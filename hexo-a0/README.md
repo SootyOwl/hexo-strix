@@ -39,7 +39,7 @@ The axis graph reaches the same receptive field in 3 layers that hex adjacency n
 
 1. **Self-play** — generate games with Gumbel MCTS under the current network.
 2. **Training** — KL policy loss + MSE value loss on samples from a SQLite replay buffer.
-3. **Evaluation** — periodic win rate vs. random, vs. a previous checkpoint, and vs. [SealBot](https://github.com/Ramora0/HexTicTacToe).
+3. **Evaluation** — periodic win rate vs. random, vs. a previous checkpoint, and vs. [SealBot](https://github.com/Ramora0/SealBot).
 4. **Curriculum** — progress through smaller board variants up to full HeXO, with automatic convergence detection.
 
 ## Install
@@ -146,7 +146,7 @@ Several evaluation opponents are available:
 
 - **vs. Random** — a uniform random opponent, the primary convergence signal during training.
 - **vs. Checkpoint** — the current model against a lagged checkpoint, to detect plateaus.
-- **vs. SealBot** — an adaptive difficulty ladder against the [SealBot](https://github.com/Ramora0/HexTicTacToe) C++ minimax engine, configured under `[eval.sealbot]` and runnable one-off via `eval-sealbot`.
+- **vs. SealBot** — an adaptive difficulty ladder against the [SealBot](https://github.com/Ramora0/SealBot) C++ minimax engine, configured under `[eval.sealbot]` and runnable one-off via `eval-sealbot`.
 - **vs. Human corpus** — optional replay-based evaluation against a human game corpus (`[eval.corpus]`, disabled by default).
 
 Promotion between champions can be gated with SPRT (`convergence_mode = "champion"`); see the `sprt_*` modules and `head-to-head`.
@@ -168,7 +168,7 @@ hexo-a0 serve --config config.toml --checkpoint <ckpt.pt> --port 8765
 ## Related
 
 - [`hexo-rs`](../hexo-rs/README.md) — the Rust game engine, MCTS, and PyO3 bindings this package depends on.
-- [SealBot](https://github.com/Ramora0/HexTicTacToe) — the C++ minimax evaluation opponent.
+- [SealBot](https://github.com/Ramora0/SealBot) — the C++ minimax evaluation opponent.
 
 ## License
 

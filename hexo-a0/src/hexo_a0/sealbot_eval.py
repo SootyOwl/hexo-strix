@@ -11,9 +11,9 @@ Requires the Sealbot repo to be cloned alongside the hexo project:
     hexo/
       hexo-a0/
       hexo-rs/
-      sealbot/   ← https://github.com/Ramora0/HexTicTacToe (tag: sealbot-v1.0),
-                   the C++ SealBot engine. (Not github.com/Ramora0/SealBot,
-                   which is an older, unused implementation.)
+      sealbot/   ← https://github.com/Ramora0/SealBot (branch master),
+                   the C++ SealBot minimax engine. Run its build.sh so that
+                   best/ contains the compiled minimax_cpp module.
 """
 
 from __future__ import annotations
@@ -41,8 +41,7 @@ def _ensure_sealbot():
     if not _SEALBOT_DIR.is_dir():
         raise FileNotFoundError(
             f"Sealbot repo not found at {_SEALBOT_DIR}. "
-            "Clone https://github.com/Ramora0/HexTicTacToe (tag sealbot-v1.0) "
-            "there and run build.sh."
+            "Clone https://github.com/Ramora0/SealBot there and run build.sh."
         )
     sealbot_str = str(_SEALBOT_DIR)
     if sealbot_str not in sys.path:

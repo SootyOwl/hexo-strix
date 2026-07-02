@@ -25,7 +25,7 @@ HeXO learns policy and value functions with a **Graph Neural Network** and searc
 
 - The board is encoded as a graph. The default `axis` representation connects stones along the 3 win axes (with 5-dim edge features and a global node), letting 3 message-passing layers cover the same receptive field that ~9 layers of plain hex adjacency would need.
 - The network (`HeXONet`) is a representation GNN — `GINEConv` by default, `GATv2Conv` optionally — plus per-node policy and stone-pooled value heads.
-- Training alternates **self-play** (Gumbel MCTS generates games), **learning** (KL policy + MSE value loss on a replay buffer), and **evaluation** (vs. random, a lagged checkpoint, and [SealBot](https://github.com/Ramora0/HexTicTacToe)), progressing through a **curriculum** of increasing board sizes.
+- Training alternates **self-play** (Gumbel MCTS generates games), **learning** (KL policy + MSE value loss on a replay buffer), and **evaluation** (vs. random, a lagged checkpoint, and [SealBot](https://github.com/Ramora0/SealBot)), progressing through a **curriculum** of increasing board sizes.
 
 See [`hexo-rs/README.md`](hexo-rs/README.md) for the engine/rules and [`hexo-a0/README.md`](hexo-a0/README.md) for the training details.
 
@@ -83,7 +83,7 @@ uv run --no-sync pytest hexo-a0/tests/ --tb=short   # Python
 
 ## Evaluation opponents
 
-[SealBot](https://github.com/Ramora0/HexTicTacToe) (a C++ minimax engine) is the main non-trivial evaluation opponent. It is **not vendored here** — to enable SealBot evaluation, clone `Ramora0/HexTicTacToe` (tag `sealbot-v1.0`) into `sealbot/` at the repo root and build its `minimax_cpp` extension (`pip install -r requirements.txt` then `python setup.py build_ext --inplace`, which needs a C++ compiler and pybind11). Training also always evaluates against a uniform-random opponent and a lagged checkpoint, and can optionally replay against a human game corpus.
+[SealBot](https://github.com/Ramora0/SealBot) (a C++ minimax engine) is the main non-trivial evaluation opponent. It is **not vendored here** — to enable SealBot evaluation, clone `Ramora0/SealBot` into `sealbot/` at the repo root and run its `build.sh` (needs a C++ compiler and pybind11) so `sealbot/best/` holds the compiled `minimax_cpp` module. Training also always evaluates against a uniform-random opponent and a lagged checkpoint, and can optionally replay against a human game corpus.
 
 ## License
 
