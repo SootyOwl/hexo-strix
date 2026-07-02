@@ -44,7 +44,7 @@ sealbot/
 
 # ---- Local environment / secrets (keep .env.example only) ----
 .env
-.envrc
+.envrc*
 
 # ---- Editor / OS ----
 .vscode/
