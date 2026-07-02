@@ -15,6 +15,7 @@ uv.toml          # machine-local uv overrides
 # ---- Training / research outputs ----
 # `runs` (no trailing slash) matches a real dir OR a symlink (e.g. runs -> ../hexo/runs)
 runs
+docs/
 *.pt             # model checkpoints
 *.bin
 *.tfevents.*
