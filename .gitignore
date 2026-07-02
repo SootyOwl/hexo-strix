@@ -1,0 +1,52 @@
+# ---- Rust ----
+target/
+perf.data*
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-*/
+.python-version
+uv.toml          # machine-local uv overrides
+# uv.lock IS tracked — do not ignore it
+
+# ---- Training / research outputs ----
+runs/
+*.pt             # model checkpoints
+*.bin
+*.tfevents.*
+benchmark.txt
+trajectories.json
+
+# ---- Datasets / local eval results ----
+data/
+
+# ---- Databases (play-server games, replay buffers) ----
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.lock
+*.db
+
+# ---- Tooling caches ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.cache/
+.rocprofv3/
+
+# ---- Third-party repos co-located during development ----
+# SealBot eval opponent: clone Ramora0/HexTicTacToe into sealbot/
+sealbot/
+
+# ---- Local environment / secrets (keep .env.example only) ----
+.env
+.envrc
+
+# ---- Editor / OS ----
+.vscode/
+*.code-workspace
+.DS_Store

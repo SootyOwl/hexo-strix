@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Play HeXO</title>
+<meta name="description" content="Play &amp; analyse infinite hex tic-tac-toe against an AlphaZero engine.">
+<meta name="theme-color" content="#0d0f0e">
+<link rel="icon" type="image/svg+xml" href="__PREFIX_RAW__/static/favicon.svg?v=__ASSET_V__">
+<link rel="apple-touch-icon" href="__PREFIX_RAW__/static/apple-touch-icon.png?v=__ASSET_V__">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="HeXO Observatory">
+<meta property="og:title" content="HeXO · Observatory">
+<meta property="og:description" content="Play &amp; analyse infinite hex tic-tac-toe against an AlphaZero engine.">
+<meta property="og:url" content="__BASE_URL____PREFIX_RAW__/">
+<meta property="og:image" content="__BASE_URL____PREFIX_RAW__/static/social-card.png?v=__ASSET_V__">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="HeXO Observatory — play &amp; analyse infinite hex tic-tac-toe">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="HeXO · Observatory">
+<meta name="twitter:description" content="Play &amp; analyse infinite hex tic-tac-toe against an AlphaZero engine.">
+<meta name="twitter:image" content="__BASE_URL____PREFIX_RAW__/static/social-card.png?v=__ASSET_V__">
+<link rel="stylesheet" href="__PREFIX_RAW__/static/observatory.css?v=__ASSET_V__"></head>
+<body data-view="play">
+<div id="topbar">
+  <h1><span class="mark">He<span class="mark-x">X</span>O</span><span class="mark-tag">Observatory</span></h1>
+  <span id="view-label">Analysis</span>
+  <span id="status">Loading…</span>
+  <span id="difficulty-badge" hidden></span>
+  <button id="resign-btn" hidden onclick="resign()">Resign</button>
+  <button id="copy-htttx-btn" hidden onclick="copyHtttx()">Copy HTTTX</button>
+  <button id="analyze-game-btn" hidden onclick="analyzeThisGame()">Analyze this game</button>
+  <button id="new-game-btn" onclick="openModal()">New game</button>
+  <button id="analysis-btn" onclick="goToAnalysis()">Analysis</button>
+  <button id="play-btn" onclick="goToPlay()">&#8592; Play</button>
+</div>
+<div id="board-container">
+  <svg id="board"></svg>
+</div>
+<div id="analysis-panel" hidden>
+  <div id="analysis-controls">
+    <div id="hds-import" style="border-bottom:1px solid #15191a;padding-bottom:10px;margin-bottom:10px">
+      <label>Import from hexo.did.science
+        <input id="hds-input" type="text" placeholder="https://hexo.did.science/sandbox/5knldz6 or 5knldz6">
+      </label>
+      <div class="row">
+        <button onclick="convertHds()">Convert &#8594; HTTTX</button>
+        <button id="hds-analyze-btn" onclick="openConvertedInAnalysis()" disabled style="flex:0 0 auto;width:auto;padding:6px 10px">Open in analysis</button>
+      </div>
+      <div id="hds-status" style="font-size:12px;color:#8b8f88;min-height:14px;margin-top:4px"></div>
+      <div id="hds-result" hidden style="margin-top:6px">
+        <div id="hds-name" style="font-size:12px;color:#b8bdb2;margin-bottom:4px"></div>
+        <textarea id="hds-htttx" rows="4" readonly></textarea>
+        <button onclick="copyHdsHtttx()" style="flex:0 0 auto;width:auto;padding:6px 10px;background:#232826;color:#d8d2c6">Copy HTTTX</button>
+      </div>
+    </div>
+    <label>Paste HTTTX
+      <textarea id="analysis-htttx" rows="4" placeholder="version[1];\n1. [1,0][2,0];\n..."></textarea>
+    </label>
+    <div class="row">
+      <button onclick="loadAnalysis()">Load / Analyze</button>
+      <label><input type="checkbox" id="analysis-heatmap" checked onchange="rerenderCurrentAnalysis()"> Suggested moves</label>
+    </div>
+    <div id="analysis-progress">
+      <div id="analysis-progress-track"><div id="analysis-progress-bar"></div></div>
+      <div id="analysis-progress-label"></div>
+    </div>
+    <div class="row">
+      <button onclick="analysisUndo()" style="background:#f08a3c;flex:0 0 auto;width:auto;padding:6px 10px">◀ Undo</button>
+      <button onclick="returnToMainline()" style="background:#232826;color:#b8bdb2;flex:0 0 auto;width:auto;padding:6px 10px">↺ Mainline</button>
+    </div>
+    <label id="analysis-slider-label">Position
+      <input type="range" id="analysis-slider" min="0" max="0" value="0" oninput="onAnalysisSlider()">
+    </label>
+    <div id="analysis-info"></div>
+    <canvas id="analysis-eval-bar" width="320" height="40"></canvas>
+    <div id="analysis-movetree"></div>
+    <div id="analysis-caveat">Eval is the value head from P1's perspective (positive = P1 ahead). The heatmap shades the side-to-move's suggested next moves (deeper = stronger). Click any hex to play it out; ★ best ✓ good ? mistake ✗ blunder at turn ends.</div>
+  </div>
+  <div id="analysis-board-container">
+    <div id="gauge-wrap" hidden>
+      <div class="gauge-poles">
+        <span class="pole pole-p1">&#9679; P1 <b id="gauge-v1">+0.00</b></span>
+        <span class="pole pole-p2"><b id="gauge-v2">&#8722;0.00</b> P2 &#9679;</span>
+      </div>
+      <div class="gauge"><div class="gauge-zero"></div><div class="gauge-needle" id="gauge-needle"></div></div>
+      <div class="gauge-scale"><span>P1 +1.0</span><span>EVEN</span><span>P2 +1.0</span></div>
+    </div>
+    <svg id="analysis-board"></svg>
+    <div id="board-legend" hidden>
+      <span><i class="sw sw-p1"></i>P1 to move</span>
+      <span><i class="sw sw-p2"></i>P2 to move</span>
+      <span><i class="sw sw-pick"></i>top suggestion</span>
+    </div>
+  </div>
+</div>
+<div id="modal-bg">
+  <div id="modal">
+    <h2 id="modal-title">New game</h2>
+    <div id="bot-stats">
+      <div id="bot-stats-current">Loading the bot's record…</div>
+      <div id="bot-stats-alltime"></div>
+    </div>
+    <label>Name (optional)
+      <input id="modal-name" type="text" maxlength="64" autocomplete="off">
+    </label>
+    <label>Elo (optional, self-reported)
+      <input id="modal-elo" type="number" min="0" max="3500" placeholder="1500" autocomplete="off">
+    </label>
+    <label>Side</label>
+    <div class="side-row">
+      <button class="side-btn" data-side="P1" onclick="selectSide('P1')">
+        <span class="stone" style="color:#f08a3c">●</span>P1 (orange)
+      </button>
+      <button class="side-btn selected" data-side="random" onclick="selectSide('random')">
+        <span class="stone">?</span>Random
+      </button>
+      <button class="side-btn" data-side="P2" onclick="selectSide('P2')">
+        <span class="stone" style="color:#3fb6d9">●</span>P2 (blue)
+      </button>
+    </div>
+    <label id="diff-label" hidden>Difficulty</label>
+    <div id="diff-row" class="diff-row" hidden></div>
+    <button id="start-btn" onclick="startGame()">Start</button>
+  </div>
+</div>
+<script>
+window.__HEXO_CFG__ = {urlPrefix: "__URL_PREFIX__", difficultySims: "__DIFFICULTY_SIMS__", defaultDifficulty: "__DEFAULT_DIFFICULTY__"};
+</script>
+<script src="__PREFIX_RAW__/static/shared.js?v=__ASSET_V__"></script>
+<script src="__PREFIX_RAW__/static/play.js?v=__ASSET_V__"></script>
+<script src="__PREFIX_RAW__/static/analysis.js?v=__ASSET_V__"></script></body></html>

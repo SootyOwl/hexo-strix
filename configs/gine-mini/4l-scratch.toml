@@ -1,0 +1,272 @@
+# HeXO AlphaZero — 4-layer GINE, trained from scratch (no graft)
+#
+# Branched from gine-mini/baseline.toml on 2026-05-11.
+#
+# Hypothesis (carried over from 2026-05-09-depth-extension-hypothesis.md):
+#   3-layer mini is depth-bound. Layer 2's conv_ratio reaches ~13.7×
+#   the residual at S3 and is still growing — strong evidence that a 4th
+#   layer would redistribute work and improve play strength.
+#
+# Why from scratch rather than graft:
+#   Three graft attempts (2026-05-09, 2026-05-10, 2026-05-10→05-11) all
+#   failed in different ways. The 2026-05-11 literature review
+#   (docs/research/2026-05-11-depth-extension-literature-review.md)
+#   confirms zero production AlphaZero systems use parameter grafting:
+#   DeepMind retrains, KataGo trains in parallel and switches, Leela
+#   distills between sizes. At 168k params and personal hardware,
+#   from-scratch is hours-to-days, not TPU-weeks.
+#
+# Differences from gine-mini/baseline.toml:
+#   [model] num_layers                       : 3 -> 4
+#   [run] checkpoint_dir                     : runs/gine-champion-mini/... -> runs/gine-mini-4l-scratch/...
+#   [run] log_dir                            : runs -> runs/gine-mini-4l-scratch
+#   [[curriculum.stages]] run_log_dir entries: rebased to runs/gine-mini-4l-scratch/
+#
+# Explicitly NOT changed from production baseline:
+#   - use_layer_scale stays off. Keep this experiment as a clean
+#     "does depth help" comparison. LayerScale at depth 4 has no
+#     published support (CaiT validated for depth >= 12 transformers);
+#     adding it would confound the depth signal. If 4L beats 3L without
+#     LS, the next experiment is "does LS help 4L?", as a separate run
+#     with a single variable changed.
+#   - lr_warmup_steps stays at 400. The 5000 in 4l-layerscale.toml was
+#     specifically a defense against Adam-normalization runaway on
+#     freshly-introduced graft params. From scratch, all params are
+#     freshly initialized equally — the production 400 is fine.
+#   - Curriculum is identical (W1 → W2 → S1 → S2 → S3 → S4). The new
+#     model walks the same path the 3-layer baseline did.
+
+# Multi-stage curriculum — automatically advances through progressively harder game variants.
+[curriculum]
+# Convergence detection
+convergence_mode = "sprt"
+patience = 10
+min_steps_per_stage = 10000
+confirm_advance = true
+# Mode: random
+win_rate_threshold = 0.85
+# Mode: checkpoint
+improve_threshold = 0.55
+checkpoint_lag = 30
+# Mode: champion
+champion_threshold = 0.55
+# Mode: sprt
+sprt_s0 = 0.50
+sprt_s1 = 0.525
+sprt_alpha = 0.01
+sprt_beta = 0.05
+sprt_alpha_stage = 0.0
+sprt_beta_stage = 0.0
+sprt_window_size = 400
+sprt_mcts_sims = 32
+sprt_mcts_m_actions = 16
+sprt_device = "cpu"
+sprt_poll_interval = 2.0
+sprt_reject_patience = 3
+sprt_promotion_grace_steps = 1000
+sprt_pentanomial = true
+sprt_pair_variance = 0.5
+sprt_adaptive_pair_variance = true
+sprt_adaptive_pair_variance_floor = 0.20
+sprt_adaptive_pair_variance_ceil = 0.50
+sprt_adaptive_pair_variance_ema_alpha = 0.10
+
+# GNN model architecture — 4-LAYER variant (the experimental delta).
+[model]
+# Backbone
+hidden_dim = 128
+num_layers = 4                           # *** EXPERIMENT: was 3, extended to 4 per depth-extension hypothesis ***
+num_heads = 8                            # Inert for GINE; preserved for config compatibility
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+# Output heads
+policy_hidden = 64
+value_hidden = 64
+# Graph construction
+graph_type = "axis"
+prune_empty_edges = true
+
+# Game rules — overridable per curriculum stage.
+[game]
+win_length = 6
+placement_radius = 8
+max_moves = 200
+
+# Gumbel AlphaZero MCTS parameters.
+[mcts]
+n_simulations = 128
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 30
+exploration_fraction = 0.25
+exploration_max = 0.9
+exploration_window = 2000
+exploration_exponent = 1.0
+
+# Gradient updates, learning rate schedule, loss functions, and replay buffer.
+[training]
+# Optimizer
+batch_size = 512
+edge_budget = 500000
+grad_accumulation = true
+lr = 0.0002
+weight_decay = 0.0001
+max_grad_norm = 1.0
+# LR schedule
+lr_schedule = "cosine"
+lr_min = 2e-05
+lr_warmup_steps = 400
+total_train_steps = 60000
+# Throttle
+step_delay = 0.0
+target_reuse = 8.0
+max_step_delay = 5.0
+step_delay_smoothing = 0.8
+# Loss
+draw_value = 0
+pc_loss_weight = 0.0
+# Data
+augment_symmetries = true
+buffer_capacity = 250000
+reanalyze_fraction = 0.0
+
+# Self-play engine selection and shared settings across both engines.
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 0
+precision = "bf16"
+model_update_interval = 1000
+source = "trainee"
+
+# Settings specific to the Rust self-play engine (batched inference server).
+[self_play.rust]
+max_batch = 128
+batch_timeout_ms = 5
+padded_inference = true
+python_inference = true
+virtual_loss = 0.5
+max_file_mb = 2048
+output_filename = "games"
+pool_fraction = 0
+pool_size = 8
+pool_snapshot_every = 1
+playout_cap_fraction = 0.0
+playout_cap_divisor = 4
+
+# Settings specific to the Python self-play engine.
+[self_play.python]
+games_per_write = 50
+playout_cap_fraction = 0.75
+playout_cap_divisor = 4
+use_rust_mcts = true
+
+# Evaluation schedule, checkpointing, and opponent settings.
+[eval]
+interval = 2000
+checkpoint_interval = 300
+games = 10
+sims = 16
+m_actions = 16
+
+# Adaptive SealBot evaluation
+[eval.sealbot]
+games = 0
+sims = 32
+m_actions = 16
+adaptive = true
+time_limit = 0.5
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+promote_threshold = 0.7
+promote_patience = 2
+win_length = 6
+placement_radius = 8
+max_moves = 200
+workers = 8
+
+# Runtime environment — devices, directories, and compilation settings.
+[run]
+device = "cuda"
+checkpoint_dir = "runs/gine-mini-4l-scratch/checkpoints"
+log_dir = "runs/gine-mini-4l-scratch"
+compile = true
+fp16 = true
+
+# --- Per-stage overrides ---
+# Walks the same curriculum the 3-layer baseline did, from W1 onward.
+
+# --- Warm-up stages: learn fundamentals with short win conditions ---
+
+[[curriculum.stages]]
+name = "W1: 4-in-a-row, radius 2"
+log_dir = "runs/gine-mini-4l-scratch/w1-4-2"
+game_win_length = 4
+game_placement_radius = 2
+game_max_moves = 20
+convergence_mode = "random"
+win_rate_threshold = 0.95
+patience = 5
+min_steps_per_stage = 1000
+confirm_advance = false
+eval_games = 20
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+[[curriculum.stages]]
+name = "W2: 5-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-4l-scratch/w2-5-2"
+game_win_length = 5
+game_placement_radius = 2
+game_max_moves = 30
+convergence_mode = "random"
+win_rate_threshold = 0.95
+patience = 5
+min_steps_per_stage = 1000
+confirm_advance = false
+eval_games = 20
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+# --- Main curriculum: 6-in-a-row, scaling radius ---
+
+[[curriculum.stages]]
+name = "S1: 6-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-4l-scratch/s1-6-2"
+game_win_length = 6
+game_placement_radius = 2
+game_max_moves = 200
+min_steps_per_stage = 5000
+confirm_advance = false
+mcts_n_simulations = 96
+
+[[curriculum.stages]]
+name = "S2: 6-in-a-row, radius 4"
+run_log_dir = "runs/gine-mini-4l-scratch/s2-6-4"
+game_win_length = 6
+game_placement_radius = 4
+game_max_moves = 200
+confirm_advance = false
+mcts_n_simulations = 96
+
+[[curriculum.stages]]
+name = "S3: 6-in-a-row, radius 6"
+run_log_dir = "runs/gine-mini-4l-scratch/s3-6-6"
+game_win_length = 6
+game_placement_radius = 6
+game_max_moves = 200
+mcts_n_simulations = 128
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+run_log_dir = "runs/gine-mini-4l-scratch/s4-6-8"
+game_win_length = 6
+game_placement_radius = 8
+game_max_moves = 200
+mcts_n_simulations = 200
+sprt_reject_patience = 10

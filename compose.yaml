@@ -1,0 +1,69 @@
+# HeXO serving — deploy on the Oracle Cloud (ARM64 / Ampere) box.
+#
+# This pulls the prebuilt image from GHCR (no local build / no repo needed on the
+# host). One-time host setup:
+#   1) docker login ghcr.io                     # PAT with read:packages
+#   2) copy a checkpoint onto the box, make it readable:  chmod a+r champion.pt
+#   3) create a .env next to this file (see .env.example) with at least
+#      HEXO_ADMIN_TOKEN and HEXO_CHECKPOINT_HOST
+#   4) docker compose up -d      (then: docker compose logs -f)
+#
+# Update to a newer image later with:  docker compose pull && docker compose up -d
+
+services:
+  hexo:
+    image: ghcr.io/sootyowl/hexo-serve:arm64
+    pull_policy: always
+    restart: unless-stopped
+
+    # Bound to localhost by default: expose it to the world via a reverse proxy /
+    # Cloudflare Tunnel rather than directly. To serve directly instead, drop the
+    # "127.0.0.1:" prefix (e.g. "8080:8080").
+    ports:
+      - "127.0.0.1:${HEXO_PORT:-8080}:8080"
+
+    environment:
+      # MCTS sims per bot stone (strength vs latency). 64 is a good CPU default.
+      HEXO_MCTS_SIMS: "${HEXO_MCTS_SIMS:-64}"
+      # Stable stats label; keep it fixed across checkpoint swaps.
+      HEXO_MODEL_LABEL: "${HEXO_MODEL_LABEL:-hexo}"
+      # Set to e.g. /hexo when serving under a path prefix behind a proxy.
+      HEXO_URL_PREFIX: "${HEXO_URL_PREFIX:-}"
+      # Strength levels: comma-separated sims mapped onto casual,easy,standard,strong
+      # (e.g. 0,64,128,512), and which one is the default. Empty = server default.
+      HEXO_DIFFICULTY_SIMS: "${HEXO_DIFFICULTY_SIMS:-}"
+      HEXO_DEFAULT_DIFFICULTY: "${HEXO_DEFAULT_DIFFICULTY:-}"
+      # Required — the /admin token. `:?` makes compose refuse to start if unset.
+      HEXO_ADMIN_TOKEN: "${HEXO_ADMIN_TOKEN:?set HEXO_ADMIN_TOKEN in .env}"
+
+    volumes:
+      # Trained checkpoint, read-only. ",Z" relabels it for SELinux (Oracle Linux
+      # runs SELinux enforcing); the file must also be world-readable (chmod a+r).
+      - "${HEXO_CHECKPOINT_HOST:?set HEXO_CHECKPOINT_HOST in .env}:/models/champion.pt:ro,Z"
+      # Persistent SQLite: games history + analysis cache (survives restarts).
+      - hexo-data:/data
+
+    security_opt:
+      - no-new-privileges:true
+
+    # The image already defines a HEALTHCHECK (GET /), surfaced by `docker ps`.
+
+  # Cloudflare Tunnel (opt-in) — publishes the app with TLS over an OUTBOUND
+  # connection, so NO inbound ports need opening on the box firewall / OCI security
+  # list. Enable by setting COMPOSE_PROFILES=tunnel + CF_TUNNEL_TOKEN in .env (or
+  # run `docker compose --profile tunnel up -d`). In the Cloudflare Zero Trust
+  # dashboard: create the tunnel, copy its token, and point the public hostname at
+  # the in-network service address  http://hexo:8080  (NOT the host port).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: "${CF_TUNNEL_TOKEN:-}"
+    depends_on:
+      hexo:
+        condition: service_healthy
+
+volumes:
+  hexo-data:

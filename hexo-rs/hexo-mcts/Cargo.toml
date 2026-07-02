@@ -1,0 +1,57 @@
+[package]
+name = "hexo-mcts"
+version = "0.1.0"
+edition = "2024"
+authors = ["SootyOwl"]
+description = "Gumbel AlphaZero MCTS for HeXO with GNN graph construction and PyO3 bindings"
+license = "MIT"
+repository = "https://github.com/SootyOwl/hexo-engine"
+readme = "../README.md"
+keywords = ["mcts", "alphazero", "gumbel", "hexagonal", "game-ai"]
+categories = ["algorithms", "science"]
+
+[lib]
+name = "hexo_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+python = ["pyo3"]
+torch = ["tch"]
+# Phase 0 DAG-MCTS measurement spike: instruments tree MCTS expansion with a
+# throwaway canonical-serialisation fingerprint to count would-be dedup hits.
+# Zero impact when disabled.
+dedup_count = ["dep:xxhash-rust"]
+# Phase 0 REQ-0e-bis: wall-clock upper-bound prototype. Adds an in-search
+# eval cache keyed by canonical fingerprint; when a leaf state hits the
+# cache, the network forward pass is skipped and the cached
+# (policy_logits, value) pair is reused. This is NOT real DAG MCGS (no
+# recursive-Q backprop, no node sharing), so the wall-clock delta vs.
+# dedup_count alone is a strict upper bound on what full DAG MCGS can save.
+dedup_skip = ["dedup_count"]
+
+[dependencies]
+hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
+pyo3 = { version = "0.28", optional = true }
+tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ctrlc = "3"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+rayon = "1.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+rustc-hash = "2"
+libc = "0.2"
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "self_play"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rustc-hash = "2"
+
+[[bench]]
+name = "bench_dag_backprop"
+harness = false

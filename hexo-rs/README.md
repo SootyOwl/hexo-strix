@@ -1,0 +1,150 @@
+# hexo-rs
+
+The Rust engine and search core for **HeXO** — infinite hex tic-tac-toe on an unbounded hexagonal grid.
+
+Two players alternate placing stones (two per turn) on a hex grid, racing to form a line of *N* in a row. The board has no edges: it starts with a single P1 stone at the origin and grows outward as play continues. This workspace provides the game logic, a Gumbel AlphaZero MCTS, graph builders for GNN evaluation, and Python bindings.
+
+It's part of the [HeXO](../README.md) monorepo and powers the training pipeline in [`hexo-a0`](../hexo-a0/README.md), but the engine crate is usable on its own.
+
+## Game rules
+
+- P1 opens with a stone at `(0, 0)`. P2 then moves first, two stones per turn.
+- Play alternates in pairs: P2(2), P1(2), P2(2), …
+- A move places a stone on any empty hex within a configurable radius of an existing stone.
+- Win by forming *N* consecutive stones along any of the 3 hex axes.
+- Draw if the move limit is reached with no winner.
+
+The default configuration (`GameConfig::FULL_HEXO`) is 6-in-a-row, placement radius 8, 200-move limit.
+
+## Crates
+
+This is a Cargo workspace with two crates:
+
+### `hexo-engine`
+
+Core game logic — board, move validation, win detection, legal-move generation. No runtime dependencies beyond `std`.
+
+- **Sparse board**: `HashMap<Coord, Player>` — grows with the game, no fixed bounds.
+- **Incremental legal moves**: a cached `HashSet` updated on each move, no full recomputation.
+- **Efficient win detection**: checks only the 3 axes through the last-placed stone.
+- **Configurable**: win length, placement radius, move limit.
+- Optional threat-feature and D6 symmetry helpers used by the search/graph layers.
+
+### `hexo-mcts`
+
+Gumbel AlphaZero MCTS plus the graph construction used to feed a GNN, and the Python bindings.
+
+- **Gumbel MCTS** with Sequential Halving (Danihelka et al., 2022).
+- **Batched neural-network evaluation** through a pluggable eval function.
+- **Two graph builders**:
+  - `graph.rs` — hex-adjacency edges (distance 1).
+  - `axis_graph.rs` — axis-window edges (up to `win_length - 1` along the 3 win axes), 5-dim edge features, a global dummy node, and stop-at-opponent traversal.
+- **PyO3 bindings** (behind the `python` feature), exported as the `hexo_rs` Python module.
+- **Native self-play binary** (optional `torch` feature) for libtorch-based generation.
+
+## Using the engine (Rust)
+
+Add `hexo-engine` as a path or git dependency, then:
+
+```rust
+use hexo_engine::{GameState, GameConfig, Player};
+
+// Standard 6-in-a-row game
+let mut game = GameState::new();
+
+// Or configure a smaller variant
+let config = GameConfig { win_length: 4, placement_radius: 4, max_moves: 100 };
+let mut game = GameState::with_config(config);
+
+// P2 moves first (P1's opening stone at the origin is placed for you)
+assert_eq!(game.current_player(), Some(Player::P2));
+
+game.apply_move((1, 0)).unwrap();
+game.apply_move((0, 1)).unwrap();
+
+// Now it's P1's turn
+assert_eq!(game.current_player(), Some(Player::P1));
+
+// Query game state
+let moves = game.legal_moves();          // sorted (q, r) pairs
+let count = game.legal_move_count();      // no allocation
+let cached = game.legal_moves_set();      // &HashSet, incrementally maintained
+let done = game.is_terminal();
+let winner = game.winner();
+```
+
+`GameConfig` has exactly three fields: `win_length: u8`, `placement_radius: i32`, `max_moves: u32`. The two-stones-per-turn rule is fixed.
+
+## Interactive TUI
+
+Play HeXO in the terminal:
+
+```bash
+cargo run --bin play -p hexo-engine --features tui
+```
+
+Controls: click to place, `t` to toggle theme, `r` to restart, `q` to quit.
+
+## Building the Python extension
+
+The `hexo_rs` module is built with [maturin](https://www.maturin.rs/). Normally you build it via the workspace `uv sync` from the [repo root](../README.md), which handles it automatically. To build just this module into an active Python 3.13+ environment:
+
+```bash
+pip install maturin
+maturin develop --release
+```
+
+This compiles `hexo-mcts` with the `python` feature and installs the `hexo_rs` module. The build settings (manifest path, features, module name) are in `pyproject.toml`, so plain `maturin develop` / `maturin build` work with no extra flags.
+
+The module exports the `GameState`, `GameConfig`, and `MCTSConfig` classes, the `gumbel_mcts` search entry points, the `game_to_graph_raw` / `game_to_axis_graph_raw` graph builders (with batch variants), symmetry augmentation helpers, and `batched_self_play`. See `hexo-mcts/src/python.rs` for the full list.
+
+```python
+import hexo_rs
+
+game = hexo_rs.GameState(hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=100))
+edges, node_features, edge_features = hexo_rs.game_to_axis_graph_raw(game)
+```
+
+> **Note:** [`hexo-a0`](../hexo-a0/README.md) depends on this package under the name `hexo-rs`. The workspace `uv sync` builds this module into the shared environment automatically, so you rarely need to run `maturin` by hand.
+
+## Native self-play binary
+
+`hexo-mcts` ships a `self_play` binary that generates games via MCTS with neural evaluation. It has two inference paths:
+
+- **`--features torch`**: in-process libtorch inference (requires libtorch and a C++ compiler).
+- **`--python-inference`**: spawns a Python inference subprocess over a binary stdin/stdout protocol (no libtorch needed at build time).
+
+```bash
+cargo run --bin self_play -p hexo-mcts --features torch -- --help
+```
+
+Most users drive self-play through the [`hexo-a0`](../hexo-a0/README.md) training pipeline rather than invoking this binary directly.
+
+## Performance
+
+Benchmarked on the default `FULL_HEXO` configuration (6-in-a-row, radius 8):
+
+| Operation | 50 stones | 100 stones |
+|---|---|---|
+| `apply_move` | 5.1 µs | — |
+| `clone` | 490 ns | 771 ns |
+| `legal_moves` (allocates + sorts) | 21 µs | 35 µs |
+| `legal_moves_set` (cached reference) | 0 ns | 0 ns |
+
+The MCTS hot path (clone + apply_move) runs in ~5 µs. Run benchmarks with:
+
+```bash
+cargo bench -p hexo-engine
+```
+
+## Coordinates
+
+HeXO uses axial hex coordinates `(q, r)` with 6 neighbour directions. Hex distance is `max(|dq|, |dr|, |dq + dr|)`. The 3 win axes are `(1, 0)`, `(0, 1)`, and `(1, -1)`.
+
+## Related
+
+- [`hexo-a0`](../hexo-a0/README.md) — the Python training pipeline (GNN + Gumbel MCTS) that consumes these bindings.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

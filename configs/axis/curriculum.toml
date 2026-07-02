@@ -1,0 +1,128 @@
+# HeXO AlphaZero — Axis-Window Graph Curriculum
+# Tests the axis-window graph builder with 3-layer GATv2Conv + edge features.
+#
+# Key differences from hex curriculum:
+#   - graph_type = "axis" (axis-window edges with 5-dim edge features)
+#   - num_layers = 3 (3 axis layers ≈ 9 hex layers receptive field)
+#   - augment_symmetries = false (D6 augmentation not yet implemented for axis)
+#   - self_play.device = "cuda" (Rust self-play on GPU for shared memory iGPUs)
+
+[curriculum]
+convergence_mode = "checkpoint"
+win_rate_threshold = 0.85
+improve_threshold = 0.65
+patience = 10                    # higher patience to ride through local minima
+checkpoint_lag = 30              # compare further back to smooth out fluctuations
+min_steps_per_stage = 10000  # longer warmup before convergence checks
+
+# --- Shared across all stages ---
+
+[model]
+hidden_dim = 256
+num_layers = 3          # fixed: 3 axis layers match 9 hex layers' receptive field
+num_heads = 8
+policy_hidden = 128
+value_hidden = 128
+dropout = 0.0
+graph_type = "axis"
+pre_norm = false      # legacy: this run was trained with post-norm
+
+[mcts]
+n_simulations = 16
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 10
+
+[training]
+batch_size = 512  # edge budget cap
+edge_budget = 500_000
+weight_decay = 0.0001
+max_grad_norm = 1.0
+augment_symmetries = true
+lr_warmup_steps = 400
+lr_schedule = "cosine"
+lr_min = 0.00002
+total_train_steps = 30000
+buffer_capacity = 100000
+
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 16
+precision = "bf16"
+
+[self_play.rust]
+max_batch = 64
+batch_timeout_ms = 5
+max_file_mb = 2048
+
+[self_play.python]
+games_per_write = 50  # doesn't apply to Rust continuous mode
+
+[eval]
+interval = 1000
+checkpoint_interval = 300
+games = 50
+
+[eval.sealbot]
+games = 20
+adaptive = true
+sims = 64
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/axis-curriculum/checkpoints"
+fp16 = true
+
+# --- Per-stage overrides ---
+
+[[curriculum.stages]]
+name = "S1: 4-in-a-row, radius 2"
+win_length = 4
+placement_radius = 2
+max_moves = 80
+lr = 0.0002
+engine = "rust"
+sealbot_games = 20          # sealbot plays 6-in-a-row rules but still useful signal
+log_dir = "runs/axis-curriculum/s1"
+
+[[curriculum.stages]]
+name = "S2: 5-in-a-row, radius 4"
+win_length = 5
+placement_radius = 4
+max_moves = 160
+lr = 0.0002
+engine = "rust"
+log_dir = "runs/axis-curriculum/s2"
+
+[[curriculum.stages]]
+name = "S3: 5-in-a-row, radius 6"
+win_length = 5
+placement_radius = 6
+max_moves = 200
+lr = 0.0002
+engine = "rust"
+log_dir = "runs/axis-curriculum/s3"
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 6"
+win_length = 6
+placement_radius = 6
+max_moves = 200
+lr = 0.0002
+engine = "rust"
+sealbot_games = 20
+min_steps_per_stage = 50000
+log_dir = "runs/axis-curriculum/s4"
+
+[[curriculum.stages]]
+name = "S5: 6-in-a-row, radius 8 (FULL HEXO)"
+win_length = 6
+placement_radius = 8
+max_moves = 1000
+lr = 0.0002
+engine = "rust"
+sealbot_games = 20
+min_steps_per_stage = 3000000
+log_dir = "runs/axis-curriculum/s5"

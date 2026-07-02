@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hexo-rs"
+requires-python = ">=3.13"
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "hexo-mcts/Cargo.toml"
+features = ["python", "pyo3/extension-module"]
+module-name = "hexo_rs"
+
+[tool.uv]
+cache-keys = [{file = "hexo-mcts/Cargo.toml"}, {file = "hexo-engine/Cargo.toml"}, {file = "hexo-mcts/src/**/*.rs"}, {file = "hexo-engine/src/**/*.rs"}]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]

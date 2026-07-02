@@ -1,0 +1,3 @@
+[workspace]
+members = ["hexo-engine", "hexo-mcts"]
+resolver = "3"

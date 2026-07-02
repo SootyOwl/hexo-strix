@@ -1,0 +1,292 @@
+# RELATIVE STONES VARIANT - 2026-06-10
+#
+# HeXO AlphaZero — 4l-128p32v-jkcat, REMOTE-ACTOR variant (self-play on bazzite)
+#
+# Identical to 4l-128p32v-jkcat.toml except self-play runs on a separate GPU box
+# ("bazzite", a GeForce 3060) via [self_play.actor] below, while training stays
+# local — killing the single-iGPU training<->self-play contention (~7x; see
+# docs/research/2026-06-05-forward-pass-headroom). It continues the SAME run
+# (same checkpoint_dir/log_dir). Provisioning: rsync this repo to
+# bazzite:/home/tyto/Documents/hexo + a CUDA torch==2.11.0 venv there (see the
+# quick-start). Clear actor.host to fall back to local self-play. NOTE: once
+# actor mode removes the contention, self-play speeds up a lot and the bottleneck
+# may flip to training-bound — re-tune [training].target_reuse downward if so.
+# ===========================================================================
+# HeXO AlphaZero — 4l-128p32v fork with JumpingKnowledge `cat` mode
+#
+# Branched from configs/gine-mini/4l-128p32v.toml on 2026-05-26 to test
+# JumpingKnowledge `cat` mode bolted onto the latest 4l-128p32v checkpoint.
+# The latter has been training without JK for 100k+ steps; this fork enables
+# `cat` aggregation and grafts the old (hidden_dim) head weights into the
+# new (L*hidden_dim) head matrices so the forward output is bit-identical
+# at the graft step.
+#
+# Differences from 4l-128p32v.toml:
+#   [model]    use_jk                                       : false -> true
+#   [model]    jk_mode                                      : "sum" -> "cat"
+#   [training] graft_heads_for_jk_cat                       : (new) true   — opt-in head graft
+#   [training] do_lr_warmup_on_resume                       : (new) true   — Adam-safety ramp
+#   [run]      checkpoint_dir / log_dir + [[curriculum.stages]] run_log_dir
+#                                   rebased to runs/gine-mini-4l-128p32v-jkcat/
+#   [mcts]     exploration_distribution = "visit_counts"    : essentially a bug fix, switches to using visit counts instead of improved policy for exploration move selection
+#
+# To start the fork, point the run dir at a copy of the existing checkpoint:
+#
+#     mkdir -p runs/gine-mini-4l-128p32v-jkcat/checkpoints
+#     cp runs/gine-mini-4l-128p32v/checkpoints/<latest>.pt \
+#        runs/gine-mini-4l-128p32v-jkcat/checkpoints/
+#     hexo-a0 curriculum --config configs/gine-mini/4l-128p32v-jkcat.toml
+#
+# At step 0 of the fork the forward output matches the unforked run exactly.
+# Gradients flow into the zeroed columns over the first few hundred steps;
+# the LR warmup-on-resume keeps Adam from over-stepping the freshly-zeroed
+# columns (see project_layerscale_graft_failure for the precedent).
+#
+# Self-play uses python_inference (matching the parent config). The Rust
+# self_play binary now forwards `--model-use-jk` / `--model-jk-mode` to the
+# Python inference subprocess via `subprocess_model_args`, so cat-mode
+# self-play runs through the same fast inference path as the base run.
+
+[curriculum]
+convergence_mode = "sprt"
+patience = 10
+min_steps_per_stage = 10000
+confirm_advance = true
+win_rate_threshold = 0.85
+improve_threshold = 0.55
+checkpoint_lag = 30
+champion_threshold = 0.55
+sprt_s0 = 0.50
+sprt_s1 = 0.525
+sprt_alpha = 0.01
+sprt_beta = 0.05
+sprt_alpha_stage = 0.0
+sprt_beta_stage = 0.0
+sprt_window_size = 0  # allow unbounded history
+sprt_mcts_sims = 64
+sprt_mcts_m_actions = 16
+sprt_device = "cpu"
+sprt_poll_interval = 2.0
+sprt_reject_patience = 0  # <= 0 = reject-counting plateau detector OFF (counter still on CLI/TB); replaces the 9999 idiom
+sprt_promotion_grace_steps = 1000
+sprt_pentanomial = true
+sprt_pair_variance = 0.5
+sprt_adaptive_pair_variance = true
+sprt_adaptive_pair_variance_floor = 0.20
+sprt_adaptive_pair_variance_ceil = 0.50
+sprt_adaptive_pair_variance_ema_alpha = 0.10
+sprt_prev_ckpt_patience = 8       # now POOLED: Wilson upper bound over 8 evals x eval.games, not all-in-band
+sprt_prev_ckpt_band_low = 0.40
+sprt_prev_ckpt_band_high = 0.60
+sprt_promo_velocity_factor = 3.0  # plateau when promo drought > 3x stage median interval (confirm_advance gates the actual advance)
+sprt_promo_velocity_min_intervals = 3
+sprt_eval_workers = 4  # 2.3x faster SPRT eval (project_sprt_parallel_eval, knee at 4); thermal headroom restored by fixing the fan (was briefly dropped to 1 while the GPU was throttling at 600 RPM / 94°C)
+
+[model]
+# Backbone
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+# Output heads — asymmetric
+policy_hidden = 128
+value_hidden = 32
+# Graph construction
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true  # 2026-06-10 new threat features edge dimensions
+relative_stone_encoding = true  # 2026-06-10 node features encode stones as relative (own/opp) instead of absolute (p1/p2)
+# *** EXPERIMENT (2026-05-26): JK cat-mode bolted on top of the unforked run. ***
+use_jk = true
+jk_mode = "cat"
+
+[game]
+win_length = 6
+placement_radius = 8
+max_moves = 300
+
+[mcts]
+n_simulations = 128
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 15  # number of moves to explore - initial value if fraction is turned on
+exploration_fraction = 0.20  # fraction of mean game length to explore
+exploration_max = 0
+exploration_window = 2000
+exploration_exponent = 1.0
+exploration_distribution = "visit_counts"
+truncate_delta = 0.25  # Q-margin gate for exploration acting; 0 = off (docs/research/2026-06-11-q-margin-truncated-exploration.md)
+
+[training]
+batch_size = 512
+edge_budget = 250_000
+grad_accumulation = true
+lr = 5e-4
+weight_decay = 0.0001
+max_grad_norm = 1.0
+lr_schedule = "cosine"
+lr_min = 2e-05
+lr_warmup_steps = 1000
+total_train_steps = 60000
+step_delay = 0.0
+target_reuse = 8.0
+max_step_delay = 5.0
+step_delay_smoothing = 0.8
+draw_value = 0
+pc_loss_weight = 0.0
+augment_symmetries = true
+buffer_capacity = 500_000
+reanalyze_fraction = 0
+reanalyze_sims = 24
+reanalyze_m_actions = 8
+# 2026-06-10 New threat features graft
+# graft_threat_features = true
+# *** Resume-time-only flags: pick up the head expansion + safety ramp. ***
+# graft_heads_for_jk_cat = true
+# do_lr_warmup_on_resume = true
+
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 32
+precision = "bf16"
+model_update_interval = 200
+source = "trainee"
+
+# Self-play c_scale softening A/B (2026-06-04 -> 06-10): FAILED — caused the S2
+# promotion stall; trainee lost to the stage-start champion at every sim count
+# (worse with more search). See docs/research/2026-06-10-cscale-ab-s2-promotion-stall.md.
+
+[self_play.rust]
+# Edge-targeted batching (2026-06-16, +35% A/B): accumulate to ~45k edges (the
+# GPU wave-fill knee) instead of a fixed graph count; max_batch is now a safety
+# ceiling (raised 64->512 so it doesn't bind first). Fidelity-free — only changes
+# request coalescing. See docs/research/2026-06-16-edge-targeted-batching.md.
+max_batch = 512
+max_batch_edges = 45000
+batch_timeout_ms = 5
+padded_inference = false
+python_inference = true
+python_inference_workers = 2
+virtual_loss = 0
+max_file_mb = 128            # actor mode: smaller files close (=> become pullable) sooner -> low ingest latency
+output_filename = "games"
+pool_fraction = 0
+pool_size = 8
+pool_snapshot_every = 1
+playout_cap_fraction = 0.0
+playout_cap_divisor = 4
+
+[self_play.actor]
+# Remote self-play actor: bazzite (GeForce 3060). Empty host = run self-play locally.
+# host = "bazzite"
+repo_dir = "/home/tyto/Documents/hexo"
+device = "cuda"
+python_bin = "/home/tyto/Documents/hexo/.venv/bin/python"
+torch_lib = ""              # auto-derived from python_bin's venv torch/lib when blank
+games_pull_interval = 1.0
+
+[self_play.python]
+games_per_write = 50
+playout_cap_fraction = 0.75
+playout_cap_divisor = 4
+use_rust_mcts = true
+
+[eval]
+interval = 2000
+checkpoint_interval = 300
+games = 100
+sims = 16
+m_actions = 16
+
+[eval.corpus]
+# Human-corpus yardstick per champion promotion (niced CPU subprocess; TB corpus/*).
+# Fixed-seed 2000-game sample: successive evals comparable; ~7 min niced CPU.
+games = 2000
+device = "cpu"
+
+[eval.sealbot]
+games = 0
+sims = 32
+m_actions = 16
+adaptive = true
+time_limit = 0.5
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+promote_threshold = 0.7
+promote_patience = 2
+win_length = 6
+placement_radius = 8
+max_moves = 200
+workers = 8
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/checkpoints"
+log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative"
+compile = true
+fp16 = true
+
+# --- Curriculum stages (mirrors 4l-128p32v.toml; only log_dirs rebased) ---
+# The fork inherits whichever stage the source checkpoint was last in —
+# resume_from_champion_on_advance + stage_start_step in the checkpoint
+# handle that automatically.
+
+[[curriculum.stages]]
+name = "W1: 4-in-a-row, radius 2"
+log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/w1-4-2"
+training_batch_size = 512
+game_win_length = 4
+game_placement_radius = 2
+game_max_moves = 20
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 1000
+confirm_advance = false
+eval_sims = 0
+eval_interval = 200
+mcts_exploration_moves = 2
+
+[[curriculum.stages]]
+name = "W2: 5-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/w2-5-2"
+training_batch_size = 512
+game_win_length = 5
+game_placement_radius = 2
+game_max_moves = 30
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 2000
+confirm_advance = false
+eval_sims = 0
+eval_interval = 200
+mcts_exploration_moves = 4
+
+[[curriculum.stages]]
+name = "S1: 6-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/s1-6-2"
+training_batch_size = 1024
+game_placement_radius = 2
+min_steps_per_stage = 20000
+
+[[curriculum.stages]]
+name = "S2: 6-in-a-row, radius 4"
+run_log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/s2-6-4"
+game_placement_radius = 4
+min_steps_per_stage = 20000
+
+[[curriculum.stages]]
+name = "S3: 6-in-a-row, radius 6"
+run_log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/s3-6-6"
+game_placement_radius = 6
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+run_log_dir = "runs/gine-mini/4l-128p32v-jkcat-relative/s4-6-8"
+# (sprt_reject_patience stage override removed 2026-06-12 — reject-counting
+# stays off (9999 global); plateau detection = promo-velocity + pooled band
+# + corpus yardstick, all gated by confirm_advance)

@@ -1,0 +1,136 @@
+# HeXO AlphaZero — Ablation: Small Policy/Value Heads (256/3/8, p64/v64)
+# Changed from baseline: policy_hidden 128 -> 64, value_hidden 128 -> 64
+#
+# Hypothesis: Minimal impact. The GNN backbone is unchanged, so learned
+# representations are identical — the only question is whether a 64-dim MLP
+# can decode them. Since the backbone does the heavy lifting, halving the head
+# MLPs shouldn't matter much.
+# Prediction: ~indistinguishable from baseline on policy; maybe slightly worse
+# value loss since value estimation aggregates over the whole graph and might
+# benefit from the extra MLP capacity.
+
+[model]
+hidden_dim = 256
+num_layers = 3
+num_heads = 8
+policy_hidden = 64                       # ABLATION: 128 -> 64
+value_hidden = 64                        # ABLATION: 128 -> 64
+dropout = 0.0
+graph_type = "axis"
+pre_norm = true
+
+[game]
+win_length = 6
+placement_radius = 8
+max_moves = 200
+
+[mcts]
+n_simulations = 16
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 16
+exploration_fraction = 0.3
+
+[training]
+batch_size = 512
+lr = 0.0002
+weight_decay = 0.0001
+max_grad_norm = 1.0
+lr_schedule = "cosine"
+lr_min = 2e-05
+lr_warmup_steps = 400
+total_train_steps = 30000
+edge_budget = 500000
+grad_accumulation = false
+augment_symmetries = true
+buffer_capacity = 250000
+reanalyze_fraction = 0.0
+pc_loss_weight = 0.0
+
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 0
+precision = "bf16"
+model_update_interval = 50
+
+[self_play.rust]
+max_batch = 64
+batch_timeout_ms = 1
+max_file_mb = 2048
+output_filename = "games"
+
+[self_play.python]
+games_per_write = 50
+playout_cap_fraction = 0.75
+playout_cap_divisor = 4
+use_rust_mcts = true
+
+[eval]
+interval = 1000
+checkpoint_interval = 300
+games = 50
+sims = 8
+m_actions = 8
+
+[eval.sealbot]
+games = 0
+adaptive = true
+sims = 64
+m_actions = 16
+time_limit = 0.5
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+promote_threshold = 0.7
+promote_patience = 2
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/ablation-small-heads/checkpoints"
+log_dir = "runs"
+compile = false
+fp16 = true
+
+[curriculum]
+convergence_mode = "checkpoint"
+win_rate_threshold = 0.85
+improve_threshold = 0.55
+patience = 5
+checkpoint_lag = 30
+min_steps_per_stage = 10000
+
+[[curriculum.stages]]
+name = "S1: 4-in-a-row, radius 2"
+win_length = 4
+placement_radius = 2
+max_moves = 80
+log_dir = "runs/ablation-small-heads/s1"
+
+[[curriculum.stages]]
+name = "S2: 5-in-a-row, radius 4"
+win_length = 5
+placement_radius = 4
+max_moves = 160
+n_simulations = 32
+log_dir = "runs/ablation-small-heads/s2"
+
+[[curriculum.stages]]
+name = "S3: 6-in-a-row, radius 6"
+win_length = 6
+placement_radius = 6
+max_moves = 200
+sealbot_games = 20
+min_steps_per_stage = 50000
+n_simulations = 64
+log_dir = "runs/ablation-small-heads/s3"
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+win_length = 6
+placement_radius = 8
+max_moves = 1000
+sealbot_games = 50
+convergence_mode = "none"
+n_simulations = 128
+m_actions = 8
+log_dir = "runs/ablation-small-heads/s4"

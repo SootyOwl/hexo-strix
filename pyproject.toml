@@ -1,0 +1,70 @@
+[project]
+name = "hexo"
+version = "0.2.0"
+description = "HeXO — infinite hex tic-tac-toe with AlphaZero"
+requires-python = ">=3.13"
+dependencies = [
+    "hexo-a0",
+    "hexo-rs",
+]
+
+[project.optional-dependencies]
+# Plotting / analysis tooling used ONLY by scripts/ — nothing in the hexo-a0 or
+# hexo-rs packages (or serving) imports these. Kept out of the default install so
+# the serving image stays lean; `just sync` pulls them in for dev via --all-extras.
+research = [
+    "matplotlib>=3.10.9",
+    "plotly>=5.20",
+    "tb-query>=2025.11.5",
+]
+
+[dependency-groups]
+rocm = ["torch>=2.0", "triton>=3.6", "triton-rocm>=3.6"]
+cuda = ["torch>=2.0"]
+# CPU-only torch (no CUDA/ROCm libs) — for portable serving deploys and x86 CI.
+# Pinned to the 2.11 line for parity with the rocm build (2.12 was rolled back
+# for a training NaN regression); bump in lockstep with the others.
+#   uv sync --group cpu
+cpu = ["torch>=2.11,<2.12"]
+
+[tool.uv]
+# cuda / rocm / cpu are mutually exclusive torch backends — pick exactly one:
+#   uv sync --group cuda | --group rocm | --group cpu
+conflicts = [
+    [
+        { group = "cuda" },
+        { group = "rocm" },
+        { group = "cpu" },
+    ],
+]
+
+[tool.uv.workspace]
+members = ["hexo-a0", "hexo-rs"]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda", group = "cuda" },
+    { index = "pytorch-rocm", group = "rocm" },
+    { index = "pytorch-cpu", group = "cpu" },
+]
+triton-rocm = { index = "pytorch-rocm" }
+hexo-a0 = { workspace = true }
+hexo-rs = { workspace = true }
+
+[tool.pytest.ini_options]
+addopts = "-k 'not gpu'"

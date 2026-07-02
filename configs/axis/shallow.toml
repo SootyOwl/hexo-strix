@@ -1,0 +1,137 @@
+# HeXO AlphaZero — Axis Graph, Shallow Model (128/4/2)
+# Experiment: 2 layers instead of 3. With win_length-1 axis reach,
+# 2 hops covers the entire relevant game state. Tests whether the
+# third layer is redundant.
+
+# GNN model architecture — fixed across all curriculum stages.
+[model]
+hidden_dim = 128                         # Hidden dimensionality used throughout the GNN and attention layers
+num_layers = 2                           # Number of GATv2Conv message-passing layers (0 = auto: win_length * 1.5)
+num_heads = 4                            # Number of attention heads per layer (hidden_dim must be divisible by this)
+policy_hidden = 64                       # Hidden size of the policy head MLP
+value_hidden = 64                        # Hidden size of the value head MLP
+dropout = 0.0                            # Dropout probability applied after each layer (0.0 = disabled)
+graph_type = "axis"                      # Graph topology: 'hex' (distance-1 adjacency, ~9 layers) or 'axis' (axis-window with edge features, ~3 layers)
+pre_norm = true                          # Use pre-norm residual blocks (norm before conv) vs post-norm (norm after)
+
+# Game rules — overridable per curriculum stage.
+[game]
+win_length = 6                           # Number of consecutive hexes needed to win (full HeXO = 6)
+placement_radius = 8                     # Maximum hex-distance from origin for new placements (full HeXO = 8)
+max_moves = 200                          # Game declared a draw after this many total placements
+
+# Gumbel AlphaZero MCTS search parameters used during self-play.
+[mcts]
+n_simulations = 16                       # Number of MCTS simulations (tree expansions) per move
+m_actions = 16                           # Number of candidate actions sampled via Gumbel-Top-k at the root
+c_scale = 1.0                            # Q-value scaling factor in the completed-Q sigma formula
+c_visit = 50                             # Visit count baseline in the completed-Q sigma formula (rarely needs tuning)
+exploration_moves = 10                   # Number of opening moves that sample proportionally from visit counts instead of taking the argmax
+
+# Gradient updates, learning rate schedule, loss functions, and replay buffer.
+[training]
+batch_size = 512                         # Maximum number of examples per gradient step (may be smaller if edge_budget is set)
+lr = 0.0002                              # Adam learning rate (overridable per curriculum stage)
+weight_decay = 0.0001                    # L2 regularisation coefficient via AdamW
+max_grad_norm = 1.0                      # Gradient clipping threshold (max L2 norm)
+lr_schedule = "cosine"                   # Learning rate schedule: 'constant' or 'cosine'
+lr_min = 2e-05                           # Minimum learning rate floor for cosine decay
+lr_warmup_steps = 400                    # Number of steps for linear warmup from ~0 to lr (0 = no warmup)
+total_train_steps = 30000                # Total cosine period in steps before reaching lr_min (0 = no limit)
+edge_budget = 500000                     # Target total edges per micro-batch for auto batch sizing (0 = use fixed batch_size)
+grad_accumulation = false                # Accumulate gradients over micro-batches to maintain effective batch_size
+augment_symmetries = true                # Apply D6 symmetry augmentation (12x training data via hex rotations/reflections)
+buffer_capacity = 100000                 # Maximum number of positions stored in the replay buffer
+reanalyze_fraction = 0.0                 # Fraction of each training batch to re-evaluate with the current model (0 = disabled)
+pc_loss_weight = 0.0                     # Weight for path consistency regularisation loss (0 = disabled)
+
+# Self-play engine selection and shared settings across both engines.
+[self_play]
+engine = "rust"                          # Which self-play engine to use: 'rust' (background binary) or 'python' (in-process)
+device = "cuda"                          # Device for self-play inference ('cpu' or 'cuda')
+workers = 0                              # Number of parallel self-play game threads (0 = auto-detect CPU count)
+precision = "bf16"                       # Use fp16/bf16 precision for self-play inference
+
+# Settings specific to the Rust self-play engine (batched inference server).
+[self_play.rust]
+max_batch = 64                           # Maximum number of game positions batched into a single inference forward pass
+batch_timeout_ms = 1                     # Milliseconds to wait for a full batch before running a partial one
+max_file_mb = 2048                       # Rotate output game files when they reach this size in MB
+output_filename = "games"                # Base filename stem for game output files (e.g. games_0001.bin)
+
+# Settings specific to the Python self-play engine (in-process, alternating with training).
+[self_play.python]
+games_per_write = 50                     # Number of games generated per replay buffer write cycle
+playout_cap_fraction = 0.75              # Fraction of moves that use a reduced simulation budget to speed up generation
+playout_cap_divisor = 4                  # Reduced simulation budget = n_simulations // divisor
+use_rust_mcts = true                     # Use the Rust MCTS backend for tree search (vs pure-Python fallback)
+
+# Evaluation schedule, checkpointing, and opponent settings.
+[eval]
+interval = 1000                          # Run evaluation every N training steps (0 = disabled)
+checkpoint_interval = 300                # Save a model checkpoint every N training steps
+games = 50                               # Number of games per evaluation round (vs random + vs previous checkpoint)
+sims = 0                                 # MCTS simulations per move during eval games (0 = use raw policy, faster)
+m_actions = 16                           # Candidate actions for MCTS during eval games
+
+# Adaptive SealBot evaluation — plays against a C++ minimax opponent at increasing difficulty.
+[eval.sealbot]
+games = 0                                # Number of games per SealBot evaluation round (0 = disabled)
+adaptive = true                          # Automatically promote through difficulty levels when winning consistently
+sims = 64                                # MCTS simulations per move during SealBot eval (0 = use raw policy)
+m_actions = 16                           # Candidate actions for MCTS during SealBot eval
+time_limit = 0.5                         # SealBot's minimax time limit per move in seconds
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0] # Difficulty ladder: list of time limits from easiest to hardest
+promote_threshold = 0.7                  # Win rate required to promote to the next difficulty level
+promote_patience = 2                     # Number of consecutive evals above threshold before promoting
+
+# Runtime environment — devices, directories, and compilation settings.
+[run]
+device = "cuda"                          # PyTorch device for training ('cpu', 'cuda', 'cuda:0', etc.)
+checkpoint_dir = "runs/axis-shallow/checkpoints" # Directory for saving model checkpoints
+log_dir = "runs"                         # TensorBoard log directory
+compile = false                          # Enable torch.compile for faster training and inference
+fp16 = true                              # Use bf16 mixed precision for training (reduces memory, may improve speed)
+
+# Multi-stage curriculum — automatically advances through progressively harder game variants.
+[curriculum]
+convergence_mode = "checkpoint"          # How to detect convergence: 'checkpoint' (vs lagged checkpoint), 'random' (vs random opponent), or 'none' (manual only)
+win_rate_threshold = 0.85                # Win rate vs random opponent that counts as converged (mode=random)
+improve_threshold = 0.65                 # Win rate vs lagged checkpoint below which the model is considered plateaued (mode=checkpoint)
+patience = 10                            # Number of consecutive evaluations meeting the threshold before advancing to next stage
+checkpoint_lag = 30                      # Compare against the checkpoint from N saves ago for convergence detection
+min_steps_per_stage = 10000              # Minimum training iterations before convergence checks begin (warmup period)
+
+# --- Stages ---
+
+[[curriculum.stages]]
+name = "S1: 4-in-a-row, radius 2"
+win_length = 4
+placement_radius = 2
+max_moves = 80
+log_dir = "runs/axis-shallow/s1"
+
+[[curriculum.stages]]
+name = "S2: 5-in-a-row, radius 4"
+win_length = 5
+placement_radius = 4
+max_moves = 160
+log_dir = "runs/axis-shallow/s2"
+
+[[curriculum.stages]]
+name = "S3: 6-in-a-row, radius 6"
+win_length = 6
+placement_radius = 6
+max_moves = 200
+sealbot_games = 20
+min_steps_per_stage = 60000
+log_dir = "runs/axis-shallow/s3"
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+win_length = 6
+placement_radius = 8
+max_moves = 1000
+sealbot_games = 50
+convergence_mode = "none"
+log_dir = "runs/axis-shallow/s4"

@@ -1,0 +1,203 @@
+# HeXO AlphaZero — 4l-128p32v no-JK W1/W2 control (matched-LR rerun)
+#
+# Companion to 4l-128p32v-jkcat-scratch.toml. Created 2026-05-27 to
+# eliminate the LR confound in the JK-vs-no-JK W1/W2 comparison.
+#
+# Background: the existing runs/gine-mini-4l-128p32v/w1-4-2 logs are from
+# 2026-05-18 when the parent config had lr ≈ 2e-4. Since then `lr` was
+# raised to 5e-4 (testing found stability up to that point). So the
+# historical no-JK W1/W2 trajectory is on a 2.5× lower LR than the
+# current JK-scratch control, which contaminates any "JK helped"
+# comparison.
+#
+# This config reruns no-JK W1/W2 with the current lr = 5e-4 so we have a
+# matched-LR baseline. Pair with:
+#   runs/gine-mini-4l-128p32v-jkcat-scratch/  — JK cat from scratch (treatment)
+#   runs/gine-mini-4l-128p32v-nojk-w12/       — this control (no JK, same LR)
+#
+# Differences from 4l-128p32v.toml:
+#   [run]     checkpoint_dir / log_dir rebased to
+#               runs/gine-mini-4l-128p32v-nojk-w12/
+#   [[curriculum.stages]]: S1/S2/S3/S4 dropped — only W1 + W2.
+#   use_jk stays false (the whole point of this control).
+#
+# To launch:
+#     hexo-a0 curriculum --config configs/gine-mini/4l-128p32v-nojk-w12.toml
+#
+# No checkpoint to copy in — fresh start.
+
+[curriculum]
+convergence_mode = "sprt"
+patience = 10
+min_steps_per_stage = 10000
+confirm_advance = true
+win_rate_threshold = 0.85
+improve_threshold = 0.55
+checkpoint_lag = 30
+champion_threshold = 0.55
+sprt_s0 = 0.50
+sprt_s1 = 0.525
+sprt_alpha = 0.01
+sprt_beta = 0.05
+sprt_alpha_stage = 0.0
+sprt_beta_stage = 0.0
+sprt_window_size = 400
+sprt_mcts_sims = 32
+sprt_mcts_m_actions = 16
+sprt_device = "cpu"
+sprt_poll_interval = 2.0
+sprt_reject_patience = 9999
+sprt_promotion_grace_steps = 1000
+sprt_pentanomial = true
+sprt_pair_variance = 0.5
+sprt_adaptive_pair_variance = true
+sprt_adaptive_pair_variance_floor = 0.20
+sprt_adaptive_pair_variance_ceil = 0.50
+sprt_adaptive_pair_variance_ema_alpha = 0.10
+sprt_prev_ckpt_patience = 8
+sprt_prev_ckpt_band_low = 0.40
+sprt_prev_ckpt_band_high = 0.60
+
+[model]
+# Backbone — IDENTICAL to 4l-128p32v-jkcat-scratch.toml apart from use_jk.
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+policy_hidden = 128
+value_hidden = 32
+graph_type = "axis"
+prune_empty_edges = true
+use_jk = false                           # *** the only architectural diff ***
+
+[game]
+win_length = 6
+placement_radius = 8
+max_moves = 200
+
+[mcts]
+n_simulations = 128
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 16
+exploration_fraction = 0.25
+exploration_max = 0.9
+exploration_window = 2000
+exploration_exponent = 1.0
+
+[training]
+batch_size = 1536
+edge_budget = 1_500_000
+grad_accumulation = true
+lr = 5e-4
+weight_decay = 0.0001
+max_grad_norm = 1.0
+lr_schedule = "cosine"
+lr_min = 2e-05
+lr_warmup_steps = 400
+total_train_steps = 60000
+step_delay = 0.0
+target_reuse = 8.0
+max_step_delay = 5.0
+step_delay_smoothing = 0.8
+draw_value = 0
+pc_loss_weight = 0.0
+augment_symmetries = true
+buffer_capacity = 250000
+reanalyze_fraction = 0.5
+
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 64
+precision = "bf16"
+model_update_interval = 1000
+source = "trainee"
+
+[self_play.rust]
+max_batch = 512
+batch_timeout_ms = 1
+padded_inference = false
+python_inference = true
+python_inference_workers = 2
+virtual_loss = 0.0
+max_file_mb = 2048
+output_filename = "games"
+pool_fraction = 0
+pool_size = 8
+pool_snapshot_every = 1
+playout_cap_fraction = 0.0
+playout_cap_divisor = 4
+
+[self_play.python]
+games_per_write = 50
+playout_cap_fraction = 0.75
+playout_cap_divisor = 4
+use_rust_mcts = true
+
+[eval]
+interval = 2000
+checkpoint_interval = 300
+games = 100
+sims = 16
+m_actions = 16
+
+[eval.sealbot]
+games = 0
+sims = 32
+m_actions = 16
+adaptive = true
+time_limit = 0.5
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+promote_threshold = 0.7
+promote_patience = 2
+win_length = 6
+placement_radius = 8
+max_moves = 200
+workers = 8
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/gine-mini-4l-128p32v-nojk-w12/checkpoints"
+log_dir = "runs/gine-mini-4l-128p32v-nojk-w12"
+compile = true
+fp16 = true
+
+# --- Warm-up stages (only ones in the curriculum for this control) ---
+
+[[curriculum.stages]]
+name = "W1: 4-in-a-row, radius 2"
+log_dir = "runs/gine-mini-4l-128p32v-nojk-w12/w1-4-2"
+training_batch_size = 512
+game_win_length = 4
+game_placement_radius = 2
+game_max_moves = 20
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 1000
+confirm_advance = false
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+[[curriculum.stages]]
+name = "W2: 5-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-4l-128p32v-nojk-w12/w2-5-2"
+training_batch_size = 512
+game_win_length = 5
+game_placement_radius = 2
+game_max_moves = 30
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 2000
+confirm_advance = false
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1

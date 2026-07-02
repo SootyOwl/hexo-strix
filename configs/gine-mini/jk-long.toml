@@ -1,0 +1,323 @@
+# HeXO AlphaZero — Curriculum Configuration Template
+#
+# Multi-stage curriculum learning: trains on progressively harder game
+# variants, automatically advancing when convergence is detected.
+#
+# Usage:
+#   hexo-a0 curriculum --config this_file.toml
+#
+# Structure:
+#   - Shared sections set defaults that apply to ALL stages.
+#   - [[curriculum.stages]] entries override per-stage values.
+#   - The [model] section is fixed across stages.
+
+# Multi-stage curriculum — automatically advances through progressively harder game variants.
+[curriculum]
+# Convergence detection
+convergence_mode = "sprt"                # How to detect convergence: 'champion' (vs champion checkpoint, fixed-N eval), 'sprt' (vs champion checkpoint, continuous SPRT daemon), 'checkpoint' (vs lagged checkpoint), 'random' (vs random opponent), or 'none' (manual only)
+patience = 10                            # Random: consecutive evals above threshold to advance. Checkpoint: rolling window size for plateau detection. Champion: consecutive non-promotion evals before declaring plateau (reset on each promotion).
+min_steps_per_stage = 10000              # Minimum training steps before convergence checks begin (warmup period)
+confirm_advance = true                   # When convergence is detected, pause and wait for a CONFIRM file in the checkpoint dir before advancing. Training continues while waiting.
+# Mode: random
+win_rate_threshold = 0.85                # Win rate vs random opponent that counts as converged (mode=random)
+# Mode: checkpoint
+improve_threshold = 0.55                 # Mean win rate vs lagged checkpoint below which the model is considered plateaued (mode=checkpoint). Averaged over the last `patience` evaluations.
+checkpoint_lag = 30                      # Compare against the checkpoint from N saves ago for convergence detection
+# Mode: champion
+champion_threshold = 0.55                # Win rate vs champion to promote trainee to new champion. If mean win rate stays below this for `patience` evals, stage is considered plateaued and auto-advances (mode=champion).
+# Mode: sprt
+# Continuous SPRT daemon runs a separate eval subprocess that plays games
+# between the latest trainee checkpoint and the current champion, tests
+# H0 (score = sprt_s0) vs H1 (score = sprt_s1) via Wald's SPRT, and
+# promotes on accept_h1 / advances the stage on reject_h1.
+sprt_s0 = 0.50                           # Null hypothesis (trainee not stronger than champion) per-game score (mode=sprt).
+sprt_s1 = 0.525                          # Alternative hypothesis (trainee stronger, worth promoting) per-game score (mode=sprt).
+sprt_alpha = 0.01                        # Per-round SPRT type-I error rate — probability of promoting when trainee is not actually stronger (mode=sprt). Ignored if sprt_alpha_stage > 0.
+sprt_beta = 0.05                         # Per-round SPRT type-II error rate — probability of failing to promote when trainee is actually stronger (mode=sprt). Ignored if sprt_beta_stage > 0.
+# Stage-level derivation disabled (sprt_alpha_stage = sprt_beta_stage = 0):
+# patience now compounds per-round confidence rather than splitting a fixed
+# stage-level budget. Each round demands solid evidence (|A| ≈ 4.55, |B| ≈
+# 2.98 from α=0.01 / β=0.05), and patience=3 means ~3× the games per plateau
+# call vs the old derived-bounds setup. Re-enable derivation by setting the
+# stage values back to >0 if you want a fixed stage-level guarantee instead.
+sprt_alpha_stage = 0.0                   # 0 = disabled, use sprt_alpha directly per round (mode=sprt).
+sprt_beta_stage = 0.0                    # 0 = disabled, use sprt_beta directly per round (mode=sprt).
+sprt_window_size = 400                   # Sliding window of recent games for SPRT state; older games are dropped. 0 = unbounded accumulation (mode=sprt).
+sprt_mcts_sims = 32                      # MCTS simulations per placement during SPRT eval games. 0 = raw policy (deterministic; breaks SPRT) (mode=sprt).
+sprt_mcts_m_actions = 16                 # Root candidate actions for SPRT eval MCTS (mode=sprt).
+sprt_device = "cpu"                      # Device for SPRT daemon inference. 'cpu' keeps the daemon off the training GPU (mode=sprt).
+sprt_poll_interval = 2.0                 # Seconds between SPRT state-file polls by the trainer (mode=sprt).
+sprt_reject_patience = 3                 # Cumulative SPRT rounds terminating in reject_h1 (since current champion was promoted) before declaring stage plateau and advancing. With derivation off, this directly multiplies per-round evidence: total games to plateau ≈ patience × |B|/KL (mode=sprt).
+sprt_promotion_grace_steps = 1000        # Training steps after a champion promotion (or stage start) during which reject_h1 rounds do not count toward sprt_reject_patience. Gives the trainee time to pull ahead of the just-promoted champion. 0 = no grace (mode=sprt).
+sprt_pentanomial = true                  # Pair consecutive P1/P2 games and use 5-bucket pair scores as the statistical unit. Cancels first-player advantage (mode=sprt).
+sprt_pair_variance = 0.5                 # Per-pair score variance for pentanomial LLR. Pair scores are in [0,2]; 0.35 is chess-engine default; 0.5 is the independent-games upper bound (most conservative). Initial value when sprt_adaptive_pair_variance is enabled (mode=sprt).
+sprt_adaptive_pair_variance = true       # Adaptively track pair variance via EMA of round-end empirical estimates, clamped to [floor, ceil]. Resets on champion change. Removes per-stage manual tuning (mode=sprt).
+sprt_adaptive_pair_variance_floor = 0.20 # Minimum pair variance when adaptive tracking is on. Prevents over-confident accepts on lucky low-variance rounds (mode=sprt).
+sprt_adaptive_pair_variance_ceil = 0.50  # Maximum pair variance when adaptive tracking is on. Independent-games upper bound (mode=sprt).
+sprt_adaptive_pair_variance_ema_alpha = 0.10  # EMA weight on the latest empirical observation. Lower = more smoothing (mode=sprt).
+# Secondary plateau detector. Complements sprt_reject_patience by watching
+# eval/win_rate_vs_prev_checkpoint directly. If the last 8 evals are all in
+# [0.45, 0.55] (i.e. trainee neither improving nor regressing relative to a
+# ~9000-step-old self), declare plateau and advance. Catches the gine-champion-mini
+# failure mode where SPRT's auto-calibrated decl_thr keeps rising past what's
+# achievable while the model has actually stopped improving. With eval_interval=2000
+# and patience=8 the detector needs ~16000 stage-steps of stalled progress to fire,
+# well past any normal post-promotion adaptation period.
+sprt_prev_ckpt_patience = 8              # Rolling-window length on eval_win_rate_vs_prev_checkpoint. 0 disables (mode=sprt).
+sprt_prev_ckpt_band_low = 0.45           # Below this = regression, doesn't count toward plateau (mode=sprt).
+sprt_prev_ckpt_band_high = 0.55          # Above this = still improving, breaks the plateau window (mode=sprt).
+
+# GNN model architecture — fixed across all curriculum stages.
+[model]
+# Backbone
+hidden_dim = 128                         # Hidden dimensionality used throughout the GNN and attention layers
+num_layers = 3                           # Number of GATv2Conv message-passing layers (0 = auto: win_length * 1.5)
+num_heads = 8                            # Number of attention heads per layer (hidden_dim must be divisible by this)
+conv_type = "gine"                       # Convolution layer type: 'gatv2' (GATv2Conv, additive attention) or 'gine' (GINEConv, sum aggregation with edge injection, no attention — ~1.5x faster)
+pre_norm = true                          # Use pre-norm residual blocks (norm before conv) vs post-norm (norm after)
+dropout = 0.0                            # Dropout probability applied after each layer (0.0 = disabled)
+# Output heads
+policy_hidden = 64                       # Hidden size of the policy head MLP
+value_hidden = 64                        # Hidden size of the value head MLP
+# Graph construction
+graph_type = "axis"                      # Graph topology: 'hex' (distance-1 adjacency, ~9 layers) or 'axis' (axis-window with edge features, ~3 layers)
+prune_empty_edges = true                 # Drop empty→empty edges in axis-window graphs (reduces graph size, only affects graph_type='axis')
+use_jk = true
+
+# Game rules — overridable per curriculum stage.
+[game]
+win_length = 6                           # Number of consecutive hexes needed to win (full HeXO = 6)
+placement_radius = 8                     # Maximum hex-distance from origin for new placements (full HeXO = 8)
+max_moves = 200                          # Game declared a draw after this many total placements
+
+# Gumbel AlphaZero MCTS parameters (Danihelka et al. 2022).
+#
+# Each placement runs a Gumbel MCTS search that produces two outputs:
+#   1. The *improved policy* pi' = softmax(logits + sigma(completedQ))
+#      — a probability distribution over all legal placements, used as
+#      the training target for the policy network (Eq. 11-12).
+#   2. The *Gumbel-selected action* = argmax over sequential-halving
+#      survivors of g(a) + logits(a) + sigma(q_hat(a)), where g(a) is
+#      Gumbel(0) noise sampled once per search.
+#
+# During self-play, each placement is in one of two regimes:
+#
+#   Exploration (first N placements): the played action is *sampled*
+#   from pi', so even low-probability placements occur proportionally.
+#   This is critical for discovering tactical moves (like blocking)
+#   that the current policy underweights.
+#
+#   Post-exploration (remaining placements): the played action is the
+#   Gumbel-selected action. This is stochastic across games (fresh
+#   Gumbel noise each search) but biased toward the current policy via
+#   the logits term. Lower diversity than exploration-phase sampling.
+#
+# Both regimes record the same pi' as the training target — only the
+# *played action* differs, not what the model trains on.
+#
+# The number of exploration placements is either fixed (exploration_moves)
+# or adaptive (exploration_fraction * EMA game length), optionally scaling
+# up when one side dominates (exploration_max).
+[mcts]
+# Search
+n_simulations =  64                      # Number of MCTS simulations (tree expansions) per placement. With m_actions candidates, sequential halving runs log2(m) phases distributing n simulations across survivors. n >= m * log2(m) gives full halving; n = m gives 1 sim per candidate (valid but weaker targets).
+m_actions = 16                           # Number of candidate actions sampled via Gumbel-Top-k at the root. Should be close to the number of legal placements on small boards (e.g. m=32 for 36 legal) to avoid missing critical moves. The paper uses m = min(n, 16) for Go.
+c_scale = 1.0                            # Q-value scaling factor in the completed-Q sigma formula: sigma(q) = (c_visit + max_visits) * c_scale * q. Paper default 1.0 works across Go, chess, and Atari.
+c_visit = 50                             # Visit count baseline in the completed-Q sigma formula. Paper default 50; any c_visit >= 50 produces similar results.
+# Exploration
+exploration_moves = 30                   # Fixed number of opening placements in the exploration regime (1 placement = 1 stone, a full turn is 2 placements). Overridden by exploration_fraction if set.
+exploration_fraction = 0.25              # Fraction of EMA game length used as exploration placements (0 = use fixed exploration_moves). When exploration_max is also set, this becomes the base (minimum) fraction used when sides are balanced.
+exploration_max = 0.9                    # Adaptive exploration ceiling. When > 0, exploration_fraction scales up toward this value as p1_decided_rate drifts from 0.5, using squared deviation for smooth center / steep edges: frac = base + (max - base) * (2 * |p1_rate - 0.5|)^2. 0 = disabled (fixed fraction).
+exploration_window = 2000                # EMA effective window (in games) for the p1 decided rate used by adaptive exploration. Larger = smoother, slower to react. alpha = 2/(window+1).
+exploration_exponent = 1.0               # Exponent for the adaptive exploration deviation curve. 1.0 = linear (responsive), 2.0 = squared (gentle center, steep edges). Applied as deviation^exponent.
+
+# Gradient updates, learning rate schedule, loss functions, and replay buffer.
+[training]
+# Optimizer
+batch_size = 1536                        # Maximum number of examples per gradient step (may be smaller if edge_budget is set)
+edge_budget = 1_500_000                  # Target total edges per micro-batch for auto batch sizing (0 = use fixed batch_size)
+grad_accumulation = true                 # Accumulate gradients over micro-batches to maintain effective batch_size
+lr = 0.0002                              # Adam learning rate (overridable per curriculum stage)
+weight_decay = 0.0001                    # L2 regularisation coefficient via AdamW
+max_grad_norm = 1.0                      # Gradient clipping threshold (max L2 norm)
+# LR schedule
+lr_schedule = "cosine"                   # Learning rate schedule: 'constant' or 'cosine'
+lr_min = 2e-05                           # Minimum learning rate floor for cosine decay
+lr_warmup_steps = 400                    # Number of steps for linear warmup from ~0 to lr (0 = no warmup)
+total_train_steps = 60000                # Total cosine period in steps before reaching lr_min (0 = no limit). Stage-relative; matches midi (was 5000 — way too short, LR pinged back to peak every few hours of wallclock).
+# Throttle
+step_delay = 0.0                         # Seconds to sleep between training steps (0 = disabled, frees GPU for self-play)
+target_reuse = 5.0                       # Target sample reuse rate. 0 disables auto-throttle and uses fixed `step_delay`. Otherwise the trainer dynamically adjusts step_delay each reporting window to track this setpoint, computed from the closed-form inversion of the reuse formula.
+max_step_delay = 5.0                     # Safety cap for the auto-throttle controller. If the computed step_delay would exceed this, the controller clamps and logs a warning that self-play is too slow to sustain the target reuse rate.
+step_delay_smoothing = 0.8               # EMA smoothing factor on the controller output. New delay = smoothing * old + (1 - smoothing) * computed. 0 = no smoothing, 0.95 = very smooth. Default 0.8 is a reasonable starting point.
+# Loss
+draw_value = 0                           # Value target for drawn games. 0.0 = neutral, -0.1 = slight penalty for both sides (encourages decisive play). Applied symmetrically: both players see this value for all positions in a drawn game.
+pc_loss_weight = 0.0                     # Weight for path consistency regularisation loss (0 = disabled)
+# Data
+augment_symmetries = true                # Apply D6 symmetry augmentation (12x training data via hex rotations/reflections)
+buffer_capacity = 250000                 # Maximum number of positions stored in the replay buffer
+reanalyze_fraction = 0.1                 # Fraction of each training batch to re-evaluate with the current model (0 = disabled)
+
+# Self-play engine selection and shared settings across both engines.
+[self_play]
+engine = "rust"                          # Which self-play engine to use: 'rust' (background binary) or 'python' (in-process)
+device = "cuda"                          # Device for self-play inference ('cpu' or 'cuda')
+workers = 64                            # Number of parallel self-play game threads (0 = auto-detect CPU count)
+precision = "bf16"                       # Model precision for self-play inference: 'fp32', 'fp16', or 'bf16'
+model_update_interval = 1000             # Export updated model for self-play every N training steps (0 = at each checkpoint). Ignored when convergence_mode='champion' (self-play updates only on champion promotion).
+source = "trainee"
+
+# Settings specific to the Rust self-play engine (batched inference server).
+[self_play.rust]
+# Batching
+max_batch = 512                           # Maximum number of game positions batched into a single inference forward pass
+batch_timeout_ms = 1                     # Milliseconds to wait for a full batch before running a partial one
+# Inference
+padded_inference = false                 # Use bucket-padded GNN inference (forward_graphs_padded) to stabilise the HIP/CUDA caching allocator under variable input shapes.
+python_inference = true                  # Use a Python subprocess with torch.compile for inference instead of TorchScript. ~2x faster forward pass but slower model reload (~30s).
+python_inference_workers = 2
+virtual_loss = 0.0                       # SH-phase fusion + virtual-loss leaf diversification. 2026-05-13 clean A/B: +19% games/s vs serial; strength impact untested.
+# Output
+max_file_mb = 2048                       # Rotate output game files when they reach this size in MB
+output_filename = "games"                # Base filename stem for game output files (e.g. games_0001.bin)
+# Past-self pool — disabled. League/past-self pooling is canonical for non-transitive games (StarCraft, Stratego), not AZ-style training in transitive perfect-information games like HeXO. Exploration noise (Gumbel-AZ + Dirichlet + temperature) provides sufficient self-play diversity. See memory: project_pool_not_canonical_az.
+pool_fraction = 0                        # Fraction of self-play games where one side is played by a randomly chosen past-self snapshot from the pool dir (0 = disabled)
+pool_size = 8                            # Maximum number of past-self snapshots retained in the pool directory (oldest are deleted). Unused while pool_fraction=0.
+pool_snapshot_every = 1                  # Snapshot to the past-self pool every Nth model export (1 = every export). Unused while pool_fraction=0.
+# Playout cap (HX04+ weighted variant). With wire-format HX04 (post-2026-05-02)
+# fast-cap positions are no longer discarded: they are written with
+# sample_weight = 1/playout_cap_divisor and the trainer down-weights them in
+# the loss accordingly. This recovers the Wu (2019) compute efficiency while
+# avoiding the Gumbel-AZ-specific anti-pattern of throwing away informative
+# completed-Q targets at low sims.
+playout_cap_fraction = 0.0               # Fraction of placements that use a reduced simulation budget. Fast-cap examples are still written, weighted by 1/divisor.
+playout_cap_divisor = 4                  # Wu (2019) playout cap randomization: fast-search simulation budget = max(1, n_simulations // divisor). 1 disables. With n_simulations=128 and divisor=4, fast-cap = 32 sims, weight 0.25.
+
+# Settings specific to the Python self-play engine (in-process, alternating with training).
+[self_play.python]
+games_per_write = 50                     # Number of games generated per replay buffer write cycle
+playout_cap_fraction = 0.75              # Fraction of placements that use a reduced simulation budget to speed up generation
+playout_cap_divisor = 4                  # Reduced simulation budget = n_simulations // divisor
+use_rust_mcts = true                     # Use the Rust MCTS backend for tree search (vs pure-Python fallback)
+
+# Evaluation schedule, checkpointing, and opponent settings.
+[eval]
+# Schedule
+interval = 2000                          # Run evaluation every N training steps (0 = disabled)
+checkpoint_interval = 300                # Save a model checkpoint every N training steps
+# Games
+games = 10                               # Number of games per evaluation round (vs random + vs previous checkpoint)
+sims = 16                                # MCTS simulations per placement during eval games (0 = use raw policy, faster)
+m_actions = 16                           # Candidate actions for MCTS during eval games
+
+# Adaptive SealBot evaluation — plays against a C++ minimax opponent at increasing difficulty.
+[eval.sealbot]
+# Schedule
+games = 0                                # In-loop disabled: at n=30 the noise drowns the signal at current strength. Use the `eval-sealbot` CLI on demand for high-precision reads (n=100+).
+sims = 32                                # MCTS simulations per placement during SealBot eval (0 = use raw policy). Lower = faster on CPU workers; 200 was designed for GPU.
+m_actions = 16                           # Candidate actions for MCTS during SealBot eval
+# Difficulty ladder
+adaptive = true                          # Automatically promote through difficulty levels when winning consistently
+time_limit = 0.5                         # SealBot's minimax time limit per placement in seconds (not used in adaptive mode)
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0] # Difficulty ladder: list of time limits from easiest to hardest
+promote_threshold = 0.7                  # Win rate required to promote to the next difficulty level
+promote_patience = 2                     # Number of consecutive evals above threshold before promoting
+# Game overrides
+win_length = 6                           # Override win_length for SealBot games (0 = use current stage's game config)
+placement_radius = 8                     # Override placement_radius for SealBot games (0 = use current stage's game config)
+max_moves = 200                            # Override max_moves for SealBot games (0 = use current stage's game config)
+# Parallelism
+workers = 8                              # Parallel worker processes. 1 = sequential; >1 uses multiprocessing.Pool (spawn context). Each worker loads its own model copy on CPU; GPU is not shared.
+
+# Runtime environment — devices, directories, and compilation settings.
+[run]
+device = "cuda"                          # PyTorch device for training ('cpu', 'cuda', 'cuda:0', etc.)
+checkpoint_dir = "runs/gine-mini-jk-long/checkpoints" # Directory for saving model checkpoints
+log_dir = "runs"                         # TensorBoard log directory
+compile = true                           # Enable torch.compile for faster training and inference
+fp16 = true                              # Use bf16 mixed precision for training (reduces memory, may improve speed)
+
+# --- Per-stage overrides ---
+# Each stage can override fields from [game], [mcts], [training],
+# [eval], [self_play], and [run] (e.g., lr, log_dir).
+
+# --- Warm-up stages: learn fundamentals with short win conditions ---
+# Auto-advance when beating random >=95%. Fast games, no manual confirmation.
+
+[[curriculum.stages]]
+name = "W1: 4-in-a-row, radius 2"
+log_dir = "runs/gine-mini-jk-long/w1-4-2"
+game_win_length = 4
+game_placement_radius = 2
+game_max_moves = 20  # solvable in 6
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 1000
+confirm_advance = false
+eval_games = 100
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+[[curriculum.stages]]
+name = "W2: 5-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-jk-long/w2-5-2"
+game_win_length = 5
+game_placement_radius = 2
+game_max_moves = 30
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 2000
+confirm_advance = false
+eval_games = 100
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+# --- Main curriculum: 6-in-a-row, scaling radius ---
+
+[[curriculum.stages]]
+name = "S1: 6-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-jk-long/s1-6-2"
+game_win_length = 6
+game_placement_radius = 2
+game_max_moves = 200
+min_steps_per_stage = 25000              # Sit in S1 for a while because games are fast
+confirm_advance = false                  # Auto-advance on plateau; small-board stage doesn't need manual gating
+
+[[curriculum.stages]]
+name = "S2: 6-in-a-row, radius 4"
+run_log_dir = "runs/gine-mini-jk-long/s2-6-4"
+game_win_length = 6
+game_placement_radius = 4
+game_max_moves = 200
+min_steps_per_stage = 25000
+confirm_advance = false                  # Auto-advance on plateau; manual gating starts at S3
+
+[[curriculum.stages]]
+name = "S3: 6-in-a-row, radius 6"
+run_log_dir = "runs/gine-mini-jk-long/s3-6-6"
+game_win_length = 6
+game_placement_radius = 6
+game_max_moves = 200
+mcts_n_simulations = 128
+# Floor inherits global default (3). Auto-calibrated dual-threshold detector
+# in curriculum.py reads `peak_history` from sprt_state.json and uses
+# warn_thr=⌈μ+σ⌉, decl_thr=max+1 — both well above this floor for S3
+# (current calibration: warn=13, decl=16). The floor only binds during
+# bootstrap before peak_history exists, which is no longer the case here.
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+run_log_dir = "runs/gine-mini-jk-long/s4-6-8"
+game_win_length = 6
+game_placement_radius = 8
+game_max_moves = 200
+mcts_n_simulations = 128
+sprt_reject_patience = 10                # Bootstrap floor for S4 before peak_history accumulates. S3 peaks (excluding the pool-contamination outlier of 15) ranged 0-11, so 10 covers the expected first-cycle range without being overly conservative. Auto-calibration takes over after a few promotions.
+
+

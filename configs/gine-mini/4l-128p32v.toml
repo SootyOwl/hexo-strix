@@ -1,0 +1,246 @@
+# HeXO AlphaZero — 4-layer GINE + asymmetric heads (policy 128 / value 32)
+#
+# Branched from gine-mini/baseline.toml on 2026-05-18 after the jk-long S3
+# P1-decided collapse (docs/research/2026-05-18-jklong-s3-p1-collapse.md).
+#
+# Hypothesis: the 3-layer mini is capacity-bound on the *policy* side
+# (offensive coordination requires distinguishing many tactical patterns),
+# while the value head is over-provisioned for HeXO's near-decisive outcome
+# space. Reallocate parameters: deeper backbone for representation, larger
+# policy head for tactical capacity, smaller value head for what it
+# actually needs.
+#
+# Differences from baseline.toml (gine-champion-mini, current strongest
+# production checkpoint):
+#   [model] num_layers     : 3 -> 4
+#   [model] policy_hidden  : 64 -> 128
+#   [model] value_hidden   : 64 -> 32
+#   [run] checkpoint_dir / log_dir + [[curriculum.stages]] run_log_dir
+#                           rebased to runs/gine-mini-4l-128p32v/
+#
+# Explicitly NOT changed:
+#   - use_jk stays off. Empirical hierarchy as of 2026-05-18:
+#       gine-champion-mini (no JK)        : reached S3, beats sealbot 5s
+#       jk-long (JK + long curriculum)    : collapsed at S3
+#       jk      (JK + short curriculum)   : weaker than jk-long
+#     The configuration that works has no JK. Adding JK is a separate
+#     ablation requiring its own justification, not a default to preserve.
+#   - Long curriculum (S1/S2 min_steps≥20000) per memory:
+#     project_long_curriculum_wins.
+#   - Trained from scratch (no graft). Three graft attempts in early May
+#     all failed; literature review confirms from-scratch is the
+#     production-AZ default. See 4l-scratch.toml header for context.
+
+[curriculum]
+convergence_mode = "sprt"
+patience = 10
+min_steps_per_stage = 10000
+confirm_advance = true
+win_rate_threshold = 0.85
+improve_threshold = 0.55
+checkpoint_lag = 30
+champion_threshold = 0.55
+sprt_s0 = 0.50
+sprt_s1 = 0.525
+sprt_alpha = 0.01
+sprt_beta = 0.05
+sprt_alpha_stage = 0.0
+sprt_beta_stage = 0.0
+sprt_window_size = 400
+sprt_mcts_sims = 32
+sprt_mcts_m_actions = 16
+sprt_device = "cpu"
+sprt_poll_interval = 2.0
+sprt_reject_patience = 9999
+sprt_promotion_grace_steps = 1000
+sprt_pentanomial = true
+sprt_pair_variance = 0.5
+sprt_adaptive_pair_variance = true
+sprt_adaptive_pair_variance_floor = 0.20
+sprt_adaptive_pair_variance_ceil = 0.50
+sprt_adaptive_pair_variance_ema_alpha = 0.10
+sprt_prev_ckpt_patience = 8
+sprt_prev_ckpt_band_low = 0.40
+sprt_prev_ckpt_band_high = 0.60
+
+[model]
+# Backbone
+hidden_dim = 128
+num_layers = 4                           # *** EXPERIMENT: was 3, extended to 4 ***
+num_heads = 8                            # Inert for GINE; preserved for config compatibility
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+# Output heads — asymmetric
+policy_hidden = 128                      # *** EXPERIMENT: was 64, doubled for tactical capacity ***
+value_hidden = 32                        # *** EXPERIMENT: was 64, halved; value is easier than policy on HeXO ***
+# Graph construction
+graph_type = "axis"
+prune_empty_edges = true
+use_jk = false                           # See header — no-JK is the production-strongest config
+
+[game]
+win_length = 6
+placement_radius = 8
+max_moves = 200
+
+[mcts]
+n_simulations = 128
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 16
+exploration_fraction = 0.25
+exploration_max = 0.9
+exploration_window = 2000
+exploration_exponent = 1.0
+
+[training]
+batch_size = 1536
+edge_budget = 1_500_000
+grad_accumulation = true
+lr = 5e-4
+weight_decay = 0.0001
+max_grad_norm = 1.0
+lr_schedule = "cosine"
+lr_min = 2e-05
+lr_warmup_steps = 400
+total_train_steps = 60000
+step_delay = 0.0
+target_reuse = 8.0
+max_step_delay = 5.0
+step_delay_smoothing = 0.8
+draw_value = 0
+pc_loss_weight = 0.0
+augment_symmetries = true
+buffer_capacity = 250000
+reanalyze_fraction = 0.5
+
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 64
+precision = "bf16"
+model_update_interval = 1000
+source = "trainee"
+
+[self_play.rust]
+max_batch = 512
+batch_timeout_ms = 1
+padded_inference = false
+python_inference = true
+python_inference_workers = 2
+virtual_loss = 0.0
+max_file_mb = 2048
+output_filename = "games"
+pool_fraction = 0
+pool_size = 8
+pool_snapshot_every = 1
+playout_cap_fraction = 0.0
+playout_cap_divisor = 4
+
+[self_play.python]
+games_per_write = 50
+playout_cap_fraction = 0.75
+playout_cap_divisor = 4
+use_rust_mcts = true
+
+[eval]
+interval = 2000
+checkpoint_interval = 300
+games = 100
+sims = 16
+m_actions = 16
+
+[eval.sealbot]
+games = 0
+sims = 32
+m_actions = 16
+adaptive = true
+time_limit = 0.5
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+promote_threshold = 0.7
+promote_patience = 2
+win_length = 6
+placement_radius = 8
+max_moves = 200
+workers = 8
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/gine-mini-4l-128p32v/checkpoints"
+log_dir = "runs/gine-mini-4l-128p32v"
+compile = true
+fp16 = true
+
+# --- Warm-up stages ---
+
+[[curriculum.stages]]
+name = "W1: 4-in-a-row, radius 2"
+log_dir = "runs/gine-mini-4l-128p32v/w1-4-2"
+training_batch_size = 512
+game_win_length = 4
+game_placement_radius = 2
+game_max_moves = 20
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 1000
+confirm_advance = false
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+[[curriculum.stages]]
+name = "W2: 5-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-4l-128p32v/w2-5-2"
+training_batch_size = 512
+game_win_length = 5
+game_placement_radius = 2
+game_max_moves = 30
+convergence_mode = "random"
+win_rate_threshold = 0.90
+patience = 5
+min_steps_per_stage = 2000
+confirm_advance = false
+eval_sims = 0
+eval_interval = 200
+self_play_rust_playout_cap_fraction = 0
+self_play_rust_playout_cap_divisor = 1
+
+# --- Main curriculum: 6-in-a-row, scaling radius ---
+
+[[curriculum.stages]]
+name = "S1: 6-in-a-row, radius 2"
+run_log_dir = "runs/gine-mini-4l-128p32v/s1-6-2"
+training_batch_size = 1024
+game_win_length = 6
+game_placement_radius = 2
+game_max_moves = 200
+min_steps_per_stage = 20000
+confirm_advance = false
+
+[[curriculum.stages]]
+name = "S2: 6-in-a-row, radius 4"
+run_log_dir = "runs/gine-mini-4l-128p32v/s2-6-4"
+game_win_length = 6
+game_placement_radius = 4
+game_max_moves = 200
+min_steps_per_stage = 20000
+confirm_advance = false
+
+[[curriculum.stages]]
+name = "S3: 6-in-a-row, radius 6"
+run_log_dir = "runs/gine-mini-4l-128p32v/s3-6-6"
+game_win_length = 6
+game_placement_radius = 6
+game_max_moves = 200
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+run_log_dir = "runs/gine-mini-4l-128p32v/s4-6-8"
+game_win_length = 6
+game_placement_radius = 8
+game_max_moves = 200
+sprt_reject_patience = 10

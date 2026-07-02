@@ -1,0 +1,34 @@
+# VCS
+.git
+.jj
+**/.git
+**/.jj
+
+# Rust build output (can be gigabytes) — rebuilt inside the image
+**/target/
+
+# Python envs / caches — rebuilt inside the image
+.venv
+**/.venv
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+
+# Training artifacts / data — never belong in the serving image
+runs/
+data/
+*.sqlite
+*.sqlite-*
+*.pt
+*.ckpt
+
+# Docs, notes, scratch
+docs/
+scratchpad/
+**/*.log
+
+# Tests aren't needed at runtime (uv sync --no-dev already skips pytest)
+hexo-a0/tests/
+hexo-rs/**/tests/

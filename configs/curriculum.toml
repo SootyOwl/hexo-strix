@@ -1,0 +1,148 @@
+# HeXO AlphaZero — Automatic Curriculum
+# Shared config at the top, per-stage overrides in [[curriculum.stages]].
+
+[curriculum]
+# Convergence mode:
+#   "random"     — advance when win_rate vs random >= win_rate_threshold
+#   "checkpoint" — advance when win_rate vs previous checkpoint drops below
+#                  improve_threshold for `patience` consecutive evals
+#                  (model has stopped improving = stage is learned)
+convergence_mode = "checkpoint"
+win_rate_threshold = 0.85       # for "random" mode
+improve_threshold = 0.65        # for "checkpoint" mode: below this = plateaued
+patience = 3
+checkpoint_lag = 20             # compare against checkpoint from N saves ago
+min_steps_per_stage = 10000   # warmup: don't check convergence until this many iters into a stage
+
+# --- Shared across all stages (cannot change between runs) ---
+
+[model]
+hidden_dim = 256
+num_layers = 0  # auto: int(win_length * 1.5)
+num_heads = 8
+policy_hidden = 128
+value_hidden = 128
+dropout = 0.0
+
+[mcts]
+n_simulations = 16
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+
+[training]
+batch_size = 512
+weight_decay = 0.0001
+max_grad_norm = 1.0
+augment_symmetries = true
+lr_warmup_steps = 400
+buffer_capacity = 100000
+
+[self_play]
+engine = "rust"
+workers = 30
+precision = "bf16"
+
+[self_play.rust]
+max_batch = 64
+batch_timeout_ms = 5
+max_file_mb = 2048
+
+[eval]
+interval = 600
+checkpoint_interval = 600
+games = 40
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/curriculum/checkpoints"
+compile = false
+fp16 = true
+
+# --- Per-stage overrides ---
+
+[[curriculum.stages]]
+name = "S1: 4-in-a-row, radius 2"
+win_length = 4
+placement_radius = 2
+max_moves = 80
+lr = 0.0002
+python_games_per_write = 50
+exploration_moves = 8
+n_simulations = 8
+m_actions = 8
+log_dir = "runs/curriculum/s1"
+
+[[curriculum.stages]]
+name = "S2: 4-in-a-row, radius 3"
+win_length = 4
+placement_radius = 3
+max_moves = 120
+lr = 0.0002
+python_games_per_write = 50
+exploration_moves = 8
+n_simulations = 16
+m_actions = 16
+log_dir = "runs/curriculum/s2"
+
+[[curriculum.stages]]
+name = "S3: 5-in-a-row, radius 4"
+win_length = 5
+placement_radius = 4
+max_moves = 160
+lr = 0.0002
+python_games_per_write = 50
+exploration_moves = 10
+log_dir = "runs/curriculum/s3"
+
+[[curriculum.stages]]
+name = "S4: 5-in-a-row, radius 6"
+win_length = 5
+placement_radius = 6
+max_moves = 200
+lr = 0.0001
+python_games_per_write = 4
+exploration_moves = 12
+n_simulations = 16
+buffer_capacity = 100000
+log_dir = "runs/curriculum/s4"
+
+[[curriculum.stages]]
+name = "S5: 6-in-a-row, radius 6"
+win_length = 6
+placement_radius = 6
+max_moves = 200
+lr = 0.0004
+lr_schedule = "cosine"
+lr_min = 0.00004
+total_train_steps = 50000
+n_simulations = 8
+m_actions = 8
+python_games_per_write = 100
+exploration_moves = 14
+engine = "python"
+convergence_mode = "none"
+buffer_capacity = 200000
+sealbot_games = 10
+sealbot_adaptive = true
+sealbot_sims = 64
+log_dir = "runs/curriculum/s5_v2"
+
+[[curriculum.stages]]
+name = "S6: 6-in-a-row, radius 8 (FULL HEXO)"
+win_length = 6
+placement_radius = 8
+max_moves = 1000
+lr = 0.0002
+lr_schedule = "cosine"
+lr_min = 0.00002
+total_train_steps = 30000
+python_games_per_write = 4
+exploration_moves = 30
+n_simulations = 8
+m_actions = 4
+convergence_mode = "none"
+buffer_capacity = 300000
+sealbot_games = 10
+sealbot_time_limit = 0.5
+log_dir = "runs/curriculum/s6"
