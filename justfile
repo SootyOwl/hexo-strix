@@ -60,7 +60,10 @@ import-db db:
 # Run tests: Rust + Python
 test: test-rust test-python
 
-torch_lib_dir := `uv run --no-sync python -c "import torch, os; print(os.path.dirname(torch.__file__) + '/lib')" 2>/dev/null`
+# Empty on a fresh tree (before `just sync` installs torch); only used by the
+# post-sync self-play/test recipes. `|| true` keeps `just` from aborting at
+# parse time when torch isn't importable yet.
+torch_lib_dir := `uv run --no-sync python -c "import torch, os; print(os.path.dirname(torch.__file__) + '/lib')" 2>/dev/null || true`
 
 test-rust:
     cd hexo-rs && \
