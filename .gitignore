@@ -13,7 +13,8 @@ uv.toml          # machine-local uv overrides
 # uv.lock IS tracked — do not ignore it
 
 # ---- Training / research outputs ----
-runs/
+# `runs` (no trailing slash) matches a real dir OR a symlink (e.g. runs -> ../hexo/runs)
+runs
 *.pt             # model checkpoints
 *.bin
 *.tfevents.*
