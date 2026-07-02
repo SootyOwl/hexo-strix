@@ -56,17 +56,17 @@ See the [root README](../README.md) for the full workspace build. Commands below
 
 ## Quick start
 
-Everything is driven through the `hexo-a0` CLI. Generate a config template, then train:
+Everything is driven through the `hexo-a0` CLI. `curriculum` is the main training loop. Generate a config template, then train:
 
 ```bash
 # Print an annotated curriculum config template and save it
 hexo-a0 default-curriculum > curriculum.toml
 
-# Run the multi-stage curriculum (small board → full HeXO)
+# Run the multi-stage curriculum (small board → full HeXO) — the main training loop
 hexo-a0 curriculum --config curriculum.toml --device cuda:0
 
-# Watch a checkpoint play a game (needs the 'viewer' extra)
-hexo-a0 watch --config curriculum.toml --checkpoint runs/<name>/checkpoints/latest.pt
+# Play against / watch a checkpoint via the play server
+hexo-a0 serve --config curriculum.toml --checkpoint runs/<name>/checkpoints/<ckpt>.pt
 
 # Evaluate a checkpoint against SealBot
 hexo-a0 eval-sealbot --config curriculum.toml --checkpoint <ckpt.pt> --games 100
@@ -78,12 +78,12 @@ For a single fixed-stage run instead of a curriculum, use `hexo-a0 default-confi
 
 | Command | Purpose |
 |---------|---------|
-| `train` | Run the training loop for a single fixed configuration. |
-| `curriculum` | Run automatic multi-stage curriculum training. |
-| `watch` | Watch a checkpoint play a game in a pygame hex viewer. |
+| `curriculum` | **Main training loop** — automatic multi-stage curriculum training. |
+| `serve` | Public play-and-analyze server; the current way to play against / watch a model (see below). |
 | `eval-sealbot` | Evaluate a checkpoint against the SealBot minimax opponent. |
 | `head-to-head` | Run an SPRT-bounded match between two checkpoints (configs may differ). |
-| `serve` | Run the public play server / analysis tool (see below). |
+| `train` | Train a single fixed configuration (no curriculum). |
+| `watch` | Older pygame viewer for a checkpoint playing a game; largely superseded by `serve`. |
 | `default-config` | Print a standalone training config template. |
 | `default-curriculum` | Print an annotated curriculum config template. |
 

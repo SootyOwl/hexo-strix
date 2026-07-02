@@ -46,31 +46,26 @@ That's the portable path. The `justfile` wraps this and the native self-play bui
 
 ### Train
 
+`curriculum` is the main training loop — it runs the full self-play → learn → evaluate cycle through a schedule of increasing board sizes.
+
 ```bash
 # Generate an annotated curriculum config, then train small board -> full HeXO
 uv run --no-sync hexo-a0 default-curriculum > curriculum.toml
 uv run --no-sync hexo-a0 curriculum --config curriculum.toml --device cuda:0
 ```
 
-Ready-made configs live in `configs/` (e.g. `configs/axis/curriculum.toml`).
+Ready-made configs live in `configs/` (e.g. `configs/axis/curriculum.toml`). (`hexo-a0 train` runs a single fixed stage instead of a curriculum; `curriculum` is the maintained path.)
 
-### Watch a model play
+### Play against / watch a trained model
 
-```bash
-uv run --no-sync hexo-a0 watch --config curriculum.toml \
-  --checkpoint runs/<name>/checkpoints/<ckpt>.pt
-```
-
-(Needs the `viewer` extra / `pygame`.)
-
-### Play against a trained model
+`serve` is the current way to see a model play — an HTTP play-and-analyze server with selectable difficulty tiers that records games to SQLite and exposes a token-gated `/admin` page:
 
 ```bash
 uv run --no-sync hexo-a0 serve --config config.toml \
   --checkpoint <ckpt>.pt --port 8765
 ```
 
-`serve` runs an HTTP play-and-analyze server with selectable difficulty tiers; it records games to SQLite and exposes a token-gated `/admin` page.
+(There's also an older `hexo-a0 watch` pygame viewer, largely superseded by `serve`.)
 
 ### Play in the terminal (no model)
 
@@ -88,7 +83,7 @@ uv run --no-sync pytest hexo-a0/tests/ --tb=short   # Python
 
 ## Evaluation opponents
 
-[SealBot](https://github.com/Ramora0/HexTicTacToe) (a C++ minimax engine) is the main non-trivial evaluation opponent. It is **not vendored here** — to enable SealBot evaluation, clone `Ramora0/HexTicTacToe` (tag `sealbot-v1.0`) into `sealbot/` at the repo root and build it (`build.sh`). Training also always evaluates against a uniform-random opponent and a lagged checkpoint, and can optionally replay against a human game corpus.
+[SealBot](https://github.com/Ramora0/HexTicTacToe) (a C++ minimax engine) is the main non-trivial evaluation opponent. It is **not vendored here** — to enable SealBot evaluation, clone `Ramora0/HexTicTacToe` (tag `sealbot-v1.0`) into `sealbot/` at the repo root and build its `minimax_cpp` extension (`pip install -r requirements.txt` then `python setup.py build_ext --inplace`, which needs a C++ compiler and pybind11). Training also always evaluates against a uniform-random opponent and a lagged checkpoint, and can optionally replay against a human game corpus.
 
 ## License
 
