@@ -68,6 +68,26 @@ body { background: var(--ink); color: var(--text); font-family: "Hanken Grotesk"
 #copy-htttx-btn { background: #232826; color: #d8d2c6; }
 #resign-btn[hidden], #copy-htttx-btn[hidden] { display: none; }
 #play-btn { background: #232826; color: #d8d2c6; margin-left: auto; }
+/* GitHub source link — a utility tag in the topbar's instrument-panel language:
+   mono caps + brass frame (echoing .mark-tag), the octocat tilting into a
+   phosphor halo on hover. Anchored far-right, persists across both views. */
+#gh-link { display: inline-flex; align-items: center; gap: 7px; text-decoration: none;
+           padding: 4px 10px; border: 1px solid var(--line-bright); border-radius: 3px;
+           color: var(--muted); background: rgba(27,32,31,0.35);
+           margin-left: 2px; align-self: center;
+           transition: color .18s, border-color .18s, background .18s, box-shadow .3s; }
+/* Reset the global board `svg{position:absolute;width/height:100%}` rule for this inline icon. */
+#gh-link svg { display: block; position: static; width: 15px; height: 15px; flex: 0 0 auto;
+               transition: transform .35s cubic-bezier(.16,1,.3,1); }
+.gh-label { font-family: var(--mono); font-size: 8.5px; font-weight: 400; letter-spacing: 2.5px;
+            text-transform: uppercase; line-height: 1; }
+#gh-link:hover { color: var(--phos); border-color: var(--brass); background: #2a2410;
+                 box-shadow: 0 0 12px -2px rgba(242,182,90,0.35); }
+#gh-link:hover svg { transform: rotate(-8deg) scale(1.08); }
+#gh-link:active { transform: translateY(1px); }
+#gh-link:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; color: var(--phos); }
+@media (max-width: 560px) { .gh-label { display: none; }
+                            #gh-link { padding: 5px 8px; } }
 /* Screen label in the shared serif lockup font (nicer than the mono tag). */
 #view-label { font-family: var(--serif); font-size: 22px;
               color: var(--brass); line-height: 1; }
