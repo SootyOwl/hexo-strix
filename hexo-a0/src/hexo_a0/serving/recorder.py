@@ -72,7 +72,32 @@ def _m4_htttx_convention(conn):
                      (serialize_htttx(move_log), row_id))
 
 
-GAMES_MIGRATIONS = [_m0_base, _m1_model_label, _m2_opponent_elo, _m3_step, _m4_htttx_convention]
+def _m5_active_games(conn):
+    """In-progress games, written through on every completed request so a server
+    restart (or crash) can restore them. One row per live game; rows are deleted
+    when the game ends or is evicted. moves_json is the replay ground truth; the
+    win_length/placement_radius/max_moves triple is stored so restore can refuse
+    a game whose rules no longer match the server's."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS active_games (
+             game_id TEXT PRIMARY KEY,
+             created_at TEXT NOT NULL,
+             last_active_at TEXT NOT NULL,
+             human_name TEXT,
+             human_side TEXT NOT NULL,
+             bot_side TEXT NOT NULL,
+             difficulty TEXT NOT NULL,
+             opp_elo REAL,
+             elo_source TEXT,
+             opp_handle TEXT,
+             win_length INTEGER NOT NULL,
+             placement_radius INTEGER NOT NULL,
+             max_moves INTEGER NOT NULL,
+             moves_json TEXT NOT NULL)""")
+
+
+GAMES_MIGRATIONS = [_m0_base, _m1_model_label, _m2_opponent_elo, _m3_step,
+                    _m4_htttx_convention, _m5_active_games]
 
 
 class Recorder:
@@ -131,6 +156,65 @@ class Recorder:
                  opp_elo, elo_source, opp_handle),
             )
             self._conn.commit()
+
+    def save_active(
+        self,
+        *,
+        game_id: str,
+        created_at: str,
+        last_active_at: str,
+        human_name: str | None,
+        human_side: str,
+        bot_side: str,
+        difficulty: str,
+        opp_elo: float | None,
+        elo_source: str | None,
+        opp_handle: str | None,
+        win_length: int,
+        placement_radius: int,
+        max_moves: int,
+        move_log: list[tuple[int, int, str]],
+    ) -> None:
+        """Upsert the write-through snapshot of an in-progress game."""
+        moves_json = json.dumps([[q, r, p] for (q, r, p) in move_log])
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO active_games (game_id, created_at,
+                       last_active_at, human_name, human_side, bot_side, difficulty,
+                       opp_elo, elo_source, opp_handle, win_length, placement_radius,
+                       max_moves, moves_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (game_id, created_at, last_active_at, human_name, human_side,
+                 bot_side, difficulty, opp_elo, elo_source, opp_handle,
+                 win_length, placement_radius, max_moves, moves_json),
+            )
+            self._conn.commit()
+
+    def has_completed(self, game_id: str) -> bool:
+        """True if a completed-game row already exists for ``game_id``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM games WHERE game_id = ? LIMIT 1", (game_id,)
+            ).fetchone()
+        return row is not None
+
+    def delete_active(self, game_id: str) -> None:
+        """Drop a game's write-through snapshot (finished or evicted)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM active_games WHERE game_id = ?", (game_id,))
+            self._conn.commit()
+
+    def load_active(self) -> list[dict]:
+        """All persisted in-progress games, most recently active first."""
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT game_id, created_at, last_active_at, human_name,
+                          human_side, bot_side, difficulty, opp_elo, elo_source,
+                          opp_handle, win_length, placement_radius, max_moves,
+                          moves_json
+                   FROM active_games ORDER BY last_active_at DESC""")
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def recent_games(self, limit: int = 100) -> list[dict]:
         """Most recent completed games, newest first."""

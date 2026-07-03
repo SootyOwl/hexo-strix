@@ -1265,6 +1265,7 @@ def _serve(cfg, analyze_ctx):
         default_difficulty=cfg.default_difficulty,
         recorder=recorder,
     )
+    restored_games = mgr.restore_active_games()
 
     if analyze_ctx is None:
         # Model identity for cache invalidation: label (run@step) + the
@@ -1318,6 +1319,8 @@ def _serve(cfg, analyze_ctx):
     tier_str = "  ".join(f"{k}={v}" for k, v in difficulty_sims.items())
     print(f"  difficulty: {tier_str}  (default: {cfg.default_difficulty})")
     print(f"  db: {cfg.db}")
+    if restored_games:
+        print(f"  restored:   {restored_games} in-progress game(s)")
     if url_prefix:
         print(f"  url-prefix: {url_prefix}")
     if admin_token:

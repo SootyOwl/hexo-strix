@@ -256,3 +256,245 @@ def test_create_game_refuses_at_capacity_without_evicting_active():
     # The active games were NOT evicted to make room.
     assert m.get_game(r1.game_id) is not None
     assert m.get_game(r2.game_id) is not None
+
+
+# --------------------------------------------------------------------------
+# In-progress game persistence across restarts (active_games write-through)
+# --------------------------------------------------------------------------
+
+def _playing_bot(rec):
+    # Deterministic stand-in for make_bot_turn_fn: plays out the bot's whole
+    # turn so persisted snapshots are human-to-move, like production.
+    while (not rec.state.is_terminal()) and rec.state.current_player() == rec.bot_side:
+        q, r = rec.state.legal_moves()[0]
+        rec.state.apply_move(q, r)
+        rec.move_log.append((q, r, rec.bot_side))
+
+
+def _pmgr(tmp_path, name="g.sqlite", **over):
+    """GameManager backed by a real Recorder (persistence-enabled)."""
+    from hexo_a0.serving.recorder import Recorder
+    recorder = Recorder(str(tmp_path / name))
+    kwargs = dict(
+        game_kwargs={"win_length": 6, "placement_radius": 8, "max_moves": 400},
+        bot_turn_fn=_playing_bot,
+        recorder=recorder,
+        mcts_sims=64,
+        m_actions=16,
+        checkpoint_path="x.pt",
+        model_label="test",
+        difficulty_sims={"standard": 64},
+        default_difficulty="standard",
+        idle_ttl_seconds=3600,
+        max_games=10,
+    )
+    kwargs.update(over)
+    return GameManager(**kwargs), recorder
+
+
+def test_create_game_persists_active_row(tmp_path):
+    m, recorder = _pmgr(tmp_path)
+    rec = m.create_game("P1", "alice", random.Random(0), "standard")
+    rows = recorder.load_active()
+    assert [x["game_id"] for x in rows] == [rec.game_id]
+    assert rows[0]["human_side"] == "P1" and rows[0]["difficulty"] == "standard"
+
+
+def test_apply_human_move_updates_active_row(tmp_path):
+    import json
+    m, recorder = _pmgr(tmp_path)
+    rec = m.create_game("P2", "a", random.Random(0), "standard")
+    before = len(json.loads(recorder.load_active()[0]["moves_json"]))
+    q, r = rec.state.legal_moves()[0]
+    m.apply_human_move(rec.game_id, q, r)
+    after = len(json.loads(recorder.load_active()[0]["moves_json"]))
+    assert after > before
+
+
+def test_resign_deletes_active_row(tmp_path):
+    m, recorder = _pmgr(tmp_path)
+    rec = m.create_game("P2", "a", random.Random(0), "standard")
+    assert recorder.load_active()
+    m.resign(rec.game_id)
+    assert recorder.load_active() == []
+
+
+def test_terminal_game_deletes_active_row(tmp_path):
+    # max_moves=3: seed + the human's first two placements end the game, so the
+    # terminal write-through must remove the active row (and record the game).
+    m, recorder = _pmgr(tmp_path, game_kwargs={"win_length": 6, "placement_radius": 8,
+                                               "max_moves": 3})
+    rec = m.create_game("P2", "a", random.Random(0), "standard")
+    while not rec.state.is_terminal():
+        q, r = rec.state.legal_moves()[0]
+        m.apply_human_move(rec.game_id, q, r)
+    assert rec.terminal_recorded
+    assert recorder.load_active() == []
+    assert recorder.summary()["total"] == 1
+
+
+def test_restore_roundtrip(tmp_path):
+    m1, recorder = _pmgr(tmp_path)
+    rec = m1.create_game("P2", "alice", random.Random(0), "standard")
+    q, r = rec.state.legal_moves()[0]
+    m1.apply_human_move(rec.game_id, q, r)   # human move + full bot reply
+
+    m2, _ = _pmgr(tmp_path)  # same sqlite file — fresh process stand-in
+    assert m2.restore_active_games() == 1
+    rec2 = m2.get_game(rec.game_id)
+    assert rec2 is not None
+    assert rec2.move_log == rec.move_log
+    assert rec2.human_side == "P2" and rec2.human_name == "alice"
+    assert rec2.state.current_player() == rec2.human_side
+    # The restored game is fully playable.
+    q2, r2 = rec2.state.legal_moves()[0]
+    m2.apply_human_move(rec2.game_id, q2, r2)
+
+
+def test_restore_skips_and_deletes_expired(tmp_path):
+    m1, recorder = _pmgr(tmp_path)
+    m1.create_game("P2", "a", random.Random(0), "standard")
+    row = recorder.load_active()[0]
+    recorder.save_active(**{**{k: row[k] for k in row if k != "moves_json"},
+                            "last_active_at": "2020-01-01T00:00:00+00:00",
+                            "move_log": [(0, 0, "P1")]})
+    m2, _ = _pmgr(tmp_path)
+    assert m2.restore_active_games() == 0
+    assert recorder.load_active() == []
+
+
+def test_restore_skips_and_deletes_rule_mismatch(tmp_path):
+    m1, recorder = _pmgr(tmp_path)
+    m1.create_game("P2", "a", random.Random(0), "standard")
+    m2, _ = _pmgr(tmp_path, game_kwargs={"win_length": 5, "placement_radius": 8,
+                                         "max_moves": 400})
+    assert m2.restore_active_games() == 0
+    assert recorder.load_active() == []
+
+
+def test_restore_skips_and_deletes_unreplayable(tmp_path):
+    m1, recorder = _pmgr(tmp_path)
+    rec = m1.create_game("P2", "a", random.Random(0), "standard")
+    row = recorder.load_active()[0]
+    # Duplicate placement is illegal — replay must fail and the row be dropped.
+    recorder.save_active(**{**{k: row[k] for k in row if k != "moves_json"},
+                            "move_log": [(0, 0, "P1"), (1, 0, "P2"), (1, 0, "P2")]})
+    m2, _ = _pmgr(tmp_path)
+    assert m2.restore_active_games() == 0
+    assert recorder.load_active() == []
+
+
+def test_restore_skips_and_deletes_bot_to_move(tmp_path):
+    # No-stuck-games invariant: nothing schedules a bot turn for a restored
+    # game, so a snapshot left bot-to-move must be dropped, not restored.
+    m1, recorder = _pmgr(tmp_path)
+    m1.create_game("P2", "a", random.Random(0), "standard")
+    row = recorder.load_active()[0]
+    recorder.save_active(**{**{k: row[k] for k in row if k != "moves_json"},
+                            "human_side": "P1", "bot_side": "P2",
+                            "move_log": [(0, 0, "P1")]})   # P2 (bot) to move
+    m2, _ = _pmgr(tmp_path)
+    assert m2.restore_active_games() == 0
+    assert recorder.load_active() == []
+
+
+def test_restore_respects_max_games(tmp_path):
+    m1, recorder = _pmgr(tmp_path)
+    ids = [m1.create_game("P2", f"u{i}", random.Random(i), "standard").game_id
+           for i in range(3)]
+    m2, _ = _pmgr(tmp_path, max_games=2)
+    assert m2.restore_active_games() == 2
+    assert len(recorder.load_active()) == 2   # over-capacity rows are dropped
+
+
+def test_eviction_deletes_active_row(tmp_path):
+    from datetime import timedelta
+    m, recorder = _pmgr(tmp_path)
+    rec = m.create_game("P2", "a", random.Random(0), "standard")
+    # Age the game past the TTL, then trigger lazy eviction via a new game.
+    rec.last_active_at = rec.last_active_at - timedelta(seconds=7200)
+    m.create_game("P2", "b", random.Random(1), "standard")
+    assert m.get_game(rec.game_id) is None
+    assert rec.game_id not in {x["game_id"] for x in recorder.load_active()}
+
+
+def test_persistence_failure_does_not_break_play(tmp_path):
+    class BoomActiveRecorder:
+        def save_active(self, **kw):
+            raise RuntimeError("disk full")
+
+        def delete_active(self, game_id):
+            raise RuntimeError("disk full")
+
+    m = GameManager(
+        game_kwargs={"win_length": 6, "placement_radius": 8, "max_moves": 400},
+        bot_turn_fn=_playing_bot, recorder=BoomActiveRecorder(),
+        mcts_sims=64, m_actions=16, checkpoint_path="x.pt", model_label="test",
+        difficulty_sims={"standard": 64}, default_difficulty="standard",
+        idle_ttl_seconds=3600, max_games=10,
+    )
+    rec = m.create_game("P2", "a", random.Random(0), "standard")   # must not raise
+    q, r = rec.state.legal_moves()[0]
+    m.apply_human_move(rec.game_id, q, r)                          # must not raise
+
+
+def test_restore_skips_and_deletes_already_completed(tmp_path):
+    # A resignation doesn't change the board, so its replay looks live. If the
+    # process dies between the completed-game insert and the active-row delete
+    # (two separate commits), restore must drop the row by consulting the games
+    # table — otherwise the player continues a finished game and its eventual
+    # terminal insert collides with the UNIQUE game_id (500 + zombie).
+    m1, recorder = _pmgr(tmp_path)
+    rec = m1.create_game("P2", "a", random.Random(0), "standard")
+    row_before = recorder.load_active()[0]
+    m1.resign(rec.game_id)
+    # Simulate the crash window: completed row exists, active row resurrected.
+    recorder.save_active(**{**{k: row_before[k] for k in row_before if k != "moves_json"},
+                            "move_log": [(0, 0, "P1")]})
+    m2, _ = _pmgr(tmp_path)
+    assert m2.restore_active_games() == 0
+    assert recorder.load_active() == []
+
+
+def test_sync_after_eviction_does_not_resurrect_row(tmp_path):
+    # Race shape: /move thread fetched the record, then an eviction (triggered
+    # by /new_game) dropped the game + its row; the move's write-through must
+    # not re-insert a row for a game no longer in the manager.
+    from datetime import timedelta
+    m, recorder = _pmgr(tmp_path)
+    victim = m.create_game("P2", "a", random.Random(0), "standard")
+    victim.last_active_at = victim.last_active_at - timedelta(seconds=7200)
+    m.create_game("P2", "b", random.Random(1), "standard")   # evicts the victim
+    assert m.get_game(victim.game_id) is None
+    m._sync_active(victim)   # the in-flight move's write-through, arriving late
+    assert victim.game_id not in {x["game_id"] for x in recorder.load_active()}
+
+
+def test_ttl_victim_row_dropped_even_when_create_refuses(tmp_path):
+    # _evict's TTL pass can drop a game and then still return "at capacity"
+    # (ServerBusyError). The TTL victim's active row must be deleted anyway.
+    from datetime import timedelta
+    m, recorder = _pmgr(tmp_path, max_games=2, idle_grace_seconds=3600)
+    stale = m.create_game("P2", "a", random.Random(0), "standard")
+    m.create_game("P2", "b", random.Random(1), "standard")
+    stale.last_active_at = stale.last_active_at - timedelta(seconds=7200)  # past TTL
+    m.create_game("P2", "c", random.Random(2), "standard")   # TTL-evicts `stale`
+    # Manager now holds b + c, both within grace: next create must refuse.
+    stale2 = m.get_game([g["game_id"] for g in m.active_games()][0])
+    with pytest.raises(ServerBusyError):
+        m.create_game("P2", "d", random.Random(3), "standard")
+    assert stale.game_id not in {x["game_id"] for x in recorder.load_active()}
+
+
+def test_restore_skips_and_deletes_bad_bot_side(tmp_path):
+    # A row with bot_side == human_side would restore a game whose bot turn can
+    # never be scheduled (permanently stuck) — drop it instead.
+    m1, recorder = _pmgr(tmp_path)
+    m1.create_game("P2", "a", random.Random(0), "standard")
+    row = recorder.load_active()[0]
+    recorder.save_active(**{**{k: row[k] for k in row if k != "moves_json"},
+                            "bot_side": "P2",
+                            "move_log": [(0, 0, "P1")]})
+    m2, _ = _pmgr(tmp_path)
+    assert m2.restore_active_games() == 0
+    assert recorder.load_active() == []

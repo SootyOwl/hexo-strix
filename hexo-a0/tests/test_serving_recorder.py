@@ -3,6 +3,7 @@
 Parity target: scripts/play_server.py:106-240, adapted so Recorder creates its
 schema on construction and sets busy_timeout.
 """
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -283,3 +284,65 @@ def test_record_completed_persists_elo(tmp_path):
         "SELECT opp_elo, elo_source, opp_handle FROM games WHERE game_id='g1'"
     ).fetchone()
     assert row[0] == 1500.0 and row[1] == "self_reported" and row[2] is None
+
+
+# --------------------------------------------------------------------------
+# active_games (in-progress game persistence across restarts)
+# --------------------------------------------------------------------------
+
+def _active_row(**over):
+    row = dict(
+        game_id="g1",
+        created_at="2026-07-03T10:00:00+00:00",
+        last_active_at="2026-07-03T10:05:00+00:00",
+        human_name="alice",
+        human_side="P2",
+        bot_side="P1",
+        difficulty="standard",
+        opp_elo=None,
+        elo_source=None,
+        opp_handle=None,
+        win_length=6,
+        placement_radius=8,
+        max_moves=400,
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    row.update(over)
+    return row
+
+
+def test_active_game_roundtrip(tmp_path):
+    r = Recorder(str(tmp_path / "g.sqlite"))
+    r.save_active(**_active_row())
+    rows = r.load_active()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["game_id"] == "g1"
+    assert row["human_side"] == "P2" and row["bot_side"] == "P1"
+    assert row["win_length"] == 6 and row["placement_radius"] == 8
+    assert json.loads(row["moves_json"]) == [[0, 0, "P1"], [1, 0, "P2"]]
+    r.delete_active("g1")
+    assert r.load_active() == []
+
+
+def test_save_active_upserts_on_same_game_id(tmp_path):
+    r = Recorder(str(tmp_path / "g.sqlite"))
+    r.save_active(**_active_row())
+    r.save_active(**_active_row(
+        move_log=[(0, 0, "P1"), (1, 0, "P2"), (2, 0, "P2")],
+        last_active_at="2026-07-03T10:06:00+00:00"))
+    rows = r.load_active()
+    assert len(rows) == 1
+    assert len(json.loads(rows[0]["moves_json"])) == 3
+    assert rows[0]["last_active_at"] == "2026-07-03T10:06:00+00:00"
+
+
+def test_load_active_newest_first(tmp_path):
+    r = Recorder(str(tmp_path / "g.sqlite"))
+    r.save_active(**_active_row(game_id="old", last_active_at="2026-07-03T09:00:00+00:00"))
+    r.save_active(**_active_row(game_id="new", last_active_at="2026-07-03T11:00:00+00:00"))
+    assert [x["game_id"] for x in r.load_active()] == ["new", "old"]
+
+
+def test_delete_active_unknown_is_noop(tmp_path):
+    Recorder(str(tmp_path / "g.sqlite")).delete_active("nope")  # must not raise
