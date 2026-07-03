@@ -11,6 +11,31 @@ use super::scoring::{QContext, sigma};
 use super::simulate::{
     apply_virtual_loss, complete_simulation, revert_virtual_loss, simulate_select,
 };
+use super::forcing;
+
+/// Depth cap (in attacker *turns*, not placements) for the bounded VCF
+/// forcing-win shortcut run at every mr=2 root. Set high on purpose: a forced
+/// win is the case worth paying for (decisive move + clean data + skips MCTS),
+/// and iterative deepening finds shallow wins cheaply — `depth_cap` only sets
+/// how deep we're *willing* to look; `SELF_PLAY_NODE_BUDGET` is the hard ceiling
+/// on per-position effort (branchy no-win positions). The Task-11 bench sweep
+/// (synthetic wl6/r2 corpus) showed depth drives the tail, but that corpus
+/// overstates the branchy-no-win tax vs NN-guided play — so the REAL arbiter is
+/// the pre-live self-play A/B (throughput on vs off). Dial via `node_budget`
+/// (the effective tail lever at high depth) if the real tail bites.
+pub const SELF_PLAY_DEPTH_CAP: u8 = 6;
+/// Per-position node-budget cap for the same shortcut — the hard ceiling on
+/// effort per root, independent of win/no-win. This, not `depth_cap`, is the
+/// lever that bounds worst-case latency on branchy no-win positions once the
+/// depth cap is high enough for the budget to bind. Provisional pending the
+/// pre-live A/B (see `SELF_PLAY_DEPTH_CAP`).
+///
+/// `pub`: shared with `batched::batched_gumbel_mcts` (identical forced-win
+/// shortcut applied per-game before the halving/eval rounds) and with
+/// `bin/bench_depth2_shortcut`, which measures `forcing::solve` at exactly
+/// this self-play budget (Task 11,
+/// docs/superpowers/plans/2026-07-03-forcing-solver-rust-port.md).
+pub const SELF_PLAY_NODE_BUDGET: u64 = 2_000;
 
 /// Result of a Gumbel MCTS search.
 pub struct MCTSResult {
@@ -130,7 +155,10 @@ where
     #[cfg(not(feature = "dedup_skip"))]
     let root_value = values[0];
 
-    // Build coords and logits arrays (sorted order matching legal_moves)
+    // Build coords and logits arrays (sorted order matching legal_moves).
+    // The depth-N forcing shortcut (Step 3.5, Phase B) never appends to
+    // `coords`: the solver is radius-aware, so its winning move is always a
+    // member of `legal_moves()` (defensively guarded there too).
     let coords: Vec<Coord> = legal_moves.clone();
     let mut logits: Vec<f64> = coords
         .iter()
@@ -263,24 +291,32 @@ where
         }
     }
 
-    // Step 3.5: Forced-win shortcut over the candidate set.
+    // Step 3.5: Forced-win shortcut.
     //
-    // Phase A (depth-1, original): if any candidate makes the game terminal as
-    // a win for the current player, return a one-hot improved policy on it and
-    // skip sequential halving.
+    // Phase A (depth-1): if any candidate makes the game terminal as a win
+    // for the current player, return a one-hot improved policy on it and
+    // skip sequential halving. Scoped to the Gumbel-top-K candidate set
+    // (not all legal moves) to bound cost; uninformed priors will miss some
+    // forced wins but the network's own learning concentrates priors on gap
+    // squares over time.
     //
-    // Phase B (depth-2): HeXO turns are two placements. If we're at the start
-    // of a turn (moves_remaining_this_turn() == 2) and a candidate's first
-    // placement leaves a position where the same player can immediately win
-    // with their second placement, that candidate is the first half of a
-    // 1-turn forced win. Return one-hot on it. This mirrors the depth-1
-    // shortcut so own_4 patterns get the same supervised one-hot policy
-    // target that own_5 patterns already enjoy.
-    //
-    // Scoped to the Gumbel-top-K candidate set (not all legal moves) to
-    // bound cost; uninformed priors will miss some forced wins but the
-    // network's own learning concentrates priors on gap squares over time
-    // (depth-1 supervision already works this way for own_5).
+    // Phase B (depth-N, generalized VCF): HeXO turns are two placements. If
+    // we're at the start of a turn (moves_remaining_this_turn() == 2), run
+    // the bounded fully-forcing solver (`forcing::solve`) from the current
+    // position. Unlike the old exhaustive depth-2 scan (which could only
+    // ever see a forced win completed within THIS single turn, with no
+    // opponent move interposed), the solver searches multiple turns deep
+    // with the opponent's forced blocks interposed -- e.g. a "double-four"
+    // fork that isn't decisive until 2-3 turns later. On a proven win,
+    // return one-hot on the attacker's first placement. The solver is not
+    // candidate-scoped (it reasons about the whole board's threat structure
+    // directly), so the winning move may not already be a Gumbel-Top-K
+    // candidate; `candidate_indices` is extended below if needed. The solver
+    // is radius-aware, so the winning move IS always a `game.legal_moves()`
+    // member (i.e. already a `coords` entry) -- defensively re-checked below
+    // rather than assumed. Depth/node-budget bounded by `SELF_PLAY_DEPTH_CAP`
+    // / `SELF_PLAY_NODE_BUDGET` to cap worst-case latency when no forcing win
+    // exists.
     let me = game.current_player();
     let me_player = me.expect("non-terminal game guaranteed Some(current_player)");
     let stones_ref = game.stones();
@@ -341,96 +377,52 @@ where
     }
 
     if game.moves_remaining_this_turn() == 2 {
-        // For (m1, m2) to make a (win_length)-in-a-row in one turn, the
-        // winning run consists of pre-existing own stones + m1 + m2 on a
-        // single axis. m1 and m2 must therefore lie on the same axis within
-        // (win_length - 1) cells of each other. Restricting the m2 scan to
-        // axis neighbours of m1 prunes the inner loop from O(|legal_moves|)
-        // (~N at large placement_radius) to O(3 × 2 × (win_length - 1)).
-        //
-        // Phase B pre-check (parallel to Phase A's, threshold one lower):
-        // m1 needs ≥ (win_length - 2) own stones along some axis within
-        // max_dist cells, since the (win_length)-window holds 4 pre-existing
-        // own stones + m1 + m2 at win_length=6.
-        let min_own_d2 = (game.config().win_length as usize).saturating_sub(2);
-        for &idx in &candidate_indices {
-            let m1 = coords[idx];
-            let (q1, r1) = m1;
-            let mut axis_viable = false;
-            for &(dq, dr) in &WIN_AXES {
-                let mut count = 0usize;
-                for d in 1..=max_dist {
-                    if stones_ref.get(&(q1 + d * dq, r1 + d * dr)) == Some(&me_player) {
-                        count += 1;
-                    }
-                    if stones_ref.get(&(q1 - d * dq, r1 - d * dr)) == Some(&me_player) {
-                        count += 1;
-                    }
+        if let forcing::Outcome::Win(w) =
+            forcing::solve(game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET)
+        {
+            let first_move = w.first_move;
+            // Defensive guard: `forcing::solve` is radius-aware, so
+            // `first_move` should always be a member of `game.legal_moves()`.
+            // Belt-and-suspenders against a future solver regression: never
+            // return an action that isn't legal -- fall through to normal
+            // search instead.
+            if game.legal_moves_set().contains(&first_move) {
+                // `first_move` is guaranteed to already be in `coords` (==
+                // `legal_moves()`) by the guard above, so this lookup always
+                // succeeds.
+                let idx = coords
+                    .iter()
+                    .position(|&c| c == first_move)
+                    .expect("first_move verified legal, so it is in coords");
+                let mut improved_policy = vec![0.0; coords.len()];
+                improved_policy[idx] = 1.0;
+                let mut visit_counts = vec![0u32; coords.len()];
+                visit_counts[idx] = 1;
+                let qctx = QContext::new(&root, &coords);
+                let per_child_q: Vec<f64> =
+                    coords.iter().map(|c| qctx.completed_q[c]).collect();
+                let per_child_prior = priors_vec.clone();
+                let mut candidate_indices = candidate_indices.clone();
+                if !candidate_indices.contains(&idx) {
+                    // Preserve the `MCTSResult::candidate_indices` invariant
+                    // ("the chosen action is guaranteed to lie inside it")
+                    // relied on by callers such as
+                    // `acting::exploration_weights`'s Q-margin gate.
+                    candidate_indices.push(idx);
                 }
-                if count >= min_own_d2 {
-                    axis_viable = true;
-                    break;
-                }
-            }
-            if !axis_viable {
-                continue;
-            }
-            let mut g1 = game.clone();
-            if g1.apply_move(m1).is_err() {
-                continue;
-            }
-            // is_terminal already handled in Phase A.
-            if g1.is_terminal() {
-                continue;
-            }
-            // The 2-placement forced-win pattern requires the same player to
-            // still be on move after m1 (i.e. moves_remaining drops 2→1, not
-            // 2→other-player). If apply_move flipped the turn for any reason
-            // (won't here, but defensive), skip.
-            if g1.current_player() != me {
-                continue;
-            }
-            // Guard with the engine's cached legal-moves set (O(1) lookup)
-            // before paying the GameState clone for the win check.
-            let legal = g1.legal_moves_set();
-            for &(dq, dr) in &WIN_AXES {
-                for sign in [1i32, -1] {
-                    for d in 1..=max_dist {
-                        let m2 = (q1 + sign * d * dq, r1 + sign * d * dr);
-                        if !legal.contains(&m2) {
-                            continue;
-                        }
-                        let mut g2 = g1.clone();
-                        if g2.apply_move(m2).is_ok()
-                            && g2.is_terminal()
-                            && g2.winner() == me
-                        {
-                            let mut improved_policy = vec![0.0; coords.len()];
-                            improved_policy[idx] = 1.0;
-                            let mut visit_counts = vec![0u32; coords.len()];
-                            visit_counts[idx] = 1;
-                            let qctx = QContext::new(&root, &coords);
-                            let per_child_q: Vec<f64> =
-                                coords.iter().map(|c| qctx.completed_q[c]).collect();
-                            let per_child_prior = priors_vec.clone();
-                            return Ok(MCTSResult {
-                                action: m1,
-                                improved_policy,
-                                coords,
-                                visit_counts,
-                                per_child_q,
-                                per_child_prior,
-                                candidate_indices: candidate_indices.clone(),
-                                // Depth-2 shortcut: chosen p₁ leads to a
-                                // 1-turn forced win on the SECOND placement,
-                                // so the next search has no meaningful p₂
-                                // injection target (depth-1 shortcut will
-                                // close out the game). Leaving empty.
-                                chosen_action_forced_candidates: Vec::new(),
-                            });
-                        }
-                    }
-                }
+                return Ok(MCTSResult {
+                    action: first_move,
+                    improved_policy,
+                    coords,
+                    visit_counts,
+                    per_child_q,
+                    per_child_prior,
+                    candidate_indices,
+                    // The forced win may span multiple turns; unlike the old
+                    // single-turn shortcut, there's no well-defined "post-p₁ p₂
+                    // set" to seed the next search with. Leaving empty.
+                    chosen_action_forced_candidates: Vec::new(),
+                });
             }
         }
     }
@@ -1927,6 +1919,82 @@ mod tests {
         {
             assert_eq!(a.to_bits(), b.to_bits(),
                 "mr=2 improved_policy must be bit-identical regardless of forced_candidates");
+        }
+    }
+
+    /// Depth-3 forced win: a win the OLD single-turn depth-2 scan could
+    /// never see (it only ever checked whether THIS turn's own two
+    /// placements complete the game outright), but the generalized
+    /// `forcing::solve`-backed shortcut finds.
+    ///
+    /// Construction: a q-axis 3-run at the origin -- (0,0),(1,0),(2,0) --
+    /// ready to become a forcing "open four" with one more placement, plus,
+    /// far away, an r-axis 2-run and a third-hex-axis 2-run positioned so
+    /// they share a single common "next" cell ((100,102)). Turn 1 spends
+    /// one placement forcing the q-axis open four (which the opponent must
+    /// fully block) and its other, otherwise-idle placement on that shared
+    /// cell -- promoting BOTH the r-axis and third-axis runs to 3-runs at
+    /// once. That recreates the classic two-3-runs-sharing-a-corner shape
+    /// (`forcing::tests::mate_in_two_fork`) one turn later, at (100,102)
+    /// instead of the origin, so turn 2 forks it into an unstoppable
+    /// double-open-four and turn 3 completes it: depth 3 overall.
+    #[test]
+    fn gumbel_mcts_depth3_forced_win_returns_one_hot_policy() {
+        let stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0),   // q-axis 3-run
+            (100, 100), (100, 101),  // r-axis 2-run
+            (98, 104), (99, 103),    // third-axis 2-run
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+
+        // Verify (independently of gumbel_mcts) that this is a genuine
+        // depth-3 forced win at the exact self-play budgets the shortcut
+        // uses -- not depth <=2, which even a smarter single-turn check
+        // might stumble onto.
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            forcing::Outcome::No => panic!("expected a forced win, got No"),
+            forcing::Outcome::BudgetExceeded => panic!("expected a forced win, got BudgetExceeded"),
+        };
+        assert_eq!(solved.depth, 3, "test position must be exactly depth-3");
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        for seed in 0..10 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
+
+            assert_eq!(
+                result.action, solved.first_move,
+                "seed {seed}: action should be the solver's winning first move"
+            );
+            let action_idx = result
+                .coords
+                .iter()
+                .position(|&c| c == result.action)
+                .expect("action must be in coords");
+            assert_eq!(
+                result.improved_policy[action_idx], 1.0,
+                "seed {seed}: winning move should have probability 1.0"
+            );
+            for (i, &p) in result.improved_policy.iter().enumerate() {
+                if i != action_idx {
+                    assert_eq!(
+                        p, 0.0,
+                        "seed {seed}: non-winning move {i} should have probability 0.0"
+                    );
+                }
+            }
         }
     }
 }

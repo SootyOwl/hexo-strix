@@ -10,6 +10,8 @@ use hexo_engine::{Coord, GameState};
 use rand::Rng;
 
 use super::MCTSConfig;
+use super::forcing;
+use super::gumbel_mcts::{SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET};
 use super::halving::{compute_improved_policy, gumbel_top_k};
 use super::node::MCTSNode;
 use super::scoring::{QContext, sigma};
@@ -51,8 +53,7 @@ where
         return Ok(vec![]);
     }
 
-    // --- Phase 1: Batch root evaluation ---
-    // Collect all N root states into one eval call.
+    // --- Phase 0: filter out fully-terminal games ---
     let non_terminal: Vec<usize> = (0..n)
         .filter(|&i| !games[i].is_terminal())
         .collect();
@@ -61,13 +62,74 @@ where
         return Err("All games are terminal");
     }
 
-    let root_states: Vec<GameState> = non_terminal.iter().map(|&i| games[i].clone()).collect();
+    // `results[pos]` corresponds to `non_terminal[pos]` -- filled either by
+    // the forced-win shortcut below or by the halving search in Phase 4.
+    let mut results: Vec<Option<BatchedMCTSResult>> =
+        (0..non_terminal.len()).map(|_| None).collect();
+
+    // --- Phase 0.5: forced-win shortcut pre-pass.
+    //
+    // Mirrors `gumbel_mcts`'s Step 3.5 (Phase B): for each non-terminal game
+    // at the start of a turn (`moves_remaining_this_turn() == 2`), run the
+    // bounded fully-forcing solver BEFORE this game enters the halving/eval
+    // rounds. On a proven win, the game gets a one-hot result immediately
+    // and is excluded from both the root-eval batch and the halving loop
+    // below -- its NN eval is skipped entirely, same as the single-game
+    // shortcut. Games with `No`/`BudgetExceeded`, or mid-turn (mr=1) games,
+    // fall through to normal batched search unchanged.
+    let mut search_pos: Vec<usize> = Vec::new();
+    for (pos, &game_idx) in non_terminal.iter().enumerate() {
+        let game = &games[game_idx];
+        if game.moves_remaining_this_turn() == 2 {
+            if let forcing::Outcome::Win(w) =
+                forcing::solve(game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET)
+            {
+                // Defensive guard: `forcing::solve` is radius-aware, so
+                // `first_move` should always be a member of
+                // `game.legal_moves()`. Belt-and-suspenders against a future
+                // solver regression: never return an action that isn't
+                // legal -- fall through to normal search instead.
+                if game.legal_moves_set().contains(&w.first_move) {
+                    let coords = game.legal_moves();
+                    let idx = coords
+                        .iter()
+                        .position(|&c| c == w.first_move)
+                        .expect("first_move verified legal, so it is in coords");
+                    let mut improved_policy = vec![0.0; coords.len()];
+                    improved_policy[idx] = 1.0;
+                    results[pos] = Some(BatchedMCTSResult {
+                        action: w.first_move,
+                        improved_policy,
+                        coords,
+                    });
+                    continue;
+                }
+            }
+        }
+        search_pos.push(pos);
+    }
+
+    if search_pos.is_empty() {
+        return Ok(results
+            .into_iter()
+            .map(|r| r.expect("every slot filled by forced-win shortcut"))
+            .collect());
+    }
+
+    // --- Phase 1: Batch root evaluation ---
+    // Collect root states for every game still needing normal search into
+    // one eval call.
+    let root_states: Vec<GameState> = search_pos
+        .iter()
+        .map(|&pos| games[non_terminal[pos]].clone())
+        .collect();
     let (all_logits, all_values) = eval_fn(&root_states);
 
     // --- Phase 2: Initialize search state for each game ---
-    let mut searches: Vec<SearchState> = Vec::with_capacity(non_terminal.len());
+    let mut searches: Vec<SearchState> = Vec::with_capacity(search_pos.len());
 
-    for (eval_idx, &game_idx) in non_terminal.iter().enumerate() {
+    for (eval_idx, &pos) in search_pos.iter().enumerate() {
+        let game_idx = non_terminal[pos];
         let game = &games[game_idx];
         let legal_moves = game.legal_moves();
         let root_logits_map = &all_logits[eval_idx];
@@ -246,9 +308,7 @@ where
     }
 
     // --- Phase 4: Finalize each search ---
-    let mut results = Vec::with_capacity(searches.len());
-
-    for search in &searches {
+    for (search_i, search) in searches.iter().enumerate() {
         let improved_policy = compute_improved_policy(
             &search.logits,
             &search.coords,
@@ -273,20 +333,24 @@ where
             }
         }
 
-        results.push(BatchedMCTSResult {
+        let pos = search_pos[search_i];
+        results[pos] = Some(BatchedMCTSResult {
             action: selected_coord,
             improved_policy,
             coords: search.coords.clone(),
         });
     }
 
-    Ok(results)
+    Ok(results
+        .into_iter()
+        .map(|r| r.expect("every slot filled by forced-win shortcut or halving search"))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexo_engine::GameConfig;
+    use hexo_engine::{GameConfig, Player};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -329,5 +393,111 @@ mod tests {
         batched_gumbel_mcts(&[game], &config, &mut rng, &mut eval).unwrap();
 
         assert_eq!(states_seen, 1 + 200, "1 root eval + full sim budget");
+    }
+
+    /// The batched path must apply the same forced-win shortcut as
+    /// `gumbel_mcts` (Step 3.5, Phase B) to EACH game in the batch
+    /// independently: a forced-win game gets a one-hot result and never
+    /// touches `eval_fn`, while a quiet game in the same batch still runs
+    /// normal sequential halving.
+    #[test]
+    fn batched_forced_win_shortcut_is_per_game_one_hot_others_search_normally() {
+        // Depth-3 forced win fixture, identical to
+        // `gumbel_mcts_depth3_forced_win_returns_one_hot_policy` in
+        // gumbel_mcts.rs: a q-axis 3-run plus two 2-runs positioned to
+        // recreate `forcing::tests::mate_in_two_fork` one turn later.
+        let stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0),
+            (100, 100), (100, 101),
+            (98, 104), (99, 103),
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let forced_win_game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+
+        let solved = match forcing::solve(&forced_win_game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            _ => panic!("fixture must be an independently-verified forced win"),
+        };
+        assert_eq!(solved.depth, 3, "fixture must be exactly depth-3");
+
+        // Quiet position: fresh start-of-game state, no forcing structure
+        // at all, so the solver must return `No` and the game must fall
+        // through to normal batched search.
+        let quiet_game = GameState::with_config(GameConfig::FULL_HEXO);
+        assert_eq!(quiet_game.moves_remaining_this_turn(), 2);
+        assert!(
+            matches!(
+                forcing::solve(&quiet_game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET),
+                forcing::Outcome::No
+            ),
+            "quiet fixture must have no forced win"
+        );
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        // Track which states reach eval_fn -- the forced-win game's states
+        // (in particular its post-win-move continuations) must never appear,
+        // since its NN eval is skipped entirely by the shortcut.
+        let mut eval_call_count = 0usize;
+        let mut eval = |states: &[GameState]| {
+            eval_call_count += 1;
+            uniform_eval(states)
+        };
+
+        let results = batched_gumbel_mcts(
+            &[forced_win_game.clone(), quiet_game.clone()],
+            &config,
+            &mut rng,
+            &mut eval,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+
+        // The quiet game alone still needs eval calls (root + sims), so the
+        // shortcut short-circuiting the forced-win game must not have
+        // starved the batch of eval_fn calls entirely.
+        assert!(eval_call_count > 0, "quiet game must still reach eval_fn");
+
+        // Forced-win game: one-hot on the solver's first_move.
+        let forced_result = &results[0];
+        assert_eq!(
+            forced_result.action, solved.first_move,
+            "batched action should be the solver's winning first move"
+        );
+        let action_idx = forced_result
+            .coords
+            .iter()
+            .position(|&c| c == forced_result.action)
+            .expect("action must be in coords");
+        assert_eq!(forced_result.improved_policy[action_idx], 1.0);
+        for (i, &p) in forced_result.improved_policy.iter().enumerate() {
+            if i != action_idx {
+                assert_eq!(p, 0.0, "non-winning move {i} should have probability 0.0");
+            }
+        }
+
+        // Quiet game: normal search result -- with uniform priors and
+        // n=64/m=16 sims, visits spread across more than one candidate, so
+        // the improved_policy must NOT collapse to a one-hot vector.
+        let quiet_result = &results[1];
+        let quiet_nonzero = quiet_result
+            .improved_policy
+            .iter()
+            .filter(|&&p| p > 0.0)
+            .count();
+        assert!(
+            quiet_nonzero > 1,
+            "quiet position should have multiple non-zero policy entries, got {quiet_nonzero}"
+        );
     }
 }

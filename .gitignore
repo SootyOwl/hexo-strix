@@ -57,3 +57,6 @@ sealbot/
 .vscode/
 *.code-workspace
 .DS_Store
+
+# preserved real self-play corpora for bench_depth2_shortcut (large, local-only)
+bench-corpus/

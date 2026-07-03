@@ -1613,6 +1613,36 @@ fn py_augment_axis_states_to_batch_bytes(
     Ok(dict.into())
 }
 
+/// Pure-Rust forced-win (VCF: victory-by-continuous-forcing) search.
+///
+/// Searches for the shortest sequence of forcing moves (fours/completions)
+/// that forces a win for the side to move, independent of any neural network.
+/// Sound in all radius regimes — the solver is radius-aware, so it does not
+/// claim completions the attacker could not legally fill under the game's
+/// `placement_radius`.
+///
+/// Args:
+///     state: hexo_rs.GameState (non-terminal)
+///     depth_cap: maximum search depth, counted in attacker turns (default 40)
+///     node_budget: cap on the number of search nodes expanded (default 20_000_000)
+///
+/// Returns:
+///     `(first_move, pv)` — the first move of the forced win and its full
+///     principal variation (both attacker and defender replies), or `None` if
+///     no forced win was found within `depth_cap` / `node_budget`.
+#[pyfunction]
+#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000))]
+fn solve_forcing(
+    state: &PyGameState,
+    depth_cap: u8,
+    node_budget: u64,
+) -> Option<((i32, i32), Vec<(i32, i32)>)> {
+    match crate::mcts::forcing::solve(&state.inner, depth_cap, node_budget) {
+        crate::mcts::forcing::Outcome::Win(w) => Some((w.first_move, w.pv)),
+        crate::mcts::forcing::Outcome::No | crate::mcts::forcing::Outcome::BudgetExceeded => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 0 DAG-MCTS spike: thread-local instrumentation bindings.
 // Feature-gated; only present when built with `--features dedup_count`.
@@ -1678,6 +1708,7 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_augment_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_axis_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_batched_self_play, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_forcing, m)?)?;
     #[cfg(feature = "torch")]
     m.add_function(wrap_pyfunction!(py_native_self_play, m)?)?;
     #[cfg(feature = "dedup_count")]

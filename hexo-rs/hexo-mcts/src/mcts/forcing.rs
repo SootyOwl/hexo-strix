@@ -1,5 +1,6 @@
 //! Fully-forcing (VCF) threat-space solver. Pure Rust; no NN dependency.
 //! Ports scripts/forcing_search_prototype.py (validated). See the design spec.
+use hexo_engine::hex::{hex_distance as hex_dist, hex_offsets};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -53,12 +54,29 @@ impl SolverBoard {
     pub fn get(&self, coord: Coord) -> Option<Player> {
         self.stones.get(&coord).copied()
     }
+    /// True iff `cell` is within hex-distance `radius` of some stone currently on
+    /// the board. This is exactly the engine's legality disk (a cell is legal iff
+    /// empty AND within `placement_radius` of a stone; see `legal_moves::legal_moves`),
+    /// built directly from `hex::hex_offsets` so the solver and engine can never
+    /// silently desync on the disk shape. Only ever called in the tight-radius
+    /// regime (`radius < win_length - 1`), where the disk is small.
+    #[inline]
+    pub fn within_radius(&self, cell: Coord, radius: i32) -> bool {
+        hex_offsets(radius)
+            .iter()
+            .any(|&(dq, dr)| self.stones.contains_key(&(cell.0 + dq, cell.1 + dr)))
+    }
 }
 
 /// Enemy-free length-wl windows through `player`'s stones holding >= wl-2 of them;
 /// each returned as its sorted empty cells (size 1 or 2). Strip-scan per (stone, axis).
-pub fn completions(board: &SolverBoard, player: Player, wl: u8) -> FxHashSet<Vec<Coord>> {
+pub fn completions(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> FxHashSet<Vec<Coord>> {
     let l = wl as i32;
+    // Radius-awareness: a window is a real completion only if the attacker can
+    // legally fill ALL its gap cells. Skip entirely when radius >= win_length-1
+    // (every gap of a >= wl-2 window is within wl-1 <= radius of a window stone),
+    // keeping the wide-radius path byte-for-byte unchanged and zero-cost.
+    let enforce = radius < l - 1;
     let mut result: FxHashSet<Vec<Coord>> = FxHashSet::default();
     let mut stones: Vec<Coord> = board.stones.iter()
         .filter(|&(_, &owner)| owner == player)
@@ -82,6 +100,12 @@ pub fn completions(board: &SolverBoard, player: Player, wl: u8) -> FxHashSet<Vec
                     }
                 }
                 if !enemy && (pc as i32) >= (wl as i32) - 2 && (pc as i32) <= (wl as i32) - 1 {
+                    // In the tight regime, drop the window if any gap is unplayable:
+                    // the attacker could not legally complete it, so it is not a real
+                    // completion (nor a legal defender block / cover).
+                    if enforce && empties.iter().any(|&e| !board.within_radius(e, radius)) {
+                        continue;
+                    }
                     empties.sort_unstable();
                     result.insert(empties);
                 }
@@ -126,8 +150,9 @@ pub fn min_covers(comps: &[Vec<Coord>]) -> (u8, Vec<Vec<Coord>>) {
 
 /// Near-complete lines (enemy-free windows with wl-4..wl-3 stones), indexed by empty
 /// cell — so a move's B is a table lookup, not a rescan.
-pub fn threat_table(board: &SolverBoard, player: Player, wl: u8) -> FxHashMap<Coord, Vec<(Vec<Coord>, u8)>> {
+pub fn threat_table(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> FxHashMap<Coord, Vec<(Vec<Coord>, u8)>> {
     let l = wl as i32;
+    let enforce = radius < l - 1;
     let mut index: FxHashMap<Coord, Vec<(Vec<Coord>, u8)>> = FxHashMap::default();
     let mut seen: FxHashSet<Vec<Coord>> = FxHashSet::default();
     let mut stones: Vec<Coord> = board.stones.iter()
@@ -152,6 +177,15 @@ pub fn threat_table(board: &SolverBoard, player: Player, wl: u8) -> FxHashMap<Co
                 let window: Vec<Coord> = coords[k..k + l as usize].to_vec();
                 if !seen.insert(window) { continue; }
                 empties.sort_unstable();
+                // Window-level filtering (matches `completions()`'s semantics): in the
+                // tight regime, drop the WHOLE window if any of its empty cells is
+                // unplayable, rather than filtering per-cell. Per-cell filtering could
+                // leave an unplayable companion cell embedded in a *surviving* cell's
+                // payload, inflating that cell's `move_b` B-count with a gap the
+                // attacker could never legally fill.
+                if enforce && empties.iter().any(|&e| !board.within_radius(e, radius)) {
+                    continue;
+                }
                 for &e in empties.iter() {
                     index.entry(e).or_default().push((empties.clone(), pc));
                 }
@@ -180,30 +214,33 @@ pub fn move_b(index: &FxHashMap<Coord, Vec<(Vec<Coord>, u8)>>, mv: &[Coord], wl:
     min_covers(&v).0
 }
 
-pub fn has_completion(board: &SolverBoard, player: Player, wl: u8, max_empties: u8) -> bool {
-    completions(board, player, wl).iter().any(|c| c.len() as u8 <= max_empties)
+pub fn has_completion(board: &SolverBoard, player: Player, wl: u8, max_empties: u8, radius: i32) -> bool {
+    completions(board, player, wl, radius).iter().any(|c| c.len() as u8 <= max_empties)
 }
 
 /// Sound gate: can the attacker make a four this turn? (any enemy-free window with
 /// >= wl-4 attacker stones). Equivalent to a non-empty threat table.
-pub fn any_four_gate(board: &SolverBoard, attacker: Player, wl: u8) -> bool {
-    !threat_table(board, attacker, wl).is_empty()
+pub fn any_four_gate(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> bool {
+    !threat_table(board, attacker, wl, radius).is_empty()
 }
 
-pub fn attacker_turns(board: &SolverBoard, attacker: Player, defender: Player, placements: u8, wl: u8) -> Vec<Vec<Coord>> {
-    let index = threat_table(board, attacker, wl);
+pub fn attacker_turns(board: &SolverBoard, attacker: Player, defender: Player, placements: u8, wl: u8, radius: i32) -> Vec<Vec<Coord>> {
+    let enforce = radius < wl as i32 - 1;
+    let index = threat_table(board, attacker, wl, radius);
     let mut hot: Vec<Coord> = index.keys().copied().collect();
     hot.sort_unstable();
     let mut scored: Vec<(u8, Vec<Coord>)> = Vec::new();
     if placements == 1 {
         for &c in &hot {
+            // c must be a legal placement on the current board.
+            if enforce && !board.within_radius(c, radius) { continue; }
             let b = move_b(&index, &[c], wl);
             if b >= 2 { scored.push((b, vec![c])); }
         }
     } else {
         // partners = hot ∪ defender-block cells (cells of defender completions)
         let mut partners: FxHashSet<Coord> = hot.iter().copied().collect();
-        for comp in completions(board, defender, wl) {
+        for comp in completions(board, defender, wl, radius) {
             for cell in comp { partners.insert(cell); }
         }
         let mut partners_sorted: Vec<Coord> = partners.into_iter().collect();
@@ -214,6 +251,21 @@ pub fn attacker_turns(board: &SolverBoard, attacker: Player, defender: Player, p
                 if a == h { continue; }
                 let mv = if h < a { (h, a) } else { (a, h) };
                 if !seen.insert(mv) { continue; }
+                // Two-placement legality: mv.0 is played first, so it must be legal on
+                // the current board; mv.1 is played second, so it must be legal on the
+                // board AFTER mv.0 — i.e. within radius of an existing stone OR of mv.0.
+                if enforce {
+                    let (c1, c2) = mv;
+                    if !board.within_radius(c1, radius) { continue; }
+                    // `hex_dist(c1, c2) <= radius` is currently unreachable: `hot` and
+                    // `partners` are both pre-filtered to `within_radius` against the
+                    // pre-move board (via the window-level filtering in `threat_table`
+                    // / `completions`), so `board.within_radius(c2, radius)` is already
+                    // guaranteed true here. Retained for correctness if that
+                    // pre-filtering is ever relaxed -- a known completeness gap
+                    // (rejecting some legal two-placement moves), not a soundness one.
+                    if !(board.within_radius(c2, radius) || hex_dist(c1, c2) <= radius) { continue; }
+                }
                 let b = move_b(&index, &[mv.0, mv.1], wl);
                 if b >= 2 { scored.push((b, vec![mv.0, mv.1])); }
             }
@@ -238,6 +290,7 @@ struct SearchState {
     budget: u64,
     exceeded: bool,
     wl: u8,
+    radius: i32,
     atk: Player,
     dfn: Player,
 }
@@ -254,8 +307,8 @@ fn tick(s: &mut SearchState) -> bool {
 /// Mirrors the prototype's `_node_comps`.
 fn node_comps(board: &SolverBoard, s: &mut SearchState) -> (Vec<Vec<Coord>>, Vec<Vec<Coord>>) {
     if let Some(v) = s.comps.get(&board.hash) { return v.clone(); }
-    let mut atk_c: Vec<Vec<Coord>> = completions(board, s.atk, s.wl).into_iter().collect();
-    let mut dfn_c: Vec<Vec<Coord>> = completions(board, s.dfn, s.wl).into_iter().collect();
+    let mut atk_c: Vec<Vec<Coord>> = completions(board, s.atk, s.wl, s.radius).into_iter().collect();
+    let mut dfn_c: Vec<Vec<Coord>> = completions(board, s.dfn, s.wl, s.radius).into_iter().collect();
     atk_c.sort_unstable();
     dfn_c.sort_unstable();
     let v = (atk_c, dfn_c);
@@ -269,7 +322,7 @@ fn node_comps(board: &SolverBoard, s: &mut SearchState) -> (Vec<Vec<Coord>>, Vec
 fn attacker_turns_memo(board: &SolverBoard, placements: u8, s: &mut SearchState) -> Vec<Vec<Coord>> {
     let key = (board.hash, placements);
     if let Some(v) = s.gencache.get(&key) { return v.clone(); }
-    let moves = attacker_turns(board, s.atk, s.dfn, placements, s.wl);
+    let moves = attacker_turns(board, s.atk, s.dfn, placements, s.wl, s.radius);
     s.gencache.insert(key, moves.clone());
     moves
 }
@@ -304,6 +357,19 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
     if bnum >= 3 { return if budget >= 1 { (true, false) } else { (false, true) }; }
     let key = (board.hash, false, 0, budget);
     if let Some(&v) = s.tt.get(&key) { return v; }
+    // Defender covers are single cells the defender plays to block; each must be a
+    // legal placement. Covers are drawn only from the cells of `atk_comps`, which
+    // `completions` has already filtered to within-radius gaps in the tight regime,
+    // so every cover cell is playable by construction — assert the invariant.
+    #[cfg(debug_assertions)]
+    if s.radius < s.wl as i32 - 1 {
+        for cover in &covers {
+            debug_assert!(
+                cover.iter().all(|&c| board.within_radius(c, s.radius)),
+                "defender cover cell is out of placement radius"
+            );
+        }
+    }
     let mut result = (true, false);
     for cover in covers {
         for &c in &cover { board.place(c, s.dfn); }
@@ -316,14 +382,14 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
 }
 
 pub fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
-                  placements_remaining: u8, wl: u8, depth_cap: u8, node_budget: u64) -> SolveResult {
+                  placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64) -> SolveResult {
     // sound gate
-    if !any_four_gate(board, attacker, wl) && !has_completion(board, attacker, wl, placements_remaining) {
+    if !any_four_gate(board, attacker, wl, radius) && !has_completion(board, attacker, wl, placements_remaining, radius) {
         return SolveResult::No;
     }
     let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
         comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-        exceeded: false, wl, atk: attacker, dfn: defender };
+        exceeded: false, wl, radius, atk: attacker, dfn: defender };
     for depth in 1..=depth_cap {
         let (won, cut) = atk_within(board, placements_remaining, depth, &mut s);
         if won { return SolveResult::Win { depth }; }
@@ -342,18 +408,19 @@ pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     let attacker = match game.current_player() { Some(p) => p, None => return Outcome::No };
     let defender = attacker.opponent();
     let wl = game.config().win_length;
+    let radius = game.config().placement_radius;
     let placements = game.moves_remaining_this_turn();
     let mut board = SolverBoard::new();
     for (&c, &p) in game.stones() { board.place(c, p); }
-    match solve_from(&mut board, attacker, defender, placements, wl, depth_cap, node_budget) {
+    match solve_from(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget) {
         SolveResult::No => Outcome::No,
         SolveResult::BudgetExceeded => Outcome::BudgetExceeded,
         SolveResult::Win { depth } => {
             // Compute on the pristine (post-solve_from, pre-extract_pv) board: extract_pv
             // permanently applies the winning line to `board`, so first_winning_move must
             // run first or it would be probing an already-won position.
-            let fm = first_winning_move(&mut board, attacker, defender, placements, wl, depth, node_budget);
-            let pv = extract_pv(&mut board, attacker, defender, placements, wl, depth, node_budget);
+            let fm = first_winning_move(&mut board, attacker, defender, placements, wl, radius, depth, node_budget);
+            let pv = extract_pv(&mut board, attacker, defender, placements, wl, radius, depth, node_budget);
             match fm.or_else(|| pv.first().copied()) {
                 Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
                 // Should be impossible for a proven win, but never panic: fall back to
@@ -369,17 +436,17 @@ pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
 /// `def_within(depth-1, ..)` (fresh full-budget state) holds. Never panics; `None` only
 /// if no such move exists (shouldn't happen for a proven win).
 fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Player,
-                       placements: u8, wl: u8, depth: u8, node_budget: u64) -> Option<Coord> {
-    for c in completions(board, attacker, wl) {
+                       placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64) -> Option<Coord> {
+    for c in completions(board, attacker, wl, radius) {
         if c.len() as u8 <= placements {
             return c.first().copied();
         }
     }
-    for mv in attacker_turns(board, attacker, defender, placements, wl) {
+    for mv in attacker_turns(board, attacker, defender, placements, wl, radius) {
         for &c in &mv { board.place(c, attacker); }
         let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
             comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-            exceeded: false, wl, atk: attacker, dfn: defender };
+            exceeded: false, wl, radius, atk: attacker, dfn: defender };
         let (w, _) = def_within(board, depth.saturating_sub(1), &mut s);
         for &c in &mv { board.remove(c); }
         if w { return mv.first().copied(); }
@@ -390,13 +457,13 @@ fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Playe
 /// Port of principal_variation: returns the flat placement sequence of one winning line
 /// (attacker turns interleaved with prolonging defender covers), ending in six-in-a-row.
 fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
-              mut placements: u8, wl: u8, depth: u8, node_budget: u64) -> Vec<Coord> {
+              mut placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64) -> Vec<Coord> {
     let mut pv: Vec<Coord> = Vec::new();
     let mut remaining = depth;
     loop {
         // attacker to move: immediate completion?
         let mut fin: Option<Vec<Coord>> = None;
-        for c in completions(board, attacker, wl) {
+        for c in completions(board, attacker, wl, radius) {
             if c.len() as u8 <= placements { fin = Some(c); break; }
         }
         if let Some(cells) = fin {
@@ -405,11 +472,11 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
         }
         // find a winning forcing move
         let mut chosen: Option<Vec<Coord>> = None;
-        for mv in attacker_turns(board, attacker, defender, placements, wl) {
+        for mv in attacker_turns(board, attacker, defender, placements, wl, radius) {
             for &c in &mv { board.place(c, attacker); }
             let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
                 comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-                exceeded: false, wl, atk: attacker, dfn: defender };
+                exceeded: false, wl, radius, atk: attacker, dfn: defender };
             let (w, _) = def_within(board, remaining - 1, &mut s);
             for &c in &mv { board.remove(c); }
             if w { chosen = Some(mv); break; }
@@ -418,7 +485,7 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
         for &c in &mv { board.place(c, attacker); pv.push(c); }
         placements = 2;
         // defender: B>=3 terminal, or prolonging cover
-        let comps: Vec<Vec<Coord>> = completions(board, attacker, wl).into_iter().collect();
+        let comps: Vec<Vec<Coord>> = completions(board, attacker, wl, radius).into_iter().collect();
         let (bnum, covers) = min_covers(&comps);
         if bnum >= 3 {
             // defender blocks two threat cells (futile), attacker completes next loop
@@ -436,7 +503,7 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
             for d in 1..remaining {
                 let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
                     comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-                    exceeded: false, wl, atk: attacker, dfn: defender };
+                    exceeded: false, wl, radius, atk: attacker, dfn: defender };
                 let (w, _) = atk_within(board, 2, d, &mut s);
                 if w { sub = Some(d); break; }
             }
@@ -462,7 +529,7 @@ mod tests {
         // __XXXX__ along the q-axis, no enemies (wl=6)
         let mut b = SolverBoard::new();
         for q in 0..4 { b.place((q, 0), Player::P1); }
-        let comps = completions(&b, Player::P1, 6);
+        let comps = completions(&b, Player::P1, 6, 8);
         let want: FxHashSet<Vec<Coord>> = [
             vec![(-2, 0), (-1, 0)],   // left
             vec![(-1, 0), (4, 0)],    // straddle
@@ -491,12 +558,12 @@ mod tests {
         // 5-run open both ends -> B=2 unique cover
         let mut b = SolverBoard::new();
         for q in 0..5 { b.place((q, 0), Player::P1); }
-        assert_eq!(min_covers(&sorted_vec(completions(&b, Player::P1, 6))).0, 2);
+        assert_eq!(min_covers(&sorted_vec(completions(&b, Player::P1, 6, 8))).0, 2);
         // walled 4-run (one empty each side) -> B=1
         let mut w = SolverBoard::new();
         for q in 0..4 { w.place((q, 0), Player::P1); }
         w.place((-2, 0), Player::P2); w.place((5, 0), Player::P2);
-        assert_eq!(min_covers(&sorted_vec(completions(&w, Player::P1, 6))).0, 1);
+        assert_eq!(min_covers(&sorted_vec(completions(&w, Player::P1, 6, 8))).0, 1);
     }
 
     fn sorted_vec(s: FxHashSet<Vec<Coord>>) -> Vec<Vec<Coord>> { s.into_iter().collect() }
@@ -506,7 +573,7 @@ mod tests {
         // two 3-runs sharing (0,0) on q and r axes; playing (3,0)+(0,3) -> B>=3
         let mut b = SolverBoard::new();
         for c in [(0,0),(1,0),(2,0),(0,1),(0,2)] { b.place(c, Player::P1); }
-        let idx = threat_table(&b, Player::P1, 6);
+        let idx = threat_table(&b, Player::P1, 6, 8);
         assert!(move_b(&idx, &[(3,0),(0,3)], 6) >= 3);
         // a lone extension is only B<=2
         assert!(move_b(&idx, &[(3,0),(9,9)], 6) <= 2);
@@ -516,10 +583,10 @@ mod tests {
     fn attacker_turns_orders_double_four_first() {
         let mut b = SolverBoard::new();
         for c in [(0,0),(1,0),(2,0),(0,1),(0,2)] { b.place(c, Player::P1); }
-        let moves = attacker_turns(&b, Player::P1, Player::P2, 2, 6);
+        let moves = attacker_turns(&b, Player::P1, Player::P2, 2, 6, 8);
         assert!(!moves.is_empty());
         // the top move creates B>=3
-        let idx = threat_table(&b, Player::P1, 6);
+        let idx = threat_table(&b, Player::P1, 6, 8);
         assert!(move_b(&idx, &moves[0], 6) >= 3);
     }
 
@@ -527,7 +594,7 @@ mod tests {
     fn any_four_gate_false_on_scattered() {
         let mut b = SolverBoard::new();
         b.place((0,0), Player::P1); b.place((10,10), Player::P1);
-        assert!(!any_four_gate(&b, Player::P1, 6));
+        assert!(!any_four_gate(&b, Player::P1, 6, 8));
     }
 
     fn line(cells: &[Coord], p: Player) -> SolverBoard {
@@ -539,17 +606,17 @@ mod tests {
     #[test]
     fn mate_in_one() {
         let mut b = line(&[(0,0),(1,0),(2,0),(3,0),(4,0)], Player::P1);
-        assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 40, 5_000_000), SolveResult::Win { depth: 1 }));
+        assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000), SolveResult::Win { depth: 1 }));
     }
     #[test]
     fn mate_in_two_fork() {
         let mut b = line(&[(0,0),(1,0),(2,0),(0,1),(0,2)], Player::P1);
-        assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 40, 5_000_000), SolveResult::Win { depth: 2 }));
+        assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000), SolveResult::Win { depth: 2 }));
     }
     #[test]
     fn no_forcing_win() {
         let mut b = line(&[(0,0),(10,10)], Player::P1);
-        assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 40, 5_000_000), SolveResult::No));
+        assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000), SolveResult::No));
     }
 
     #[test]
@@ -598,14 +665,14 @@ mod tests {
     #[test]
     fn wl4_and_wl2_do_not_panic() {
         let mut b4 = line(&[(0,0),(1,0),(2,0)], Player::P1);
-        let _ = solve_from(&mut b4, Player::P1, Player::P2, 2, 4, 10, 100_000);
-        let _ = completions(&b4, Player::P1, 4);
-        let _ = threat_table(&b4, Player::P1, 4);
+        let _ = solve_from(&mut b4, Player::P1, Player::P2, 2, 4, 8, 10, 100_000);
+        let _ = completions(&b4, Player::P1, 4, 8);
+        let _ = threat_table(&b4, Player::P1, 4, 8);
 
         let mut b2 = line(&[(0,0)], Player::P1);
-        let _ = solve_from(&mut b2, Player::P1, Player::P2, 2, 2, 10, 100_000);
-        let _ = completions(&b2, Player::P1, 2);
-        let _ = threat_table(&b2, Player::P1, 2);
+        let _ = solve_from(&mut b2, Player::P1, Player::P2, 2, 2, 8, 10, 100_000);
+        let _ = completions(&b2, Player::P1, 2, 8);
+        let _ = threat_table(&b2, Player::P1, 2, 8);
     }
 
     // FIX 3: candidate enumeration (board.stones / game.stones() hashmap iteration) must
@@ -625,6 +692,68 @@ mod tests {
             _ => panic!("expected Win"),
         };
         assert_eq!(a, b, "first_move must be deterministic across calls");
+    }
+
+    /// TDD regression for the radius-blindness bug: in the tight regime
+    /// (`placement_radius < win_length - 1`) the solver must never return a forced win
+    /// whose line plays a cell outside the placement radius (an ILLEGAL HeXO move).
+    ///
+    /// Construction (`win_length = 6`, attacker = P2): a single fork cell `(20,0)`
+    /// extends two P2 three-runs into two simultaneous 4-in-a-rows (a double-four,
+    /// move_b == 4) -> forced win at depth 2. A *distant* P2 two-run at
+    /// `(-15,0),(-14,0)` seeds threat cells far from every stone; a radius-blind
+    /// `attacker_turns` pairs one of those far cells (e.g. `(-19,0)`, hex-distance 4
+    /// from the nearest stone) with the fork cell as a useless partner and drops it
+    /// into the winning line. Legal at radius 8, ILLEGAL at radius 2.
+    #[test]
+    fn radius_aware_rejects_illegal_forcing_win() {
+        use hexo_engine::game::{GameState, GameConfig};
+        let stones: Vec<(Coord, Player)> = vec![
+            ((0, 0), Player::P1),                                                // seeded distant defender stone
+            ((21, 0), Player::P2), ((22, 0), Player::P2), ((23, 0), Player::P2), // q-arm three-run
+            ((20, 1), Player::P2), ((20, 2), Player::P2), ((20, 3), Player::P2), // r-arm three-run
+            ((-15, 0), Player::P2), ((-14, 0), Player::P2),                      // distant threat two-run
+        ];
+        let cfg = |r: i32| GameConfig { win_length: 6, placement_radius: r, max_moves: 200 };
+
+        // Walk the PV from the initial stones; return the first cell that is NOT within
+        // `radius` of a stone present just before it is played (legality is colour-agnostic).
+        let first_illegal = |pv: &[Coord], radius: i32| -> Option<Coord> {
+            let mut present: FxHashSet<Coord> = stones.iter().map(|(c, _)| *c).collect();
+            for &cell in pv {
+                let legal = present.iter().any(|&s| hex_dist(cell, s) <= radius);
+                if !legal { return Some(cell); }
+                present.insert(cell);
+            }
+            None
+        };
+
+        // Control + non-vacuity: at radius 8 (>= win_length-1, so all legality work is
+        // skipped) the solver returns the win, and its PV contains a cell that would be
+        // ILLEGAL under radius 2 -- proving the position really triggers the bug.
+        let g8 = GameState::from_state(&stones, Player::P2, 2, cfg(8));
+        let w8 = match solve(&g8, 40, 5_000_000) {
+            Outcome::Win(w) => w,
+            _ => panic!("radius-8 control: expected Win"),
+        };
+        assert_eq!(w8.depth, 2, "radius-8 win depth");
+        assert!(
+            first_illegal(&w8.pv, 2).is_some(),
+            "non-vacuous test needs the radius-blind PV {:?} to contain a cell illegal under radius 2",
+            w8.pv
+        );
+
+        // The fix: at radius 2 the solver must not return a win that plays an illegal
+        // cell; for ANY win it returns, every PV cell must be legal when played.
+        let g2 = GameState::from_state(&stones, Player::P2, 2, cfg(2));
+        match solve(&g2, 40, 5_000_000) {
+            Outcome::Win(w) => {
+                if let Some(bad) = first_illegal(&w.pv, 2) {
+                    panic!("radius-2 solver returned a win with out-of-radius move {bad:?} in PV {:?}", w.pv);
+                }
+            }
+            Outcome::No | Outcome::BudgetExceeded => {} // also acceptable: no bogus win returned
+        }
     }
 
     // Cross-implementation parity fixtures captured from the validated Python
@@ -664,7 +793,7 @@ mod tests {
             let mut b = SolverBoard::new();
             for &(c, p) in stones { b.place(c, p); }
             let defender = attacker.opponent();
-            let r = solve_from(&mut b, attacker, defender, placements, 6, 40, 80_000_000);
+            let r = solve_from(&mut b, attacker, defender, placements, 6, 8, 40, 80_000_000);
             match r {
                 SolveResult::Win { depth } => assert_eq!(depth, d, "depth mismatch on fixture"),
                 SolveResult::No => panic!("expected Win{{{d}}}, got No"),
@@ -682,7 +811,7 @@ mod tests {
             let mut b = SolverBoard::new();
             for &(c, p) in stones { b.place(c, p); }
             let defender = attacker.opponent();
-            let r = solve_from(&mut b, attacker, defender, placements, 6, 40, 80_000_000);
+            let r = solve_from(&mut b, attacker, defender, placements, 6, 8, 40, 80_000_000);
             match r {
                 SolveResult::Win { depth } => assert_eq!(depth, d, "depth mismatch on fixture"),
                 SolveResult::No => panic!("expected Win{{{d}}}, got No"),
@@ -712,7 +841,7 @@ mod tests {
         let mut b = SolverBoard::new();
         for &(c, p) in stones { b.place(c, p); }
         let defender = attacker.opponent();
-        let r = solve_from(&mut b, attacker, defender, placements, 6, 6, 80_000_000);
+        let r = solve_from(&mut b, attacker, defender, placements, 6, 8, 6, 80_000_000);
         assert!(
             !matches!(r, SolveResult::Win { .. }),
             "unsound: Rust found a forced win where the validated Python solver found none"
@@ -737,7 +866,7 @@ mod tests {
             for &(c, p) in stones { b.place(c, p); }
             let defender = attacker.opponent();
             let t = std::time::Instant::now();
-            let r = solve_from(&mut b, attacker, defender, placements, 6, 20, 300_000_000);
+            let r = solve_from(&mut b, attacker, defender, placements, 6, 8, 20, 300_000_000);
             let elapsed = t.elapsed();
             eprintln!("{code} -> {r:?}  ({elapsed:.2?})");
         }

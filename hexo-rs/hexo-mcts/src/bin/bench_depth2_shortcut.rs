@@ -7,20 +7,25 @@
 //!     (size m_actions) for both depth-1 and depth-2 forced wins.
 //!   - **all-legal**: scan every legal move at the root for the same.
 //!
-//! Positions are extracted directly from a `games_*.bin` (HX04) emitted
-//! by the running self-play loop, so the benchmark exercises realistic
-//! mid/late-game distributions rather than random play (random play
-//! almost never produces own_4 patterns, defeating the purpose).
+//! Positions are extracted directly from a `games_*.bin` emitted by the
+//! running self-play loop (current wire format: HX07 board-state records;
+//! legacy HX03/HX04 serialized-graph records also supported, auto-detected
+//! by magic), so the benchmark exercises realistic mid/late-game
+//! distributions rather than random play (random play almost never produces
+//! own_4 patterns, defeating the purpose). Falls back to a synthetic
+//! corpus when no real `games.bin` is found on disk.
 //!
 //! Usage:
-//!     bench_depth2_shortcut <games.bin> [--max=N]
+//!     bench_depth2_shortcut [<games.bin>|synthetic] [--corpus=PATH] [--max=N] [--depth-cap=N] [--node-budget=N]
 //!
 //! Output: per-position-bucket wall-clock cost, hit-rate divergence, and
 //! projected per-MCTS-call overhead.
 
 use hexo_engine::{Coord, GameConfig, GameState, Player};
 use hexo_rs::mcts::MCTSConfig;
+use hexo_rs::mcts::forcing;
 use hexo_rs::mcts::gumbel_mcts::gumbel_mcts;
+use hexo_rs::mcts::gumbel_mcts::{SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET};
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -513,6 +518,250 @@ fn read_positions(path: &str, max_positions: usize) -> Vec<Position> {
     positions
 }
 
+// --- HX07 reader (board-state records; current self-play wire format) ---
+//
+// HX07 envelope: [4B magic "HX07"][4B LE record_size][4B LE num_examples]
+// [1B winner i8][4B LE move_count u32][1B has_window u8]
+// [opt 12B window stats IFF has_window==1].
+// Each example: [2B num_stones u16][1B current_player u8 (0=P1,1=P2)]
+// [1B moves_remaining u8][2B num_legal u16][4B value f32][4B sample_weight f32]
+// [num_stones*(2B q i16, 2B r i16, 1B player u8)][num_legal*4B policy f32].
+// See `self_play.rs`'s `RECORD_MAGIC_HX07` docs (~line 1169) for the
+// authoritative spec this mirrors. Only `stones`/`current_player`/
+// `moves_remaining` are needed for the forcing-solve bench; value/
+// sample_weight/policy are skipped over (cursor advanced past them).
+const MAGIC_HX07: &[u8; 4] = b"HX07";
+
+fn read_i8(buf: &[u8], offset: &mut usize) -> i8 {
+    let v = buf[*offset] as i8;
+    *offset += 1;
+    v
+}
+
+fn parse_example_hx07(buf: &[u8], offset: &mut usize) -> Position {
+    let num_stones = read_u16_le(buf, offset) as usize;
+    let current_player_byte = buf[*offset];
+    *offset += 1;
+    let moves_remaining = buf[*offset];
+    *offset += 1;
+    let num_legal = read_u16_le(buf, offset) as usize;
+    *offset += 4; // value f32
+    *offset += 4; // sample_weight f32
+
+    let mut stones: Vec<(Coord, Player)> = Vec::with_capacity(num_stones);
+    for _ in 0..num_stones {
+        let q = read_i16_le(buf, offset) as i32;
+        let r = read_i16_le(buf, offset) as i32;
+        let p = if buf[*offset] == 0 { Player::P1 } else { Player::P2 };
+        *offset += 1;
+        stones.push(((q, r), p));
+    }
+
+    // Policy floats aren't needed for the forcing-solve bench; skip.
+    *offset += num_legal * 4;
+
+    let current_player = if current_player_byte == 0 { Player::P1 } else { Player::P2 };
+
+    Position {
+        stones,
+        current_player,
+        moves_remaining,
+        legal_coords: Vec::new(),
+        policy: Vec::new(),
+    }
+}
+
+fn read_positions_hx07(path: &str, max_positions: usize) -> Vec<Position> {
+    let mut file = File::open(path).expect("open HX07 games.bin");
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).expect("read");
+
+    let mut positions = Vec::new();
+    let mut cursor = 0;
+    while cursor + 8 < buf.len() && positions.len() < max_positions {
+        let magic = &buf[cursor..cursor + 4];
+        if magic != MAGIC_HX07 {
+            panic!("unknown magic at offset {cursor}: {magic:?} (expected HX07)");
+        }
+        cursor += 4;
+        let record_size = read_u32_le(&buf, &mut cursor) as usize;
+        let record_end = cursor + record_size;
+        let num_examples = read_u32_le(&buf, &mut cursor);
+        let _winner = read_i8(&buf, &mut cursor);
+        cursor += 4; // move_count u32
+        let has_window = buf[cursor] != 0;
+        cursor += 1;
+        if has_window {
+            cursor += 12; // in_window(2) + gated(2) + mass_removed(4) + acted_deficit(4)
+        }
+        let mut examples_parsed = 0u32;
+        for _ in 0..num_examples {
+            if positions.len() >= max_positions {
+                break;
+            }
+            let pos = parse_example_hx07(&buf, &mut cursor);
+            positions.push(pos);
+            examples_parsed += 1;
+        }
+        // If we parsed every example in this record (didn't bail early on
+        // max_positions), the cursor must land exactly on record_end -- the
+        // same exact-byte-consumption invariant `self_play.rs`'s HX07
+        // round-trip test checks. A mismatch here would mean the per-example
+        // offset math (parse_example_hx07) has drifted from the writer
+        // (write_example_hx07), which -- unlike a magic mismatch -- would
+        // NOT otherwise crash the loop (cursor is unconditionally reset to
+        // record_end below), so it could silently corrupt multi-example
+        // records without this check.
+        if examples_parsed == num_examples {
+            assert_eq!(
+                cursor, record_end,
+                "HX07 record parsed to offset {cursor} but expected record_end {record_end} \
+                 (num_examples={num_examples}) -- parse_example_hx07 offset math has drifted \
+                 from the HX07 writer"
+            );
+        }
+        cursor = record_end;
+    }
+    positions
+}
+
+/// Sniff the first 4 bytes of a file to detect its magic, if it exists and
+/// is readable. Returns `None` if the path doesn't exist or is too short.
+fn sniff_magic(path: &str) -> Option<[u8; 4]> {
+    let mut file = File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    Some(magic)
+}
+
+// --- Synthetic corpus (fallback when no real games.bin is on disk) ---
+//
+// The bench originally read positions out of a real self-play `games_*.bin`
+// (HX03/HX04, a serialized-graph wire format). The self-play writer has since
+// moved to HX07 (board-state records; see `self_play.rs`'s
+// `RECORD_MAGIC_HX07` docs and `read_positions_hx07` above), and `main()`
+// prefers a real HX07 corpus (default: `DEFAULT_HX07_CORPUS`) when present on
+// disk. This synthetic generator remains as a fallback for environments where
+// no real corpus is available (e.g. a fresh checkout with no self-play run
+// yet): it plays games directly with `hexo_engine`, no NN involved, using a
+// biased-random policy (mostly random, occasionally preferring cells that
+// extend the mover's own axis runs) so that own-3/own-4 patterns -- and
+// occasionally deeper forced-win shapes -- actually occur, unlike pure
+// uniform random play. Only `stones` / `current_player` / `moves_remaining`
+// are populated (`legal_coords` / `policy` are left empty): the
+// `forcing::solve` measurement pass needs only board state, not a network
+// prior.
+
+/// Score a candidate cell by the most own stones already on some WIN_AXIS
+/// through it within `win_length - 1` cells (a cheap proxy for "how much
+/// this move builds toward a line"), used to bias synthetic self-play.
+fn own_axis_score(game: &GameState, me: Player, c: Coord) -> i32 {
+    use hexo_engine::types::WIN_AXES;
+    let (q, r) = c;
+    let max_dist = (game.config().win_length - 1) as i32;
+    let stones_ref = game.stones();
+    let mut best = 0i32;
+    for &(dq, dr) in &WIN_AXES {
+        let mut count = 0i32;
+        for d in 1..=max_dist {
+            if stones_ref.get(&(q + d * dq, r + d * dr)) == Some(&me) {
+                count += 1;
+            }
+            if stones_ref.get(&(q - d * dq, r - d * dr)) == Some(&me) {
+                count += 1;
+            }
+        }
+        best = best.max(count);
+    }
+    best
+}
+
+/// Pick a move: with probability `1 - bias` uniformly at random over legal
+/// moves; otherwise greedily (uniform tie-break) among the legal moves with
+/// the highest `own_axis_score`. `bias` close to 1 produces more line-heavy,
+/// tactical positions (own-3/4s, occasional forced wins); `bias` close to 0
+/// produces quiet/scattered positions, similar to genuine early self-play.
+fn choose_synthetic_move(game: &GameState, bias: f64, rng: &mut ChaCha8Rng) -> Coord {
+    let legal = game.legal_moves();
+    debug_assert!(!legal.is_empty());
+    if rng.random::<f64>() >= bias {
+        return legal[rng.random_range(0..legal.len())];
+    }
+    let me = game
+        .current_player()
+        .expect("non-terminal game guaranteed Some(current_player)");
+    let mut best_score = i32::MIN;
+    let mut best: Vec<Coord> = Vec::new();
+    for &c in &legal {
+        let score = own_axis_score(game, me, c);
+        if score > best_score {
+            best_score = score;
+            best.clear();
+            best.push(c);
+        } else if score == best_score {
+            best.push(c);
+        }
+    }
+    best[rng.random_range(0..best.len())]
+}
+
+/// Play one synthetic self-play-like game to terminal/draw, recording a
+/// `Position` snapshot at the start of every turn (`moves_remaining_this_turn()
+/// == 2`) -- the only point `forcing::solve` is ever invoked in production
+/// (`gumbel_mcts.rs`'s Step 3.5 guard). `legal_coords`/`policy` are left
+/// empty; only board state is needed downstream.
+fn play_synthetic_game(config: GameConfig, bias: f64, rng: &mut ChaCha8Rng) -> Vec<Position> {
+    let mut game = GameState::with_config(config);
+    let mut out = Vec::new();
+    loop {
+        if game.is_terminal() {
+            break;
+        }
+        if game.moves_remaining_this_turn() == 2 {
+            out.push(Position {
+                stones: game.placed_stones(),
+                current_player: game
+                    .current_player()
+                    .expect("non-terminal game guaranteed Some(current_player)"),
+                moves_remaining: game.moves_remaining_this_turn(),
+                legal_coords: Vec::new(),
+                policy: Vec::new(),
+            });
+        }
+        let mv = choose_synthetic_move(&game, bias, rng);
+        if game.apply_move(mv).is_err() {
+            break; // shouldn't happen: mv is drawn from game.legal_moves()
+        }
+    }
+    out
+}
+
+/// Generate a synthetic corpus by playing biased-random games until
+/// `max_positions` turn-start snapshots are collected (or `n_games` games
+/// have been played, whichever comes first). Mixes three bias levels across
+/// games (quiet / moderate / tactical) for a spread of position types.
+fn generate_synthetic_corpus(
+    config: GameConfig,
+    n_games: usize,
+    max_positions: usize,
+) -> Vec<Position> {
+    let mut positions = Vec::new();
+    for g in 0..n_games {
+        if positions.len() >= max_positions {
+            break;
+        }
+        let bias = match g % 3 {
+            0 => 0.25, // mostly random: quiet/scattered positions
+            1 => 0.6,  // moderate: some line-building
+            _ => 0.9,  // tactical: heavy line-building, more forced shapes
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(0xF0AC1A6 ^ (g as u64));
+        positions.extend(play_synthetic_game(config, bias, &mut rng));
+    }
+    positions.truncate(max_positions);
+    positions
+}
+
 #[derive(Default, Debug)]
 struct BucketStats {
     label: &'static str,
@@ -755,23 +1004,242 @@ fn run_mcts_bench(
     println!("  virtual_loss:           {}", virtual_loss);
 }
 
+// --- forcing::solve vs. exhaustive depth-1/2 scan ---
+
+#[derive(Default)]
+struct ForcingBenchStats {
+    /// Positions actually measured (moves_remaining_this_turn() == 2 and
+    /// non-terminal -- the only point the shortcut fires in production).
+    n: usize,
+    times_us: Vec<f64>,
+    /// Same latencies, split by outcome. `no_or_exceeded_us` is the latency
+    /// class that matters most for self-play throughput: in production,
+    /// `forcing::solve` runs before every normal-search fallback, so on a
+    /// non-winning root (`No` or `BudgetExceeded`) its cost is pure overhead
+    /// added on top of the subsequent MCTS search -- unlike `Win`, which
+    /// replaces the search entirely (net win, not overhead).
+    win_us: Vec<f64>,
+    no_or_exceeded_us: Vec<f64>,
+    solve_win: usize,
+    solve_no: usize,
+    solve_budget_exceeded: usize,
+    /// Wins found by the exhaustive depth-1/2 scan (`shortcut_all_legal`,
+    /// unbounded by candidate set -- the strongest possible baseline for a
+    /// depth <= 2 shortcut).
+    old_win: usize,
+    old_d1: usize,
+    old_d2: usize,
+    /// `forcing::solve` found `Win` on a position the old exhaustive scan
+    /// also won -- expected, the common case.
+    both_win: usize,
+    /// Old scan found a win but `forcing::solve` did NOT -- a REGRESSION;
+    /// should be 0. Kept separate from `solve_no`/`solve_budget_exceeded`
+    /// tallies above for a direct superset check.
+    regressions: usize,
+    /// `forcing::solve` found a win the old exhaustive depth-1/2 scan could
+    /// not (i.e. a genuinely deeper, multi-turn forced win) -- the new
+    /// capability this solver adds.
+    extra_deeper_wins: usize,
+    win_depth_hist: HashMap<u8, usize>,
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((p * (sorted.len() - 1) as f64).round() as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+fn run_forcing_bench(
+    positions: &[Position],
+    config: GameConfig,
+    depth_cap: u8,
+    node_budget: u64,
+) -> ForcingBenchStats {
+    let mut stats = ForcingBenchStats::default();
+    for pos in positions {
+        // Matches the production guard in gumbel_mcts.rs Step 3.5: the
+        // solver only ever runs at the start of a turn.
+        if pos.moves_remaining != 2 {
+            continue;
+        }
+        let game = GameState::from_state(&pos.stones, pos.current_player, pos.moves_remaining, config);
+        if game.is_terminal() {
+            continue;
+        }
+
+        let old_hit = shortcut_all_legal(&game);
+
+        let t = Instant::now();
+        let outcome = forcing::solve(&game, depth_cap, node_budget);
+        let elapsed_us = t.elapsed().as_nanos() as f64 / 1000.0;
+
+        stats.n += 1;
+        stats.times_us.push(elapsed_us);
+
+        if let Some(c) = old_hit {
+            stats.old_win += 1;
+            if classify_hit(&game, c) == 1 {
+                stats.old_d1 += 1;
+            } else {
+                stats.old_d2 += 1;
+            }
+        }
+
+        match outcome {
+            forcing::Outcome::Win(w) => {
+                stats.solve_win += 1;
+                stats.win_us.push(elapsed_us);
+                *stats.win_depth_hist.entry(w.depth).or_insert(0) += 1;
+                if old_hit.is_some() {
+                    stats.both_win += 1;
+                } else {
+                    stats.extra_deeper_wins += 1;
+                }
+            }
+            forcing::Outcome::No => {
+                stats.solve_no += 1;
+                stats.no_or_exceeded_us.push(elapsed_us);
+                if old_hit.is_some() {
+                    stats.regressions += 1;
+                }
+            }
+            forcing::Outcome::BudgetExceeded => {
+                stats.solve_budget_exceeded += 1;
+                stats.no_or_exceeded_us.push(elapsed_us);
+                if old_hit.is_some() {
+                    stats.regressions += 1;
+                }
+            }
+        }
+    }
+    stats
+}
+
+fn print_forcing_report(stats: &ForcingBenchStats, depth_cap: u8, node_budget: u64) {
+    println!();
+    println!("=== forcing::solve vs. exhaustive depth-1/2 scan ===");
+    println!(
+        "depth_cap={depth_cap}  node_budget={node_budget}  positions measured (moves_remaining==2, non-terminal): {}",
+        stats.n
+    );
+    if stats.n == 0 {
+        println!("(no eligible positions -- nothing to report)");
+        return;
+    }
+
+    let mut sorted = stats.times_us.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sum: f64 = sorted.iter().sum();
+    let mean = sum / sorted.len() as f64;
+    let p50 = percentile(&sorted, 0.50);
+    let p99 = percentile(&sorted, 0.99);
+    let max = *sorted.last().unwrap();
+
+    println!();
+    println!("latency (us/position), ALL outcomes:");
+    println!("  mean = {mean:.2}   p50 = {p50:.2}   p99 = {p99:.2}   max = {max:.2}");
+
+    // Outcome-conditioned breakdown: `no_or_exceeded` is the class that
+    // matters for self-play throughput (see field doc on
+    // `ForcingBenchStats::no_or_exceeded_us`) -- it is pure overhead paid on
+    // every non-winning root before the normal MCTS search runs.
+    let mut win_sorted = stats.win_us.clone();
+    win_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut noex_sorted = stats.no_or_exceeded_us.clone();
+    noex_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if !win_sorted.is_empty() {
+        let m = win_sorted.iter().sum::<f64>() / win_sorted.len() as f64;
+        println!(
+            "  Win only        (n={}): mean={:.2}  p50={:.2}  p99={:.2}  max={:.2}",
+            win_sorted.len(),
+            m,
+            percentile(&win_sorted, 0.50),
+            percentile(&win_sorted, 0.99),
+            *win_sorted.last().unwrap(),
+        );
+    }
+    if !noex_sorted.is_empty() {
+        let m = noex_sorted.iter().sum::<f64>() / noex_sorted.len() as f64;
+        println!(
+            "  No/BudgetExceeded (n={}, pure overhead): mean={:.2}  p50={:.2}  p99={:.2}  max={:.2}",
+            noex_sorted.len(),
+            m,
+            percentile(&noex_sorted, 0.50),
+            percentile(&noex_sorted, 0.99),
+            *noex_sorted.last().unwrap(),
+        );
+    }
+
+    println!();
+    println!("outcomes:");
+    println!(
+        "  solve: Win={} ({:.2}%)  No={}  BudgetExceeded={}",
+        stats.solve_win,
+        100.0 * stats.solve_win as f64 / stats.n as f64,
+        stats.solve_no,
+        stats.solve_budget_exceeded,
+    );
+    println!(
+        "  old exhaustive depth-1/2 scan: Win={} (d1={}, d2={})",
+        stats.old_win, stats.old_d1, stats.old_d2
+    );
+    println!(
+        "  both agree Win: {}   solve-only (deeper) wins: {}   REGRESSIONS (old won, solve didn't): {}",
+        stats.both_win, stats.extra_deeper_wins, stats.regressions
+    );
+    println!(
+        "  superset check: {}",
+        if stats.regressions == 0 {
+            "PASS -- solve finds a superset of the old scan's wins"
+        } else {
+            "FAIL -- solve MISSED wins the old exhaustive scan found (regression!)"
+        }
+    );
+
+    let mut depths: Vec<&u8> = stats.win_depth_hist.keys().collect();
+    depths.sort();
+    print!("  win depth histogram: ");
+    for d in depths {
+        print!("depth={}:{}  ", d, stats.win_depth_hist[d]);
+    }
+    println!();
+}
+
+/// Default real self-play corpus (HX07, win_length=6/placement_radius=2 --
+/// matches this const's own regime). Preserved permanent copy: the live
+/// self-play `batches/` dir is ephemeral (the trainer consumes+deletes those
+/// files), so the bench points at a stable copy under `bench-corpus/`
+/// (git-ignored). Used when no positional path is given and the file is
+/// present on disk; falls back to `synthetic` otherwise.
+const DEFAULT_HX07_CORPUS: &str =
+    "/var/home/tyto/Development/personal/hexo-strix/bench-corpus/games_lean-d6_wl6r2_0002.bin";
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: {} <games.bin> [--max=N] [--radius=R] [--win=W] [--mcts] [--sims=N] [--vl=F]", args[0]);
-        std::process::exit(1);
-    }
-    let path = &args[1];
-    let mut max_positions: usize = 50_000;
+
+    // Positional path (first non-`--` argument), a `--corpus=` flag, or the
+    // default real HX07 corpus (if present) / `synthetic` (fallback). A real
+    // corpus is always preferred over synthetic when available.
+    let mut path: Option<String> = None;
+    let mut max_positions: Option<usize> = None;
+    let mut n_games: usize = 2_000;
     let mut radius: i32 = 2;
     let mut win_length: u8 = 6;
     let mut mode = CandidateMode::Gumbel;
     let mut do_mcts = false;
     let mut n_simulations: u32 = 128;
     let mut virtual_loss: f64 = 1.0;
-    for a in &args[2..] {
-        if let Some(v) = a.strip_prefix("--max=") {
-            max_positions = v.parse().expect("--max value");
+    let mut depth_cap: u8 = SELF_PLAY_DEPTH_CAP;
+    let mut node_budget: u64 = SELF_PLAY_NODE_BUDGET;
+    for a in &args[1..] {
+        if let Some(v) = a.strip_prefix("--corpus=") {
+            path = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--max=") {
+            max_positions = Some(v.parse().expect("--max value"));
+        } else if let Some(v) = a.strip_prefix("--games=") {
+            n_games = v.parse().expect("--games value");
         } else if let Some(v) = a.strip_prefix("--radius=") {
             radius = v.parse().expect("--radius value");
         } else if let Some(v) = a.strip_prefix("--win=") {
@@ -788,15 +1256,33 @@ fn main() {
             n_simulations = v.parse().expect("--sims value");
         } else if let Some(v) = a.strip_prefix("--vl=") {
             virtual_loss = v.parse().expect("--vl value");
+        } else if let Some(v) = a.strip_prefix("--depth-cap=") {
+            depth_cap = v.parse().expect("--depth-cap value");
+        } else if let Some(v) = a.strip_prefix("--node-budget=") {
+            node_budget = v.parse().expect("--node-budget value");
+        } else if !a.starts_with("--") {
+            path = Some(a.clone());
+        } else {
+            eprintln!("unknown flag: {a}");
+            std::process::exit(1);
         }
     }
-    let _ = mode; // unused in mcts mode
 
-    println!(
-        "Loading positions from {path} (max={max_positions}, radius={radius}, win={win_length}, candidates={mode:?})"
-    );
-    let positions = read_positions(path, max_positions);
-    println!("Loaded {} positions", positions.len());
+    // Resolve the path: explicit arg wins; otherwise prefer the real HX07
+    // corpus if it exists on disk; otherwise fall back to synthetic.
+    let path = path.unwrap_or_else(|| {
+        if std::path::Path::new(DEFAULT_HX07_CORPUS).exists() {
+            DEFAULT_HX07_CORPUS.to_string()
+        } else {
+            "synthetic".to_string()
+        }
+    });
+    let synthetic = path == "synthetic";
+    // Default cap: 50_000 for a real games.bin (unchanged); for the
+    // synthetic corpus, default to ~5000 turn-start positions (matches the
+    // corpus size assumed by docs/superpowers/plans/2026-07-03-forcing-solver-rust-port.md
+    // Task 11) unless the user overrides via --max.
+    let max_positions = max_positions.unwrap_or(if synthetic { 5_000 } else { 50_000 });
 
     let config = GameConfig {
         win_length,
@@ -804,8 +1290,56 @@ fn main() {
         max_moves: 200,
     };
 
+    // `has_policy_data`: only legacy HX03/HX04 records carry legal_coords/
+    // policy (needed for the Gumbel-top-K candidate-scoped table below).
+    // HX07 board-state records and the synthetic corpus leave those empty.
+    let (positions, has_policy_data) = if synthetic {
+        println!(
+            "Generating synthetic corpus (no real corpus found at {DEFAULT_HX07_CORPUS}): \
+             n_games={n_games}, max_positions={max_positions}, radius={radius}, win={win_length}"
+        );
+        let positions = generate_synthetic_corpus(config, n_games, max_positions);
+        println!("Generated {} turn-start positions", positions.len());
+        (positions, false)
+    } else {
+        // Auto-detect wire format by magic: HX07 (board-state, current
+        // format) vs. legacy HX03/HX04 (serialized-graph format).
+        let magic = sniff_magic(&path);
+        let (positions, has_policy_data) = match magic.as_ref().map(|m| m.as_slice()) {
+            Some(m) if m == MAGIC_HX07 => {
+                println!(
+                    "Loading HX07 positions from {path} (max={max_positions}, radius={radius}, win={win_length})"
+                );
+                (read_positions_hx07(&path, max_positions), false)
+            }
+            Some(_) => {
+                println!(
+                    "Loading legacy HX03/HX04 positions from {path} (max={max_positions}, radius={radius}, win={win_length}, candidates={mode:?})"
+                );
+                (read_positions(&path, max_positions), true)
+            }
+            None => panic!("could not open or sniff magic from {path}"),
+        };
+        println!("Loaded {} positions", positions.len());
+        (positions, has_policy_data)
+    };
+
     if do_mcts {
         run_mcts_bench(&positions, config, n_simulations, virtual_loss);
+        return;
+    }
+
+    // New: forcing::solve at the self-play budget vs. the exhaustive
+    // depth-1/2 scan. Works for both real (file) and synthetic corpora --
+    // only needs board state, not policy.
+    let forcing_stats = run_forcing_bench(&positions, config, depth_cap, node_budget);
+    print_forcing_report(&forcing_stats, depth_cap, node_budget);
+
+    // Old candidate-scoped comparison table: only meaningful with a real
+    // policy (Gumbel-top-K candidates need it), so skip it for the
+    // synthetic corpus and HX07 board-state corpora (legal_coords/policy
+    // are empty in both).
+    if !has_policy_data {
         return;
     }
 
