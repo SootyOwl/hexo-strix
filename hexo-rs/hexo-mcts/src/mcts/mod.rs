@@ -1,4 +1,9 @@
 pub mod acting;
+// batcher.rs uses std::time::Instant (panics at runtime on wasm32-unknown-unknown) and
+// is only consumed by the python-feature path + the self_play bin, never the serial
+// gumbel_mcts search. Gate it off wasm so a future wiring can't reintroduce a runtime
+// panic on the target — a compile-time guarantee stronger than the grep invariant.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod batcher;
 pub mod backup;
 pub mod batched;

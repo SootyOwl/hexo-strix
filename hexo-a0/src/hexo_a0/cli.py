@@ -260,6 +260,16 @@ def main(argv=None):
                                    "pre-emptive defense) for ALL difficulty tiers; falls "
                                    "back to byte-identical pre-forcing-feature MCTS/argmax play.")
 
+    # --- export ---
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Export checkpoint weights to safetensors (for hexo-infer / wasm)",
+    )
+    export_parser.add_argument("--checkpoint", type=str, required=True,
+                               help="Path to a .pt checkpoint with embedded model_config")
+    export_parser.add_argument("--out", type=str, required=True,
+                               help="Output .safetensors path")
+
     # --- default-config ---
     subparsers.add_parser(
         "default-config",
@@ -301,6 +311,9 @@ def main(argv=None):
 
     if args.command == "serve":
         return _run_serve(args)
+
+    if args.command == "export":
+        return _run_export(args)
 
     return 1
 
@@ -749,6 +762,18 @@ def _run_serve(args):
     # argparse converts hyphens to underscores, so args already has the
     # attribute shape app.run() expects.
     return run(args)
+
+
+def _run_export(args):
+    from hexo_a0.export import export_checkpoint
+
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.exists():
+        print(f"Checkpoint not found: {ckpt_path}")
+        return 1
+    meta = export_checkpoint(ckpt_path, Path(args.out))
+    print(f"Exported (train_steps={meta['train_steps']}, source={meta['source_checkpoint']}) -> {args.out}")
+    return 0
 
 
 if __name__ == "__main__":

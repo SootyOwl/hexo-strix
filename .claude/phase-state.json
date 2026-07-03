@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "plan_path": "docs/superpowers/plans/2026-07-02-wasm-inference.md",
+  "branch": "wasm-inference",
+  "phases": [
+    {
+      "id": 1,
+      "name": "Phase 1: wasm hygiene",
+      "status": "complete"
+    },
+    {
+      "id": 2,
+      "name": "Phase 2: export + fixtures",
+      "status": "complete"
+    },
+    {
+      "id": 3,
+      "name": "Phase 3: hexo-infer crate",
+      "status": "in_progress"
+    },
+    {
+      "id": 4,
+      "name": "Phase 4: hexo-wasm + worker demo",
+      "status": "pending"
+    }
+  ],
+  "current_phase_id": 3,
+  "current_state": "phase_breakdown",
+  "adversarial_review": {
+    "active": false,
+    "context": null,
+    "current_round": 0
+  },
+  "notes": "",
+  "updated_at": "2026-07-03T08:48:47+01:00"
+}

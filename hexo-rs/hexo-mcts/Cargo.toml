@@ -35,15 +35,26 @@ pyo3 = { version = "0.28", optional = true }
 tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ctrlc = "3"
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
 rayon = "1.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 rustc-hash = "2"
+
+# OS-only deps: ctrlc (signal registration), libc (fcntl/pipe FDs), crossbeam-channel
+# (used by the self_play bin's batcher). Cargo compiles non-optional deps for --lib too,
+# and none of these build for wasm32-unknown-unknown, so target-gate the declarations.
+# The bin self_play.rs uses them on native; --lib wasm checks never build the bin.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ctrlc = "3"
 libc = "0.2"
 crossbeam-channel = "0.5"
+
+# getrandom needs a wasm backend (rand 0.9 -> rand_core 0.9 -> getrandom 0.3 has no
+# wasm32-unknown-unknown host by default). The `wasm_js` feature + the cfg below enable it.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [[bin]]
 name = "self_play"

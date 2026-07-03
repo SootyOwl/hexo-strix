@@ -12,6 +12,7 @@ dependencies = [
     "torch>=2.11",
     "torch-geometric>=2.7",
     "tensorboard",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]

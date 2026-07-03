@@ -81,6 +81,12 @@ test-python:
 test-all:
     uv run --no-sync pytest hexo-a0/tests/ --tb=short -o "addopts="
 
+# Verify the engine + MCTS libs compile for the browser/WebWorker (wasm32) target.
+# Self-contained CARGO_TARGET_DIR: just runs each recipe in a fresh shell, so the
+# separate build dir is set here (never the shared hexo-rs/target/ the live trainer uses).
+check-wasm:
+    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target cargo check --lib -p hexo-engine -p hexo-mcts --target wasm32-unknown-unknown
+
 # Run the axis curriculum
 train-axis:
     uv run --no-sync hexo-a0 curriculum

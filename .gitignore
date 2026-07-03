@@ -60,3 +60,6 @@ sealbot/
 
 # preserved real self-play corpora for bench_depth2_shortcut (large, local-only)
 bench-corpus/
+
+exports/
+hexo-rs/hexo-infer/tests/fixtures/real_*.json

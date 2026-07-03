@@ -1,0 +1,8 @@
+# Wasm-target build config for hexo-rs crates.
+# getrandom 0.3 (via rand 0.9 -> rand_core 0.9) has no wasm32-unknown-unknown host by
+# default; the `wasm_js` backend is selected via this cfg. (Covers getrandom 0.3 and 0.4.)
+# NOTE: cargo config `rustflags` are IGNORED when a RUSTFLAGS env var is set (no merge),
+# and wasm-pack can inject its own — re-verify the cfg reached getrandom after the first
+# `wasm-pack build` (Phase 4); if it clobbered, export the combined RUSTFLAGS there.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
