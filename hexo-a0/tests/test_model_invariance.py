@@ -170,18 +170,37 @@ def test_relational_model_is_not_degenerate():
     assert torch.isfinite(policy_b).all() and torch.isfinite(value_b).all()
 
 
-def test_relational_model_rejects_edge_attr():
-    """Relational mode must not silently accept legacy edge_attr."""
-    config = _lean_relational_config()
+def test_relational_model_converts_legacy_edge_attr():
+    """A relational model handed a LEGACY graph (wide x + edge_attr[E,5], no
+    edge_type) converts on the fly: drops leaky node columns and splits
+    edge_attr into edge_type/edge_dist/global. It must run and stay finite."""
+    config = _lean_relational_config()  # lean node dim 7; input_proj sized 7
     net = HeXONet(config)
     net.eval()
     g = _synthetic_axis_graph(config, seed=1, with_global=False)
-    edge_attr = torch.randn(g["edge_index"].shape[1], 5)
-    with pytest.raises(ValueError):
-        net(
-            g["x"], g["edge_index"], g["legal_mask"], g["stone_mask"],
-            edge_attr=edge_attr,
+    n = g["x"].shape[0]
+    ei = g["edge_index"]
+    e = ei.shape[1]
+
+    # Legacy relative+threat node features are 11-dim (the model must reduce to 7).
+    torch.manual_seed(5)
+    x_legacy = torch.randn(n, 11)
+    # Legacy edge_attr[E,5] = [axis0, axis1, axis2, signed_dist, src_player];
+    # give each edge an axis one-hot + a signed distance; leave a couple as
+    # all-zero one-hot (dummy/global edges) to exercise the global split.
+    edge_attr = torch.zeros(e, 5)
+    for idx in range(e):
+        if idx < e - 2:
+            edge_attr[idx, idx % 3] = 1.0
+            edge_attr[idx, 3] = float((idx % 4) + 1) * (1 if idx % 2 else -1)
+        edge_attr[idx, 4] = 1.0  # src_player (dropped)
+
+    with torch.no_grad():
+        policy, value = net(
+            x_legacy, ei, g["legal_mask"], g["stone_mask"], edge_attr=edge_attr,
         )
+    assert policy.shape[0] == int(g["legal_mask"].sum())
+    assert torch.isfinite(policy).all() and torch.isfinite(value).all()
 
 
 def test_relational_model_requires_edge_type_and_dist():

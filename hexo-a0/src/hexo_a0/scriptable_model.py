@@ -13,12 +13,39 @@ The forward pass takes raw tensors (no PyG Batch object):
   - edge_attr: (E, 5) float — edge features (axis graphs), or empty tensor (hex)
 """
 
+from types import SimpleNamespace
 from typing import Final, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+def _legacy_lean_columns(
+    *,
+    relative_stone_encoding: bool,
+    threat_features: bool,
+    compact_stone_onehot: bool,
+    node_coords: bool,
+    moves_scope: str,
+):
+    """Legacy node-column indices the lean schema keeps (or ``None`` if no
+    reduction). Delegates to :func:`hexo_a0.config.legacy_lean_columns` via a
+    duck-typed namespace so the scriptable model's column map is guaranteed
+    identical to the eager model's. Called only in ``__init__`` (plain Python).
+    """
+    from hexo_a0.config import legacy_lean_columns
+
+    return legacy_lean_columns(
+        SimpleNamespace(
+            relative_stone_encoding=relative_stone_encoding,
+            threat_features=threat_features,
+            compact_stone_onehot=compact_stone_onehot,
+            node_coords=node_coords,
+            moves_scope=moves_scope,
+        )
+    )
 
 
 class GATv2Layer(nn.Module):
@@ -189,6 +216,149 @@ class GINELayer(nn.Module):
         return out
 
 
+class AxisRelationalLayer(nn.Module):
+    """TorchScript-compatible port of ``axis_conv.AxisRelationalConv``.
+
+    Reproduces the eager module EXACTLY:
+
+      - ONE shared GINE block (a :class:`GINELayer`) applied to each of
+        ``num_axes`` axis relations with TIED weights, the per-relation outputs
+        summed (permutation-symmetric SUM). Because GINE aggregation is additive
+        and the same weights hit every relation, relabelling the axes only
+        permutes the summands — exact axis-permutation invariance.
+      - a learned per-hop distance embedding ``Embedding(window, edge_dim)``
+        indexed by ``edge_dist - 1`` (unsigned hop), shared across relations.
+      - an OPTIONAL separate global/dummy relation with its OWN untied GINE and
+        its OWN learned ``global_edge_embed`` broadcast to every global edge;
+        it is NOT part of the axis sum, so it never breaks the symmetry.
+      - a ``node_update`` MLP over ``cat(x, summed_messages)``.
+
+    The inner GINE is a :class:`GINELayer`, whose ``eps``/``mlp_0``/``mlp_1``/
+    ``lin_edge`` names line up with PyG ``GINEConv``'s ``eps``/``nn.0``/``nn.2``/
+    ``lin`` after ``load_from_hexonet``'s key translation, so the eager weights
+    map straight across. Requires ``in_dim == out_dim`` (as in the model).
+    """
+
+    num_axes: Final[int]
+    use_global: Final[bool]
+    num_buckets: Final[int]
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        window: int,
+        num_axes: int = 3,
+        use_global: bool = True,
+    ):
+        super().__init__()
+        if in_dim != out_dim:
+            raise ValueError(
+                f"AxisRelationalLayer requires in_dim == out_dim (GINELayer is "
+                f"single-width), got in_dim={in_dim}, out_dim={out_dim}."
+            )
+        # edge_dim / mlp_hidden default to in_dim / out_dim exactly as the eager
+        # AxisRelationalConv does when the model omits those kwargs.
+        edge_dim = in_dim
+        self.out_dim = out_dim
+        self.window = window
+        self.num_axes = num_axes
+        self.use_global = use_global
+        # Fixed number of scatter buckets: one per axis relation + one global
+        # (when enabled). The global relation's edges live in bucket ``num_axes``.
+        self.num_buckets = num_axes + 1 if use_global else num_axes
+
+        # Per-hop distance embedding (unsigned): rows 0..window-1 <-> dist 1..window.
+        self.dist_embed = nn.Embedding(window, edge_dim)
+        # ONE shared GINE reused across all axis relations (tied weights).
+        self.axis_conv = GINELayer(out_dim, edge_dim=edge_dim)
+        # Separate untied global branch + its own learned edge feature. Always
+        # allocated for TorchScript shape stability; ``use_global`` (Final) gates
+        # whether it is applied in forward. The model always builds use_global=True.
+        self.global_conv = GINELayer(out_dim, edge_dim=edge_dim)
+        self.global_edge_embed = nn.Parameter(torch.randn(edge_dim) * 0.1)
+        # Combine invariant residual node features with the summed messages.
+        self.node_update = nn.Sequential(
+            nn.Linear(in_dim + out_dim, out_dim),
+            nn.ReLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        edge_bucket: Tensor,
+        edge_dist: Tensor,
+    ) -> Tensor:
+        """Fixed-shape, ``fullgraph``-safe reformulation of the eager conv.
+
+        Every edge (3 axes + global/dummy) is represented uniformly by
+        ``(edge_index, edge_bucket, edge_dist)`` with ``edge_bucket`` in
+        ``0..num_axes-1`` for axis edges and ``num_axes`` for global edges, so
+        NO per-axis boolean masking / ``nonzero`` split (the data-dependent ops
+        that produced unbacked symints ``torch.compile(fullgraph=True)`` could
+        not guard on) is needed.
+
+        Mathematically identical to the eager per-axis-GINE-then-SUM: bucket
+        ``k`` holds exactly axis ``k``'s aggregated messages, and applying the
+        SHARED axis GINE to ``(1+eps)*x + bucket_k`` reproduces each summand
+        (incl. the ``(1+eps)*x`` self term even when a bucket is empty); the
+        global bucket runs the untied global GINE.
+        """
+        N = x.shape[0]
+        E = edge_bucket.shape[0]
+        src = edge_index[0]
+        dst = edge_index[1]
+
+        # Per-edge message, computed for ALL edges with a BRANCHLESS axis-vs-
+        # global edge-feature projection (both projections evaluated, selected
+        # by the global-column mask — no data-dependent split).
+        dist_feat = self.dist_embed((edge_dist - 1).long())  # (E, edge_dim)
+        axis_proj = self.axis_conv.lin_edge(dist_feat)       # (E, out_dim)
+        if self.use_global:
+            is_global_col = (edge_bucket == self.num_axes).unsqueeze(1)
+            global_proj = self.global_conv.lin_edge(
+                self.global_edge_embed.unsqueeze(0).expand(E, -1)
+            )                                                # (E, out_dim)
+            proj = torch.where(is_global_col, global_proj, axis_proj)
+        else:
+            proj = axis_proj
+        msg = F.relu(x.index_select(0, src) + proj)          # (E, out_dim)
+
+        # Scatter each edge's message into its (dst, bucket) slot of a
+        # FIXED-shape (N * num_buckets, out_dim) buffer. Data-dependent INDICES
+        # into a fixed-shape output are fullgraph-safe (no unbacked shapes).
+        flat_idx = dst * self.num_buckets + edge_bucket      # (E,)
+        buckets = torch.zeros(
+            N * self.num_buckets, self.out_dim, device=x.device, dtype=x.dtype
+        )
+        buckets.scatter_add_(0, flat_idx.unsqueeze(1).expand(E, self.out_dim), msg)
+        buckets = buckets.view(N, self.num_buckets, self.out_dim)
+
+        # Per-bucket GINE update. Axis buckets share the tied axis GINE and are
+        # SUMMED (each summand carries its own (1+eps)*x self term); the global
+        # bucket runs the untied global GINE. Reaches into the sub-convs'
+        # eps/mlp_0/mlp_1 params so the eager weights map straight across.
+        one_plus_eps = 1.0 + self.axis_conv.eps
+        agg = torch.zeros(N, self.out_dim, device=x.device, dtype=x.dtype)
+        for k in range(self.num_axes):
+            z = one_plus_eps * x + buckets.select(1, k)
+            a = self.axis_conv.mlp_1(F.relu(self.axis_conv.mlp_0(z)))
+            agg = agg + a
+
+        if self.use_global:
+            zg = (1.0 + self.global_conv.eps) * x + buckets.select(1, self.num_axes)
+            g = self.global_conv.mlp_1(F.relu(self.global_conv.mlp_0(zg)))
+            # Only contribute the global term when global edges are present, to
+            # match the eager module (which skips its branch on an empty global
+            # relation). Branchless indicator -> no data-dependent guard.
+            global_present = (edge_bucket == self.num_axes).any().to(x.dtype)
+            agg = agg + global_present * g
+
+        return self.node_update(torch.cat([x, agg], dim=-1))
+
+
 class ScriptableHeXONet(nn.Module):
     """TorchScript-compatible HeXO network.
 
@@ -204,6 +374,14 @@ class ScriptableHeXONet(nn.Module):
     # so the no-JK path stays bit-identical to the pre-JK forward.
     use_jk: Final[bool]
     jk_mode_id: Final[int]  # 0=sum, 1=cat, 2=max; lstm is unsupported here
+    # D6-invariant axis-relational backbone. Final so torch.jit.script constant-
+    # folds the whole relational-vs-legacy branch (the legacy path stays
+    # byte-identical when this is off, like ``use_jk``).
+    axis_relational: Final[bool]
+    axis_window: Final[int]
+    # Number of hex axis relations (global/dummy edges use bucket ``axis_num_axes``).
+    # Matches the ``num_axes=3`` the AxisRelationalLayers are built with.
+    axis_num_axes: Final[int]
 
     def __init__(
         self,
@@ -219,6 +397,13 @@ class ScriptableHeXONet(nn.Module):
         use_layer_scale: bool = False,
         use_jk: bool = False,
         jk_mode: str = "sum",
+        axis_relational: bool = False,
+        axis_window: int = 8,
+        relative_stone_encoding: bool = False,
+        threat_features: bool = False,
+        compact_stone_onehot: bool = False,
+        node_coords: bool = True,
+        moves_scope: str = "node",
     ):
         super().__init__()
         # ScriptableHeXONet supports sum/cat/max. lstm is intentionally out of
@@ -239,11 +424,34 @@ class ScriptableHeXONet(nn.Module):
         self.conv_type = conv_type
         self.use_layer_scale = use_layer_scale
         self.use_jk = use_jk
+        self.axis_relational = axis_relational
+        self.axis_window = axis_window
+        self.axis_num_axes = 3
         # Head input dim: L*H for cat mode, H otherwise.
         head_in_dim = num_layers * hidden_dim if (use_jk and jk_mode == "cat") else hidden_dim
         self.head_in_dim = head_in_dim
 
-        # Input projection
+        # Legacy->lean node-column index map (same result as
+        # ``config.legacy_lean_columns``). The inference server sends a LEGACY
+        # graph over the wire (wide ``x``); the axis_relational forward shim uses
+        # this to drop the leaky columns before ``input_proj`` (which is sized to
+        # the LEAN width). Registered as a non-persistent buffer so it rides on
+        # ``.to(device)`` but never enters a checkpoint. Identity (arange) when
+        # the schema needs no reduction, so the index_select is a safe no-op.
+        _cols = _legacy_lean_columns(
+            relative_stone_encoding=relative_stone_encoding,
+            threat_features=threat_features,
+            compact_stone_onehot=compact_stone_onehot,
+            node_coords=node_coords,
+            moves_scope=moves_scope,
+        )
+        if _cols is None:
+            _cols = list(range(node_features))
+        self.register_buffer(
+            "lean_cols", torch.tensor(_cols, dtype=torch.long), persistent=False
+        )
+
+        # Input projection (sized to the LEAN node width).
         self.input_proj = nn.Linear(node_features, hidden_dim)
 
         # Edge feature projection for axis graphs.
@@ -255,11 +463,20 @@ class ScriptableHeXONet(nn.Module):
         else:
             self.edge_proj = nn.Linear(1, 1)  # dummy, unused for hex
 
-        # Conv layers with residual + LayerNorm
+        # Conv layers with residual + LayerNorm. In axis_relational mode the
+        # convs are tied-weight AxisRelationalLayers consuming edge_type/
+        # edge_dist/global_edge_index; otherwise the legacy GINE/GATv2 stack.
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
-            if conv_type == "gine":
+            if axis_relational:
+                self.convs.append(
+                    AxisRelationalLayer(
+                        hidden_dim, hidden_dim, window=axis_window,
+                        num_axes=3, use_global=True,
+                    )
+                )
+            elif conv_type == "gine":
                 self.convs.append(GINELayer(hidden_dim, edge_dim=edge_dim))
             else:
                 head_dim = hidden_dim // num_heads
@@ -317,6 +534,9 @@ class ScriptableHeXONet(nn.Module):
         legal_idx: Tensor = torch.zeros(0, dtype=torch.long),
         stone_idx: Tensor = torch.zeros(0, dtype=torch.long),
         stone_batch: Tensor = torch.zeros(0, dtype=torch.long),
+        edge_type: Tensor = torch.zeros(0, dtype=torch.long),
+        edge_dist: Tensor = torch.zeros(0, dtype=torch.long),
+        global_edge_index: Tensor = torch.zeros(0, dtype=torch.long),
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Forward pass on a batched graph.
 
@@ -338,12 +558,52 @@ class ScriptableHeXONet(nn.Module):
               - legal_counts: (num_graphs,) — count of legal moves per graph
               - values: (num_graphs,) — value predictions
         """
+        # --- Axis-relational preamble ---------------------------------------
+        # Unify ALL edges (3 axes + global/dummy) into fixed-shape inputs
+        # ``(ax_edge_index, edge_bucket, ed)`` with ``edge_bucket`` in
+        # ``0..num_axes-1`` for axis edges and ``num_axes`` for global edges.
+        # Built WITHOUT any boolean-mask split / ``nonzero`` (the data-dependent
+        # ops that made unbacked symints ``fullgraph=True`` could not guard on):
+        # data-dependent VALUES scattered into fixed-shape buckets are fine.
+        # Defined unconditionally so the Final-folded legacy branch type-checks.
+        #   - native-lean (training): fold the separate ``global_edge_index``
+        #     into the unified edge set (concat of fixed-shape inputs).
+        #   - legacy (the inference-server wire format): drop the leaky node
+        #     columns and map each edge to a bucket (axis argmax, or the global
+        #     bucket for all-zero axis one-hot) + unsigned hop — no split.
+        edge_bucket = edge_type
+        ed = edge_dist
+        ax_edge_index = edge_index
+        if self.axis_relational:
+            if edge_type.numel() == 0 and edge_attr.numel() > 0:
+                x = x.index_select(1, self.lean_cols)
+                axis_oh = edge_attr[:, 0:3]
+                is_global = axis_oh.abs().sum(1) <= 0.5
+                axis_bucket = axis_oh.argmax(1)
+                global_bucket = torch.full_like(axis_bucket, self.axis_num_axes)
+                edge_bucket = torch.where(is_global, global_bucket, axis_bucket)
+                ed = edge_attr.select(1, 3).abs().round().long()
+                ax_edge_index = edge_index
+            elif global_edge_index.numel() > 0:
+                n_glob = global_edge_index.shape[1]
+                ax_edge_index = torch.cat([edge_index, global_edge_index], dim=1)
+                glob_bucket = torch.full(
+                    (n_glob,), self.axis_num_axes,
+                    dtype=torch.long, device=x.device,
+                )
+                edge_bucket = torch.cat([edge_type, glob_bucket], dim=0)
+                glob_dist = torch.ones(n_glob, dtype=torch.long, device=x.device)
+                ed = torch.cat([edge_dist, glob_dist], dim=0)
+            # Defensive clamp into the per-hop embedding table's valid range.
+            ed = ed.long().clamp(1, self.axis_window)
+
         # Representation
         h = self.input_proj(x)
 
-        # Project edge features once for axis graphs; reuse across all layers
+        # Project edge features once for axis graphs; reuse across all layers.
+        # Skipped in relational mode (edge features come from the dist embedding).
         projected_edge_attr = torch.zeros(0)
-        if edge_attr.numel() > 0 and self.graph_type == "axis":
+        if edge_attr.numel() > 0 and self.graph_type == "axis" and not self.axis_relational:
             projected_edge_attr = self.edge_proj(edge_attr)
 
         # Per-layer post-residual outputs collected only when JK is on.
@@ -353,13 +613,19 @@ class ScriptableHeXONet(nn.Module):
             residual = h
             if self.pre_norm:
                 h = norm(h)
-                h = conv(h, edge_index, projected_edge_attr)
+                if self.axis_relational:
+                    h = conv(h, ax_edge_index, edge_bucket, ed)
+                else:
+                    h = conv(h, edge_index, projected_edge_attr)
                 if self.use_layer_scale:
                     h = layer_scale * h
                 h = h + residual
                 h = F.relu(h)
             else:
-                h = conv(h, edge_index, projected_edge_attr)
+                if self.axis_relational:
+                    h = conv(h, ax_edge_index, edge_bucket, ed)
+                else:
+                    h = conv(h, edge_index, projected_edge_attr)
                 if self.use_layer_scale:
                     h = layer_scale * h
                 h = h + residual
@@ -432,6 +698,12 @@ def load_from_hexonet(scriptable: ScriptableHeXONet, hexonet_state_dict: dict) -
     Maps PyG conv parameter names to our pure-PyTorch layer names.
     GATv2Conv: lin_l, lin_r, att, bias, lin_edge → same names in GATv2Layer.
     GINEConv: nn.0.weight/bias, nn.2.weight/bias, lin.weight → mlp_0/mlp_1/lin_edge.
+
+    Axis-relational (AxisRelationalConv) submodules ride the SAME translations:
+    each conv's ``dist_embed`` / ``global_edge_embed`` / ``node_update`` map
+    verbatim, while the shared ``axis_conv`` and untied ``global_conv`` are PyG
+    GINEConvs whose ``nn.0``/``nn.2``/``lin`` names are rewritten to the
+    scriptable GINELayer's ``mlp_0``/``mlp_1``/``lin_edge`` exactly as above.
     """
     mapping = {}
     for key in hexonet_state_dict:
@@ -525,6 +797,13 @@ def export_torchscript(
         use_layer_scale=getattr(config, "use_layer_scale", False),
         use_jk=getattr(config, "use_jk", False),
         jk_mode=getattr(config, "jk_mode", "sum"),
+        axis_relational=getattr(config, "axis_relational", False),
+        axis_window=getattr(config, "axis_window", 8),
+        relative_stone_encoding=getattr(config, "relative_stone_encoding", False),
+        threat_features=getattr(config, "threat_features", False),
+        compact_stone_onehot=getattr(config, "compact_stone_onehot", False),
+        node_coords=getattr(config, "node_coords", True),
+        moves_scope=getattr(config, "moves_scope", "node"),
     )
     load_from_hexonet(model, hexonet_state_dict)
     model.eval()

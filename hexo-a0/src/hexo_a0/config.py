@@ -62,6 +62,48 @@ def node_feature_dim(model_config) -> int:
     return base + (4 if threat else 0)
 
 
+def legacy_lean_columns(model_config):
+    """Legacy node-feature column indices to KEEP for the lean schema, in
+    ascending (native-lean) order — the map a relational model uses to convert a
+    legacy graph's node features to lean inputs on the fly (self-play / eval
+    paths still emit legacy graphs). Returns ``None`` when no lean node-schema
+    reduction applies (legacy == lean), so callers skip the index_select.
+    """
+    relative = getattr(model_config, "relative_stone_encoding", False)
+    threat = getattr(model_config, "threat_features", False)
+    compact = getattr(model_config, "compact_stone_onehot", False)
+    coords = getattr(model_config, "node_coords", True)
+    moves_graph = getattr(model_config, "moves_scope", "node") == "graph"
+    if not (compact or not coords or moves_graph):
+        return None  # no reduction — legacy layout already equals lean
+    if relative:
+        # [own, opp, empty, moves, norm_q, norm_r, inv_dist, threat*4]
+        keep = [0, 1]
+        if not compact:
+            keep.append(2)
+        if not moves_graph:
+            keep.append(3)
+        if coords:
+            keep += [4, 5]
+        keep.append(6)
+        if threat:
+            keep += [7, 8, 9, 10]
+    else:
+        # [P1, P2, empty, to_move, moves, norm_q, norm_r, inv_dist, threat*4]
+        keep = [0, 1]
+        if not compact:
+            keep.append(2)
+        keep.append(3)  # to_move retained (D6-invariant)
+        if not moves_graph:
+            keep.append(4)
+        if coords:
+            keep += [5, 6]
+        keep.append(7)
+        if threat:
+            keep += [8, 9, 10, 11]
+    return keep
+
+
 def model_config_from_checkpoint(ckpt, fallback_dict=None) -> "ModelConfig":
     """Build a ModelConfig for a loaded checkpoint dict.
 

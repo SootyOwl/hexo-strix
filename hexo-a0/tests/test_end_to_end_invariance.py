@@ -159,6 +159,42 @@ def test_native_lean_full_d6_invariance():
             )
 
 
+def _legacy_axis_data(moves):
+    """Today's LEGACY axis graph (11-dim x + edge_attr[E,5]) — what self-play
+    leaf inference and the eval collate path still produce."""
+    st = _build_state(moves)
+    return game_to_axis_graph(st, prune_empty_edges=True, threat_features=True,
+                              relative_stones=True)
+
+
+def test_relational_model_legacy_equals_native_lean():
+    """The relational model fed a LEGACY graph (converts internally) produces
+    the SAME policy+value as fed the NATIVE lean graph — so self-play/eval
+    (legacy inputs) match training (native-lean inputs) exactly."""
+    cfg = ModelConfig(
+        relative_stone_encoding=True, threat_features=True,
+        compact_stone_onehot=True, node_coords=False, moves_scope="node",
+        axis_relational=True, num_layers=3, hidden_dim=32,
+        use_jk=True, jk_mode="cat", axis_window=8,
+    )
+    torch.manual_seed(0)
+    model = HeXONet(cfg).eval()
+
+    moves = [(0, 0), (1, 0), (0, 1), (2, 0), (-1, 1)]
+    gN = _native_lean_graph(moves)
+    with torch.no_grad():
+        polN, valN = _run(model, gN)
+
+    d = _legacy_axis_data(moves)  # 11-dim x + edge_attr[E,5]
+    assert d.x.shape[1] == 11 and d.edge_attr.shape[1] == 5
+    with torch.no_grad():
+        polL, valL = model(d.x, d.edge_index, d.legal_mask,
+                           stone_mask=d.stone_mask, edge_attr=d.edge_attr)
+
+    assert torch.allclose(valN, valL, atol=1e-5), "legacy-converted value != native lean"
+    assert torch.allclose(polN, polL, atol=1e-5), "legacy-converted policy != native lean"
+
+
 def test_lean_graph_matches_transform():
     """Sanity: the lean graph of g.P equals the g-transform of the lean graph of
     P — invariant node features, edge_type globally permuted, edge_dist equal."""

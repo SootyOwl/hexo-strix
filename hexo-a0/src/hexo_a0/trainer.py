@@ -1356,18 +1356,22 @@ class Trainer:
         import os, tempfile
         fd, tmp = tempfile.mkstemp(dir=str(sp_dir), suffix=".pt.tmp")
         os.close(fd)
-        torch.save({"model_state_dict": sd, "model_config": {
+        mc_dict = {
             f.name: getattr(self.model_config, f.name)
             for f in self.model_config.__dataclass_fields__.values()
-        }, "train_steps": export_steps}, tmp)
+        }
+        torch.save({"model_state_dict": sd, "model_config": mc_dict,
+                    "train_steps": export_steps}, tmp)
         os.replace(tmp, champion_path)
         self._champion_path = champion_path
 
-        # Also export to the self-play model path so Rust reloads
+        # Also export to the self-play model path so Rust reloads. Embed
+        # model_config so the inference server can read the (lean/relational)
+        # schema and build a matching model with no extra self-play CLI plumbing.
         if self.self_play_config.rust.python_inference:
             fd2, tmp2 = tempfile.mkstemp(dir=str(sp_dir), suffix=".pt.tmp")
             os.close(fd2)
-            torch.save({"model_state_dict": sd}, tmp2)
+            torch.save({"model_state_dict": sd, "model_config": mc_dict}, tmp2)
             os.replace(tmp2, sp_model_path)
             self._snapshot_to_pool(sp_model_path)
         else:
@@ -1631,7 +1635,10 @@ class Trainer:
             if rust_cfg.python_inference:
                 fd, tmp = tempfile.mkstemp(dir=str(sp_dir), suffix=".pt.tmp")
                 os.close(fd)
-                torch.save({"model_state_dict": sd}, tmp)
+                # Preserve the champion's embedded model_config (lean/relational
+                # schema) so the inference server auto-configures from the ckpt.
+                torch.save({"model_state_dict": sd,
+                            "model_config": ckpt.get("model_config")}, tmp)
                 os.replace(tmp, base_model_path)
             else:
                 from hexo_a0.scriptable_model import export_torchscript
@@ -1656,9 +1663,13 @@ class Trainer:
             # Python subprocess loads raw state dict, not TorchScript
             import os, tempfile, torch
             sd = self.model.state_dict()
+            mc_dict = {
+                f.name: getattr(self.model_config, f.name)
+                for f in self.model_config.__dataclass_fields__.values()
+            }
             fd, tmp = tempfile.mkstemp(dir=str(sp_dir), suffix=".pt.tmp")
             os.close(fd)
-            torch.save({"model_state_dict": sd}, tmp)
+            torch.save({"model_state_dict": sd, "model_config": mc_dict}, tmp)
             os.replace(tmp, base_model_path)
             model_path = base_model_path
             logger.info("Python inference: saved checkpoint %s", model_path)
@@ -3567,9 +3578,13 @@ class Trainer:
                     # Use atomic write (tmp + rename) to avoid partial reads.
                     import os, tempfile
                     sd = self.model.state_dict()
+                    mc_dict = {
+                        f.name: getattr(self.model_config, f.name)
+                        for f in self.model_config.__dataclass_fields__.values()
+                    }
                     fd, tmp = tempfile.mkstemp(dir=str(sp_dir), suffix=".pt.tmp")
                     os.close(fd)
-                    torch.save({"model_state_dict": sd}, tmp)
+                    torch.save({"model_state_dict": sd, "model_config": mc_dict}, tmp)
                     os.replace(tmp, sp_model_path)
                     logger.debug("Saved checkpoint for Python inference: %s", sp_model_path)
                     self._snapshot_to_pool(sp_model_path)

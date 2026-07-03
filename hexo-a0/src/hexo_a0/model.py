@@ -11,9 +11,27 @@ from torch_geometric.nn import GATv2Conv, GINEConv
 from torch_geometric.nn.models.jumping_knowledge import JumpingKnowledge
 
 from hexo_a0.axis_conv import AxisRelationalConv
-from hexo_a0.config import ModelConfig, node_feature_dim
+from hexo_a0.config import ModelConfig, node_feature_dim, legacy_lean_columns
 
 logger = logging.getLogger(__name__)
+
+
+def legacy_edges_to_lean(edge_index: Tensor, edge_attr: Tensor):
+    """Split a legacy axis ``edge_attr`` (E×5 = [axis0, axis1, axis2,
+    signed_dist, src_player]) into lean relational inputs: axis edges
+    (``edge_type`` in {0,1,2} + unsigned ``edge_dist``) plus a separate
+    ``global_edge_index`` for the dummy edges (all-zero axis one-hot).
+
+    Matches ``graph.legacy_to_lean`` / the native Rust lean builder, so a
+    relational model fed a legacy self-play/eval graph produces exactly the
+    lean result. Native-lean callers pass ``edge_type`` directly and never
+    reach this (e.g. training), so it is free for them.
+    """
+    axis_oh = edge_attr[:, 0:3]
+    is_axis = axis_oh.abs().sum(dim=1) > 0.5
+    edge_type = axis_oh.argmax(dim=1)[is_axis]
+    edge_dist = edge_attr[is_axis, 3].abs().round().long().clamp(min=1)
+    return edge_index[:, is_axis], edge_type, edge_dist, edge_index[:, ~is_axis]
 
 # Set of JK modes that go through PyG's JumpingKnowledge module rather than
 # the legacy scalar-weighted "sum" path. "cat" additionally changes the
@@ -78,6 +96,16 @@ class RepresentationNetwork(nn.Module):
         # consumes edge_type/edge_dist/global_edge_index directly in each conv.
         if self.axis_relational:
             self.axis_window = int(getattr(config, "axis_window", 8))
+            # Legacy→lean node-column map (self-play/eval feed legacy graphs);
+            # None when the lean node schema equals legacy (no reduction).
+            _cols = legacy_lean_columns(config)
+            if _cols is not None:
+                self.register_buffer(
+                    "_lean_cols", torch.tensor(_cols, dtype=torch.long),
+                    persistent=False,
+                )
+            else:
+                self._lean_cols = None
         elif graph_type == "axis":
             self.edge_proj = nn.Linear(5, config.hidden_dim)
 
@@ -235,24 +263,31 @@ class RepresentationNetwork(nn.Module):
         Returns:
             Node embedding matrix of shape (N, hidden_dim).
         """
+        # A relational model handed a LEGACY graph (edge_attr present, no
+        # edge_type) — as self-play leaf inference and the eval collate path
+        # still produce — converts to lean inputs on the fly: drop the leaky
+        # node columns and split edge_attr into edge_type/edge_dist/global.
+        # Native-lean callers (training) pass edge_type and skip this entirely,
+        # so it costs the training loop nothing.
+        if self.axis_relational and edge_type is None and edge_attr is not None:
+            if self._lean_cols is not None:
+                x = x.index_select(1, self._lean_cols)
+            edge_index, edge_type, edge_dist, global_edge_index = (
+                legacy_edges_to_lean(edge_index, edge_attr)
+            )
+            edge_attr = None
+
         x = self.input_proj(x)  # (N, hidden_dim)
 
         # Edge inputs. Relational mode consumes edge_type/edge_dist/global;
         # legacy mode projects edge_attr once and reuses it across layers.
         projected_edge_attr = None
         if self.axis_relational:
-            if edge_attr is not None:
-                raise ValueError(
-                    "Axis-relational model received unexpected edge_attr. "
-                    "Relational mode consumes edge_type/edge_dist/"
-                    "global_edge_index; ensure the graph builder matches "
-                    "model.axis_relational=True."
-                )
             if edge_type is None or edge_dist is None:
                 raise ValueError(
-                    "Axis-relational model requires edge_type and edge_dist "
-                    "but received None. Ensure the graph builder matches "
-                    "model.axis_relational=True."
+                    "Axis-relational model requires lean edge_type+edge_dist or "
+                    "a legacy edge_attr to convert, but received neither. Ensure "
+                    "the graph builder matches model.axis_relational=True."
                 )
             # Defensive clamp into the per-hop embedding table's valid range.
             edge_dist = edge_dist.long().clamp(1, self.axis_window)
@@ -501,9 +536,12 @@ class HeXONet(nn.Module):
             # Edges never cross subgraph boundaries and PyG applies node-index
             # offsets to both edge_index and global_edge_index, so the axis
             # message passing is correct per-subgraph — batching is transparent.
+            # edge_attr is passed too so a legacy collate batch (eval path)
+            # auto-converts; native-lean batches (training) carry edge_type.
             embeddings = self.representation(
                 batch.x,
                 batch.edge_index,
+                getattr(batch, "edge_attr", None),
                 edge_type=getattr(batch, "edge_type", None),
                 edge_dist=getattr(batch, "edge_dist", None),
                 global_edge_index=getattr(batch, "global_edge_index", None),

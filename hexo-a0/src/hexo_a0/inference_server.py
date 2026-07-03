@@ -152,8 +152,37 @@ def _load_model(args) -> torch.nn.Module:
     """Build and load a ScriptableHeXONet from checkpoint."""
     from hexo_a0.scriptable_model import ScriptableHeXONet, load_from_hexonet
 
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+
+    # The lean/relational schema is authoritative from the checkpoint's embedded
+    # model_config (training writes it into model_selfplay.pt), so self-play
+    # needs no extra CLI plumbing — the server auto-configures from the ckpt.
+    # CLI flags remain as a fallback for standalone/test invocations.
+    emb = ckpt.get("model_config") if isinstance(ckpt, dict) else None
+    if isinstance(emb, dict):
+        for _k in ("axis_relational", "axis_window", "compact_stone_onehot",
+                   "node_coords", "moves_scope", "relative_stone_encoding",
+                   "threat_features"):
+            if _k in emb:
+                setattr(args, _k, emb[_k])
+
+    # In axis_relational mode the model's input_proj is the LEAN width: the
+    # wire graph arrives legacy (args.node_dim, e.g. 11) and the shim reduces it
+    # to lean before input_proj. Size the model to the lean width accordingly.
+    node_features = args.node_dim
+    if getattr(args, "axis_relational", False):
+        from types import SimpleNamespace
+        from hexo_a0.config import node_feature_dim
+        node_features = node_feature_dim(SimpleNamespace(
+            relative_stone_encoding=getattr(args, "relative_stone_encoding", False),
+            threat_features=getattr(args, "threat_features", False),
+            compact_stone_onehot=getattr(args, "compact_stone_onehot", False),
+            node_coords=getattr(args, "node_coords", True),
+            moves_scope=getattr(args, "moves_scope", "node"),
+        ))
+
     model = ScriptableHeXONet(
-        node_features=args.node_dim,
+        node_features=node_features,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
@@ -164,9 +193,15 @@ def _load_model(args) -> torch.nn.Module:
         conv_type=args.conv_type,
         use_jk=getattr(args, "use_jk", False),
         jk_mode=getattr(args, "jk_mode", "sum"),
+        axis_relational=getattr(args, "axis_relational", False),
+        axis_window=getattr(args, "axis_window", 8),
+        relative_stone_encoding=getattr(args, "relative_stone_encoding", False),
+        threat_features=getattr(args, "threat_features", False),
+        compact_stone_onehot=getattr(args, "compact_stone_onehot", False),
+        node_coords=getattr(args, "node_coords", True),
+        moves_scope=getattr(args, "moves_scope", "node"),
     )
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
 
     # Strip _orig_mod. prefixes that torch.compile adds
@@ -193,6 +228,11 @@ def _load_model(args) -> torch.nn.Module:
         compile_kwargs = {}
         if getattr(args, "dynamic_compile", False) or os.environ.get("HEXO_DYNAMIC_COMPILE") == "1":
             compile_kwargs["dynamic"] = True
+        # The axis-relational encoder now unifies all edges into fixed-shape
+        # scatter buckets (no per-axis boolean masking / nonzero split), so it
+        # compiles under fullgraph=True like the legacy path — no graph breaks,
+        # no ~3x self-play launch overhead. (The heads' index_select path is
+        # taken because _prepare_tensors passes legal_idx/stone_idx.)
         model = torch.compile(model, fullgraph=True, **compile_kwargs)
 
     return model
@@ -655,6 +695,38 @@ def main() -> None:
         help="JK aggregation mode (only honored when --use-jk is set). "
              "'lstm' is not supported in ScriptableHeXONet — use --jk-mode "
              "sum/cat/max for self-play.",
+    )
+    # --- D6-invariant lean schema (must match the training config) ---
+    parser.add_argument(
+        "--axis-relational", action="store_true",
+        help="Use the D6-invariant axis-relational encoder (edge-type partition "
+             "+ tied-weight AxisRelationalConv). The server converts the legacy "
+             "wire graph to lean inputs internally; must match the checkpoint.",
+    )
+    parser.add_argument(
+        "--axis-window", type=int, default=8,
+        help="Max unsigned hop for the axis-relational distance embedding "
+             "(only with --axis-relational; must be >= win_length-1).",
+    )
+    parser.add_argument(
+        "--relative-stone-encoding", action="store_true",
+        help="Relative (own/opp) stone encoding — needed for the lean-column map.",
+    )
+    parser.add_argument(
+        "--threat-features", action="store_true",
+        help="Threat node features present — needed for the lean-column map.",
+    )
+    parser.add_argument(
+        "--compact-stone-onehot", action="store_true",
+        help="Lean schema: the redundant 'empty' stone one-hot dim is dropped.",
+    )
+    parser.add_argument(
+        "--no-node-coords", dest="node_coords", action="store_false", default=True,
+        help="Lean schema: norm-q/r node coordinates are dropped.",
+    )
+    parser.add_argument(
+        "--moves-scope", default="node", choices=["node", "graph"],
+        help="moves-remaining scope in the lean node schema.",
     )
     parser.add_argument(
         "--dynamic-compile", action="store_true",
