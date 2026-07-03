@@ -61,13 +61,16 @@ def turns_to_htttx(turns_so_far: list[list[tuple[int, int]]]) -> str:
     HTTTX implicitly assumes P1's (0,0) opening, so turns_so_far[0] is P2's
     first 2-stone turn (HTTTX turn 1), turns_so_far[1] is P1's first 2-stone
     turn (HTTTX turn 2), etc. Matches the format produced by
-    ``scripts/play_server.py:serialize_htttx``.
+    ``hexo_a0.serving.htttx.serialize_htttx``, including its mirror into
+    htttx.io's coordinate convention.
     """
+    from hexo_a0.serving.htttx import mirror_axial
+
     body = "version[1];\n"
     for i, pair in enumerate(turns_so_far, start=1):
         if not pair:
             continue
-        coords = "".join(f"[{q},{r}]" for q, r in pair)
+        coords = "".join(f"[{mq},{mr}]" for mq, mr in (mirror_axial(q, r) for q, r in pair))
         body += f"{i}. {coords};\n"
     return body
 

@@ -87,8 +87,9 @@ class TestTurnsToHtttx:
         assert turns_to_htttx([]) == "version[1];\n"
 
     def test_single_turn(self):
+        # Internal (q, r) -> htttx.io convention (q + r, -r).
         out = turns_to_htttx([[(-1, 1), (0, -1)]])
-        assert out == "version[1];\n1. [-1,1][0,-1];\n"
+        assert out == "version[1];\n1. [0,-1][-1,1];\n"
 
     def test_multiple_turns(self):
         out = turns_to_htttx([
@@ -98,9 +99,9 @@ class TestTurnsToHtttx:
         ])
         assert out == (
             "version[1];\n"
-            "1. [-1,1][0,-1];\n"
-            "2. [7,1][6,0];\n"
-            "3. [-1,-1][-1,0];\n"
+            "1. [0,-1][-1,1];\n"
+            "2. [8,-1][6,0];\n"
+            "3. [-2,1][-1,0];\n"
         )
 
     def test_partial_turn(self):

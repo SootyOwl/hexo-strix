@@ -164,6 +164,43 @@ def test_opens_legacy_db_without_step_column(tmp_path):
     assert r.bot_brag("strix", 100)["current"]["total"] == 1
 
 
+def test_htttx_regenerated_from_moves_json_on_migration(tmp_path):
+    # Rows recorded before the htttx.io-convention fix serialized internal
+    # coords verbatim into the htttx column; opening the DB must recompute it
+    # from moves_json (the ground truth) in the new convention.
+    db = str(tmp_path / "legacy.sqlite")
+    con = sqlite3.connect(db)
+    con.executescript(
+        "CREATE TABLE games ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT UNIQUE,"
+        " created_at TEXT, completed_at TEXT, human_name TEXT, human_side TEXT,"
+        " bot_side TEXT, winner TEXT, result_type TEXT, n_moves INTEGER,"
+        " mcts_sims INTEGER, win_length INTEGER, placement_radius INTEGER,"
+        " max_moves INTEGER, checkpoint_path TEXT, htttx TEXT, moves_json TEXT);")
+    old_convention = "version[1];\n1. [2,-2][0,-3];\n"
+    moves_json = '[[0, 0, "P1"], [2, -2, "P2"], [0, -3, "P2"]]'
+    con.execute(
+        "INSERT INTO games (game_id,created_at,completed_at,human_side,bot_side,"
+        "result_type,n_moves,mcts_sims,win_length,placement_radius,max_moves,"
+        "checkpoint_path,htttx,moves_json) VALUES "
+        "('g','t','t','P1','P2','win',3,64,6,8,400,'c.pt',?,?)",
+        (old_convention, moves_json))
+    # A row with unusable moves_json must be left alone, not crash the open.
+    con.execute(
+        "INSERT INTO games (game_id,created_at,completed_at,human_side,bot_side,"
+        "result_type,n_moves,mcts_sims,win_length,placement_radius,max_moves,"
+        "checkpoint_path,htttx,moves_json) VALUES "
+        "('bad','t','t','P1','P2','win',0,64,6,8,400,'c.pt','version[1];','not json')")
+    con.commit()
+    con.close()
+    Recorder(db)
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT htttx FROM games WHERE game_id='g'").fetchone()[0] \
+        == "version[1];\n1. [0,2][-3,3];\n"
+    assert con.execute("SELECT htttx FROM games WHERE game_id='bad'").fetchone()[0] \
+        == "version[1];"
+
+
 def test_model_label_default_unknown(tmp_path):
     db = str(tmp_path / "g.sqlite")
     r = Recorder(db)

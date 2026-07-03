@@ -2,6 +2,7 @@ pub mod acting;
 pub mod batcher;
 pub mod backup;
 pub mod batched;
+pub mod forcing;
 pub mod gumbel_mcts;
 pub mod halving;
 pub mod node;

@@ -314,13 +314,19 @@ class AxisRelationalLayer(nn.Module):
         # Per-edge message, computed for ALL edges with a BRANCHLESS axis-vs-
         # global edge-feature projection (both projections evaluated, selected
         # by the global-column mask — no data-dependent split).
-        dist_feat = self.dist_embed((edge_dist - 1).long())  # (E, edge_dim)
-        axis_proj = self.axis_conv.lin_edge(dist_feat)       # (E, out_dim)
+        # Axis edge projection via a (window, out_dim) table indexed by hop
+        # distance: there are only `window` distinct distances, so project the
+        # embedding table ONCE instead of all E edges. Byte-identical because
+        # lin_edge is row-wise: lin_edge(embed[idx]) == lin_edge(embed)[idx].
+        dist_table = self.axis_conv.lin_edge(self.dist_embed.weight)  # (window, out_dim)
+        axis_proj = dist_table.index_select(0, (edge_dist - 1).long())  # (E, out_dim)
         if self.use_global:
             is_global_col = (edge_bucket == self.num_axes).unsqueeze(1)
+            # global_edge_embed is a single learned vector, so its projection is
+            # a constant — compute once and broadcast (was E redundant matmuls).
             global_proj = self.global_conv.lin_edge(
-                self.global_edge_embed.unsqueeze(0).expand(E, -1)
-            )                                                # (E, out_dim)
+                self.global_edge_embed
+            ).unsqueeze(0)                                   # (1, out_dim)
             proj = torch.where(is_global_col, global_proj, axis_proj)
         else:
             proj = axis_proj

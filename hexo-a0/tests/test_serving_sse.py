@@ -99,14 +99,14 @@ def test_static_serves_css_and_js():
         s, ctype, etag, cache, body = _get(port, "/static/observatory.css")
         assert s == 200 and ctype == "text/css; charset=utf-8"
         assert etag and "max-age" in (cache or "") and len(body) > 0
-        s2, ctype2, _, _, _ = _get(port, "/static/app.js")
+        s2, ctype2, _, _, _ = _get(port, "/static/play.js")
         assert s2 == 200 and ctype2 == "text/javascript; charset=utf-8"
 
 
 def test_static_etag_304():
     with _server(analyze_ctx=None) as port:
-        _, _, etag, _, _ = _get(port, "/static/app.js")
-        s, _, _, cache, body = _get(port, "/static/app.js", headers={"If-None-Match": etag})
+        _, _, etag, _, _ = _get(port, "/static/play.js")
+        s, _, _, cache, body = _get(port, "/static/play.js", headers={"If-None-Match": etag})
         assert s == 304 and body == b"" and "max-age" in (cache or "")
 
 

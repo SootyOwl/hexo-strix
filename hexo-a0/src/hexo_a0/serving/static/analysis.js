@@ -115,12 +115,17 @@ function updateAnalysisHash() {
   }
 }
 
+// HTTTX text uses explore.htttx.io's coordinate convention, a mirror of our
+// internal axial frame: internal (q, r) <-> HTTTX (q + r, -r). Self-inverse,
+// so parseHtttx and serializeHtttx apply the same map (mirrors serving/htttx.py).
+function mirrorAxial(q, r) { return [q + r, -r]; }
+
 function parseHtttx(text) {
   const re = /\[(-?\d+),(-?\d+)\]/g;
   const out = [];
   let m;
   while ((m = re.exec(text)) !== null) {
-    out.push([parseInt(m[1]), parseInt(m[2])]);
+    out.push(mirrorAxial(parseInt(m[1]), parseInt(m[2])));
   }
   return out;
 }
@@ -936,7 +941,7 @@ function renderMoveTree() {
 function serializeHtttx(moves) {
   let body = "version[1];\n";
   if (moves.length <= 1) return body;
-  const rest = moves.slice(1);
+  const rest = moves.slice(1).map(m => mirrorAxial(m[0], m[1]));
   let turn = 1, i = 0;
   while (i < rest.length) {
     const a = rest[i];

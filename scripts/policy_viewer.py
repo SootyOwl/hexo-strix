@@ -1700,18 +1700,24 @@ function clearBoard() {
   drawBoard();
 }
 
+// HTTTX text uses explore.htttx.io's coordinate convention, a mirror of our
+// internal axial frame: internal (q, r) <-> HTTTX (q + r, -r). Self-inverse,
+// so both directions apply the same map (mirrors serving/htttx.py).
+function mirrorAxial(q, r) { return {q: q + r, r: -r}; }
+
 function movesToHTTTX() {
   // HTTTX format: "version[1];\n1. [q,r][q,r];\n2. [q,r][q,r];\n..."
   // Skip move 0 (auto-placed origin). Group remaining moves into turns of 2.
   // Turn 1 = moves 1-2, turn 2 = moves 3-4, etc.
   if (moves.length <= 1) return 'version[1];\n';
+  const out = moves.map(m => mirrorAxial(m.q, m.r));
   let s = 'version[1];\n';
   let turn = 1;
-  for (let i = 1; i < moves.length; i += 2) {
+  for (let i = 1; i < out.length; i += 2) {
     s += `${turn}.`;
-    s += ` [${moves[i].q},${moves[i].r}]`;
-    if (i + 1 < moves.length) {
-      s += `[${moves[i+1].q},${moves[i+1].r}]`;
+    s += ` [${out[i].q},${out[i].r}]`;
+    if (i + 1 < out.length) {
+      s += `[${out[i+1].q},${out[i+1].r}]`;
     }
     s += ';\n';
     turn++;
@@ -1722,7 +1728,7 @@ function movesToHTTTX() {
 function parseHTTTX(s) {
   const coords = [];
   for (const m of s.matchAll(/\[(-?\d+),(-?\d+)\]/g)) {
-    coords.push({q: parseInt(m[1]), r: parseInt(m[2])});
+    coords.push(mirrorAxial(parseInt(m[1]), parseInt(m[2])));
   }
   return coords;
 }

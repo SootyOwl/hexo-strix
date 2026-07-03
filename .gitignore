@@ -1,6 +1,11 @@
 # ---- Rust ----
 target/
+# scoped cargo target dirs (e.g. target-forcing/) — avoid clobbering the live self-play build in target/
+target-*/
 perf.data*
+
+# superpowers SDD scratch (progress ledger etc.)
+.superpowers/
 
 # ---- Python ----
 __pycache__/

@@ -59,7 +59,20 @@ def _m3_step(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_games_model_step ON games(model_label, step)")
 
 
-GAMES_MIGRATIONS = [_m0_base, _m1_model_label, _m2_opponent_elo, _m3_step]
+def _m4_htttx_convention(conn):
+    """Recompute htttx from moves_json (the ground truth): rows recorded before
+    the htttx.io-convention fix serialized internal coords verbatim. Rows whose
+    moves_json doesn't parse are left as-is rather than failing the open."""
+    for row_id, moves_json in conn.execute("SELECT id, moves_json FROM games").fetchall():
+        try:
+            move_log = [(int(q), int(r), str(p)) for q, r, p in json.loads(moves_json)]
+        except (TypeError, ValueError):
+            continue
+        conn.execute("UPDATE games SET htttx = ? WHERE id = ?",
+                     (serialize_htttx(move_log), row_id))
+
+
+GAMES_MIGRATIONS = [_m0_base, _m1_model_label, _m2_opponent_elo, _m3_step, _m4_htttx_convention]
 
 
 class Recorder:
