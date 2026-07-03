@@ -16,15 +16,15 @@
     {
       "id": 3,
       "name": "Phase 3: hexo-infer crate",
-      "status": "in_progress"
+      "status": "complete"
     },
     {
       "id": 4,
       "name": "Phase 4: hexo-wasm + worker demo",
-      "status": "pending"
+      "status": "in_progress"
     }
   ],
-  "current_phase_id": 3,
+  "current_phase_id": 4,
   "current_state": "phase_breakdown",
   "adversarial_review": {
     "active": false,
@@ -32,5 +32,5 @@
     "current_round": 0
   },
   "notes": "",
-  "updated_at": "2026-07-03T08:48:47+01:00"
+  "updated_at": "2026-07-05T20:37:45+01:00"
 }

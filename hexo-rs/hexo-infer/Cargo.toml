@@ -1,0 +1,19 @@
+[package]
+name = "hexo-infer"
+version = "0.1.0"
+edition = "2024"
+authors = ["SootyOwl"]
+description = "Dependency-light pure-Rust inference for HeXO GNN checkpoints (native + wasm)"
+license = "MIT"
+
+[dependencies]
+hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
+hexo-mcts = { version = "0.1.0", path = "../hexo-mcts" }
+safetensors = "0.4"
+serde_json = "1"
+rustc-hash = "2"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+rand = "0.9"
+rand_chacha = "0.9"

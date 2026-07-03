@@ -752,6 +752,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexo-infer"
+version = "0.1.0"
+dependencies = [
+ "hexo-engine",
+ "hexo-mcts",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "rustc-hash",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hexo-mcts"
 version = "0.1.0"
 dependencies = [
@@ -1759,6 +1773,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "safetensors"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1976,7 +2000,7 @@ dependencies = [
  "libc",
  "ndarray",
  "rand 0.8.5",
- "safetensors",
+ "safetensors 0.3.3",
  "thiserror 1.0.69",
  "torch-sys",
  "zip",
