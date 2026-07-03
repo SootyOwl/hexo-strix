@@ -753,17 +753,84 @@ fn py_game_to_graph_batch(
         .collect()
 }
 
+/// Resolve the lean-schema flags into a `LeanOpts`, validating `moves_scope`.
+///
+/// `moves_scope="graph"` is not yet implemented in the native builder; it is
+/// rejected with a clear error rather than silently mis-encoding.
+fn resolve_lean_opts(
+    axis_relational: bool,
+    compact_stone_onehot: bool,
+    node_coords: bool,
+    moves_scope: &str,
+) -> PyResult<crate::axis_graph::LeanOpts> {
+    use crate::axis_graph::MovesScope;
+    let scope = match moves_scope {
+        "node" => MovesScope::Node,
+        "graph" => {
+            return Err(PyValueError::new_err(
+                "moves_scope='graph' is not yet implemented in the native axis \
+                 graph builder; only 'node' is supported.",
+            ));
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "moves_scope must be 'node' or 'graph', got {other:?}"
+            )));
+        }
+    };
+    Ok(crate::axis_graph::LeanOpts {
+        axis_relational,
+        compact_stone_onehot,
+        node_coords,
+        moves_scope: scope,
+    })
+}
+
+/// Populate a graph dict with the edge representation matching `lean`: the
+/// relational schema emits `edge_type`/`edge_dist` + `global_edge_src`/
+/// `global_edge_dst`; the legacy schema emits `edge_attr`.
+fn set_axis_edge_items(
+    dict: &Bound<'_, PyDict>,
+    g: crate::axis_graph::AxisGraphData,
+    axis_relational: bool,
+) -> PyResult<()> {
+    dict.set_item("features", g.features)?;
+    dict.set_item("edge_src", g.edge_src)?;
+    dict.set_item("edge_dst", g.edge_dst)?;
+    if axis_relational {
+        dict.set_item("edge_type", g.edge_type)?;
+        dict.set_item("edge_dist", g.edge_dist)?;
+        dict.set_item("global_edge_src", g.global_edge_src)?;
+        dict.set_item("global_edge_dst", g.global_edge_dst)?;
+    } else {
+        dict.set_item("edge_attr", g.edge_attr)?;
+    }
+    dict.set_item("legal_mask", g.legal_mask)?;
+    dict.set_item("stone_mask", g.stone_mask)?;
+    dict.set_item("coords", g.coords)?;
+    dict.set_item("num_nodes", g.num_nodes)?;
+    Ok(())
+}
+
 /// Build axis-window graph arrays from a game state (Rust-accelerated).
 ///
-/// Returns a dict with keys: features, edge_src, edge_dst, edge_attr, legal_mask,
-/// stone_mask, coords, num_nodes — all as flat Python lists ready for torch.tensor().
-#[pyfunction(name = "game_to_axis_graph_raw", signature = (game, prune_empty_edges=false, threat_features=false, relative_stones=false))]
+/// Legacy schema returns a dict with keys: features, edge_src, edge_dst,
+/// edge_attr, legal_mask, stone_mask, coords, num_nodes. With
+/// `axis_relational=true` the edge_attr key is replaced by edge_type, edge_dist,
+/// global_edge_src, global_edge_dst (see the D6-invariant lean schema). All
+/// values are flat Python lists ready for torch.tensor().
+#[pyfunction(name = "game_to_axis_graph_raw", signature = (game, prune_empty_edges=false, threat_features=false, relative_stones=false, axis_relational=false, compact_stone_onehot=false, node_coords=true, moves_scope="node"))]
+#[allow(clippy::too_many_arguments)]
 fn py_game_to_axis_graph_raw(
     py: Python<'_>,
     game: &PyGameState,
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+    axis_relational: bool,
+    compact_stone_onehot: bool,
+    node_coords: bool,
+    moves_scope: &str,
 ) -> PyResult<Py<PyAny>> {
     if game.inner.is_terminal() {
         return Err(PyValueError::new_err(
@@ -771,36 +838,38 @@ fn py_game_to_axis_graph_raw(
         ));
     }
 
-    let g = crate::axis_graph::game_to_axis_graph_raw_opts(
+    let lean = resolve_lean_opts(axis_relational, compact_stone_onehot, node_coords, moves_scope)?;
+    let g = crate::axis_graph::game_to_axis_graph_raw_lean(
         &game.inner,
         prune_empty_edges,
         threat_features,
         relative_stones,
+        &lean,
     );
 
     let dict = pyo3::types::PyDict::new(py);
-    dict.set_item("features", g.features)?;
-    dict.set_item("edge_src", g.edge_src)?;
-    dict.set_item("edge_dst", g.edge_dst)?;
-    dict.set_item("edge_attr", g.edge_attr)?;
-    dict.set_item("legal_mask", g.legal_mask)?;
-    dict.set_item("stone_mask", g.stone_mask)?;
-    dict.set_item("coords", g.coords)?;
-    dict.set_item("num_nodes", g.num_nodes)?;
+    set_axis_edge_items(&dict, g, axis_relational)?;
     Ok(dict.into())
 }
 
 /// Build axis-window graph arrays for a batch of game states in parallel.
 ///
 /// Returns a list of dicts, one per state. Uses rayon for parallel construction.
-#[pyfunction(name = "game_to_axis_graph_batch", signature = (games, prune_empty_edges=false, threat_features=false, relative_stones=false))]
+#[pyfunction(name = "game_to_axis_graph_batch", signature = (games, prune_empty_edges=false, threat_features=false, relative_stones=false, axis_relational=false, compact_stone_onehot=false, node_coords=true, moves_scope="node"))]
+#[allow(clippy::too_many_arguments)]
 fn py_game_to_axis_graph_batch(
     py: Python<'_>,
     games: Vec<Py<PyGameState>>,
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+    axis_relational: bool,
+    compact_stone_onehot: bool,
+    node_coords: bool,
+    moves_scope: &str,
 ) -> PyResult<Vec<Py<PyAny>>> {
+    let lean = resolve_lean_opts(axis_relational, compact_stone_onehot, node_coords, moves_scope)?;
+
     // Extract inner GameStates while we hold the GIL
     let states: Vec<GameState> = games
         .iter()
@@ -817,25 +886,19 @@ fn py_game_to_axis_graph_batch(
         .collect::<PyResult<Vec<_>>>()?;
 
     // Parallel graph construction (no GIL needed — pure Rust)
-    let graphs = crate::axis_graph::game_to_axis_graph_batch_opts(
+    let graphs = crate::axis_graph::game_to_axis_graph_batch_lean(
         &states,
         prune_empty_edges,
         threat_features,
         relative_stones,
+        &lean,
     );
 
     graphs
         .into_iter()
         .map(|g| {
             let dict = pyo3::types::PyDict::new(py);
-            dict.set_item("features", g.features)?;
-            dict.set_item("edge_src", g.edge_src)?;
-            dict.set_item("edge_dst", g.edge_dst)?;
-            dict.set_item("edge_attr", g.edge_attr)?;
-            dict.set_item("legal_mask", g.legal_mask)?;
-            dict.set_item("stone_mask", g.stone_mask)?;
-            dict.set_item("coords", g.coords)?;
-            dict.set_item("num_nodes", g.num_nodes)?;
+            set_axis_edge_items(&dict, g, axis_relational)?;
             Ok(dict.into())
         })
         .collect()

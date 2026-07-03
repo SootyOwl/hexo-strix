@@ -11,20 +11,113 @@ use hexo_engine::hex::hex_distance;
 use hexo_engine::types::{Coord, Player, WIN_AXES};
 use hexo_engine::GameState;
 
+/// Where the moves-remaining scalar lives in the node feature layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MovesScope {
+    /// Legacy: a per-node feature column.
+    Node,
+    /// Leaner: a single per-graph scalar injected in the model (native builder
+    /// does not emit it as a node column yet).
+    Graph,
+}
+
+/// D6-invariant "lean" schema flags. All default to the legacy schema, so a
+/// `LeanOpts::default()` reproduces today's byte-exact output.
+#[derive(Clone, Copy, Debug)]
+pub struct LeanOpts {
+    /// Emit `edge_type`/`edge_dist` + a separate global edge list instead of the
+    /// `(E, 5)` `edge_attr`, and route dummy edges to the global relation.
+    pub axis_relational: bool,
+    /// Drop the redundant `empty` stone one-hot column.
+    pub compact_stone_onehot: bool,
+    /// Include the normalised (q, r) node-coordinate columns.
+    pub node_coords: bool,
+    /// Where moves-remaining lives (only `Node` is implemented natively).
+    pub moves_scope: MovesScope,
+}
+
+impl Default for LeanOpts {
+    fn default() -> Self {
+        LeanOpts {
+            axis_relational: false,
+            compact_stone_onehot: false,
+            node_coords: true,
+            moves_scope: MovesScope::Node,
+        }
+    }
+}
+
+/// Resolved column layout for the node feature vector, derived from the flags.
+struct NodeLayout {
+    own: usize,
+    opp: usize,
+    empty: Option<usize>,
+    to_move: Option<usize>,
+    moves: Option<usize>,
+    norm_q: Option<usize>,
+    norm_r: Option<usize>,
+    inv_dist: usize,
+    /// Width of the base features (columns above), before threat dims.
+    base_dim: usize,
+}
+
+impl NodeLayout {
+    fn new(relative_stones: bool, lean: &LeanOpts) -> Self {
+        let mut idx = 0usize;
+        let mut take = || {
+            let c = idx;
+            idx += 1;
+            c
+        };
+        let own = take();
+        let opp = take();
+        let empty = (!lean.compact_stone_onehot).then(&mut take);
+        let to_move = (!relative_stones).then(&mut take);
+        let moves = matches!(lean.moves_scope, MovesScope::Node).then(&mut take);
+        let (norm_q, norm_r) = if lean.node_coords {
+            (Some(take()), Some(take()))
+        } else {
+            (None, None)
+        };
+        let inv_dist = take();
+        NodeLayout {
+            own,
+            opp,
+            empty,
+            to_move,
+            moves,
+            norm_q,
+            norm_r,
+            inv_dist,
+            base_dim: idx,
+        }
+    }
+}
+
 /// Raw axis-window graph data ready to be wrapped into PyG Data on the Python side.
 #[derive(serde::Serialize)]
 pub struct AxisGraphData {
-    /// Node features, flattened row-major, including the dummy node. Per-node
-    /// width is 8 (absolute) or 7 (`relative_stones`: to_move dropped), +4
-    /// with threat features — i.e. (N+1)×{7,8,11,12}. The dummy node keeps
-    /// zeros in the threat dims.
+    /// Node features, flattened row-major, including the dummy node. Legacy
+    /// per-node width is 8 (absolute) or 7 (`relative_stones`: to_move dropped),
+    /// +4 with threat features — i.e. (N+1)×{7,8,11,12}. Lean-schema flags
+    /// (`compact_stone_onehot`, `node_coords=false`, `moves_scope=graph`) drop
+    /// columns. The dummy node keeps zeros in the threat dims.
     pub features: Vec<f32>,
-    /// Edge source indices.
+    /// Edge source indices. Legacy: axis + dummy edges. Relational: axis only
+    /// (dummy edges live in `global_edge_src`/`global_edge_dst`).
     pub edge_src: Vec<i64>,
-    /// Edge destination indices.
+    /// Edge destination indices (see `edge_src`).
     pub edge_dst: Vec<i64>,
-    /// Edge attributes, flattened: E×5 row-major.
+    /// Edge attributes, flattened: E×5 row-major. Empty in relational mode.
     pub edge_attr: Vec<f32>,
+    /// Relational mode only: per-axis-edge axis index in {0,1,2}.
+    pub edge_type: Vec<i64>,
+    /// Relational mode only: per-axis-edge unsigned hop distance (|signed_dist|).
+    pub edge_dist: Vec<i64>,
+    /// Relational mode only: global (dummy) edge source indices.
+    pub global_edge_src: Vec<i64>,
+    /// Relational mode only: global (dummy) edge destination indices.
+    pub global_edge_dst: Vec<i64>,
     /// Legal move mask (true for legal-move nodes).
     pub legal_mask: Vec<bool>,
     /// Stone mask (true for placed-stone nodes).
@@ -62,13 +155,16 @@ fn build_axis_graph(
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+    lean: &LeanOpts,
 ) -> AxisGraphData {
-    // Node-feature layout mirrors graph.rs::build_graph: 8-dim absolute base
-    // or 7-dim side-to-move-relative base (own/opp one-hot, to_move dropped),
-    // +4 optional threat dims.
-    let base_dim: usize = if relative_stones { 7 } else { 8 };
+    // Node-feature layout is derived dynamically from the flags (which columns
+    // exist). With `LeanOpts::default()` this reproduces the legacy layout:
+    // 8-dim absolute base [p1,p2,empty,to_move,moves,norm_q,norm_r,inv_dist] or
+    // 7-dim relative base [own,opp,empty,moves,norm_q,norm_r,inv_dist], +4
+    // optional threat dims appended after the base.
+    let layout = NodeLayout::new(relative_stones, lean);
+    let base_dim: usize = layout.base_dim;
     let fdim: usize = base_dim + if threat_features { 4 } else { 0 };
-    let off: usize = usize::from(!relative_stones);
     // Terminal fallback matches the absolute to_move fill: player_feat = -1.0
     // when current_player() is None → own = P2.
     let own_is_p1 = player_feat > 0.0;
@@ -126,43 +222,57 @@ fn build_axis_graph(
 
     let mut features = vec![0.0f32; n * fdim];
 
+    // Helper: write the norm-q / norm-r columns for a real node, if present.
+    let set_coords = |features: &mut [f32], base: usize, q: f64, r: f64| {
+        if let Some(cq) = layout.norm_q {
+            features[base + cq] = ((q - centroid_q) / spread) as f32;
+        }
+        if let Some(cr) = layout.norm_r {
+            features[base + cr] = ((r - centroid_r) / spread) as f32;
+        }
+    };
+
     // Stone features
     for (i, &(_, player)) in stones.iter().enumerate() {
         let base = i * fdim;
         let col = if relative_stones {
-            // 0 = own (side to move), 1 = opp
-            usize::from((player == Player::P1) != own_is_p1)
+            // own (side to move) vs opp
+            if (player == Player::P1) != own_is_p1 { layout.opp } else { layout.own }
         } else {
             match player {
-                Player::P1 => 0,
-                Player::P2 => 1,
+                Player::P1 => layout.own,
+                Player::P2 => layout.opp,
             }
         };
         features[base + col] = 1.0;
-        if !relative_stones {
-            features[base + 3] = player_feat;
+        if let Some(c) = layout.to_move {
+            features[base + c] = player_feat;
         }
-        features[base + 3 + off] = moves_feat;
+        if let Some(c) = layout.moves {
+            features[base + c] = moves_feat;
+        }
         let q = coords[i * 2] as f64;
         let r = coords[i * 2 + 1] as f64;
-        features[base + 4 + off] = ((q - centroid_q) / spread) as f32;
-        features[base + 5 + off] = ((r - centroid_r) / spread) as f32;
-        // features[base + 6 + off] = 0.0 (stones)
+        set_coords(&mut features, base, q, r);
+        // inv_dist column stays 0.0 for stones.
     }
 
     // Legal move features
     for j in 0..n_legal {
         let idx = n_stones + j;
         let base = idx * fdim;
-        features[base + 2] = 1.0; // empty one-hot
-        if !relative_stones {
-            features[base + 3] = player_feat;
+        if let Some(c) = layout.empty {
+            features[base + c] = 1.0; // empty one-hot
         }
-        features[base + 3 + off] = moves_feat;
+        if let Some(c) = layout.to_move {
+            features[base + c] = player_feat;
+        }
+        if let Some(c) = layout.moves {
+            features[base + c] = moves_feat;
+        }
         let q = coords[idx * 2] as f64;
         let r = coords[idx * 2 + 1] as f64;
-        features[base + 4 + off] = ((q - centroid_q) / spread) as f32;
-        features[base + 5 + off] = ((r - centroid_r) / spread) as f32;
+        set_coords(&mut features, base, q, r);
 
         let coord = legal[j];
         let min_d = stone_coords
@@ -170,18 +280,20 @@ fn build_axis_graph(
             .map(|&sc| hex_distance(coord, sc))
             .min()
             .unwrap_or(1);
-        features[base + 6 + off] = 1.0 / min_d.max(1) as f32;
+        features[base + layout.inv_dist] = 1.0 / min_d.max(1) as f32;
     }
 
-    // Dummy node features carry the global scalars, no one-hot. Absolute
+    // Dummy node features carry the global scalars, no one-hot. Legacy absolute
     // layout: [0,0,0, player_feat, moves_feat, 0, 0, 0]; relative layout:
     // [0,0,0, moves_feat, 0, 0, 0] (to_move doesn't exist in the relative
     // frame). Threat dims, if present, stay zero in both modes.
     let dummy_base = dummy_idx * fdim;
-    if !relative_stones {
-        features[dummy_base + 3] = player_feat;
+    if let Some(c) = layout.to_move {
+        features[dummy_base + c] = player_feat;
     }
-    features[dummy_base + 3 + off] = moves_feat;
+    if let Some(c) = layout.moves {
+        features[dummy_base + c] = moves_feat;
+    }
 
     // --- Masks ---
 
@@ -315,18 +427,50 @@ fn build_axis_graph(
         }
     }
 
-    // --- Dummy edges: bidirectional to all real nodes ---
+    // At this point edge_src/edge_dst/edge_attr hold the deduped AXIS edges.
+    let mut edge_type: Vec<i64> = Vec::new();
+    let mut edge_dist: Vec<i64> = Vec::new();
+    let mut global_edge_src: Vec<i64> = Vec::new();
+    let mut global_edge_dst: Vec<i64> = Vec::new();
 
-    for i in 0..n_real {
-        // dummy -> i
-        edge_src.push(dummy_idx as i64);
-        edge_dst.push(i as i64);
-        edge_attr.extend_from_slice(&[0.0; 5]);
+    if lean.axis_relational {
+        // Relational schema: axis edges keep only (edge_type, edge_dist);
+        // the src_player feature and the distance sign are dropped. Dummy
+        // (global) edges are routed to a SEPARATE global edge list rather
+        // than appended to the axis edge_index.
+        let n_axis = edge_src.len();
+        edge_type.reserve(n_axis);
+        edge_dist.reserve(n_axis);
+        for e in 0..n_axis {
+            edge_type.push(i64::from(axis_idx_of(&edge_attr, e)));
+            // |signed_dist| rounded to the nearest integer (always >= 1).
+            edge_dist.push(edge_attr[e * 5 + 3].abs().round() as i64);
+        }
+        edge_attr.clear();
 
-        // i -> dummy
-        edge_src.push(i as i64);
-        edge_dst.push(dummy_idx as i64);
-        edge_attr.extend_from_slice(&[0.0; 5]);
+        global_edge_src.reserve(2 * n_real);
+        global_edge_dst.reserve(2 * n_real);
+        for i in 0..n_real {
+            // dummy -> i
+            global_edge_src.push(dummy_idx as i64);
+            global_edge_dst.push(i as i64);
+            // i -> dummy
+            global_edge_src.push(i as i64);
+            global_edge_dst.push(dummy_idx as i64);
+        }
+    } else {
+        // --- Legacy dummy edges: bidirectional to all real nodes ---
+        for i in 0..n_real {
+            // dummy -> i
+            edge_src.push(dummy_idx as i64);
+            edge_dst.push(i as i64);
+            edge_attr.extend_from_slice(&[0.0; 5]);
+
+            // i -> dummy
+            edge_src.push(i as i64);
+            edge_dst.push(dummy_idx as i64);
+            edge_attr.extend_from_slice(&[0.0; 5]);
+        }
     }
 
     AxisGraphData {
@@ -334,6 +478,10 @@ fn build_axis_graph(
         edge_src,
         edge_dst,
         edge_attr,
+        edge_type,
+        edge_dist,
+        global_edge_src,
+        global_edge_dst,
         legal_mask,
         stone_mask,
         coords,
@@ -352,10 +500,12 @@ fn fill_axis_threat(
     game: &GameState,
     threat_features: bool,
     relative_stones: bool,
+    lean: &LeanOpts,
 ) {
     if threat_features {
         let n_real = graph.num_nodes - 1;
-        let base_dim = if relative_stones { 7 } else { 8 };
+        // Threat dims are appended after the (dynamically-sized) base features.
+        let base_dim = NodeLayout::new(relative_stones, lean).base_dim;
         crate::graph::fill_threat_features(&mut graph.features, &graph.coords, n_real, game, base_dim);
     }
 }
@@ -369,11 +519,34 @@ pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
 /// threat-encoding node features, and optional side-to-move-relative
 /// (own/opp) stone one-hots. Node dim: 8 (absolute), 7 (relative),
 /// 12 (absolute + threat), 11 (relative + threat).
+///
+/// Legacy schema only — see [`game_to_axis_graph_raw_lean`] for the lean/
+/// relational flags.
 pub fn game_to_axis_graph_raw_opts(
     game: &GameState,
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+) -> AxisGraphData {
+    game_to_axis_graph_raw_lean(
+        game,
+        prune_empty_edges,
+        threat_features,
+        relative_stones,
+        &LeanOpts::default(),
+    )
+}
+
+/// Build axis-window graph arrays honouring the full D6-invariant lean schema
+/// (`axis_relational`, `compact_stone_onehot`, `node_coords`, `moves_scope`).
+/// With `LeanOpts::default()` the output is byte-identical to the legacy
+/// [`game_to_axis_graph_raw_opts`].
+pub fn game_to_axis_graph_raw_lean(
+    game: &GameState,
+    prune_empty_edges: bool,
+    threat_features: bool,
+    relative_stones: bool,
+    lean: &LeanOpts,
 ) -> AxisGraphData {
     let mut stones = game.placed_stones();
     stones.sort_by_key(|&(coord, _)| coord);
@@ -395,9 +568,10 @@ pub fn game_to_axis_graph_raw_opts(
         prune_empty_edges,
         threat_features,
         relative_stones,
+        lean,
     );
     // Real nodes only — threats read from the original game's board.
-    fill_axis_threat(&mut g, game, threat_features, relative_stones);
+    fill_axis_threat(&mut g, game, threat_features, relative_stones, lean);
     g
 }
 
@@ -415,10 +589,29 @@ pub fn game_to_axis_graph_batch_opts(
     threat_features: bool,
     relative_stones: bool,
 ) -> Vec<AxisGraphData> {
+    game_to_axis_graph_batch_lean(
+        games,
+        prune_empty_edges,
+        threat_features,
+        relative_stones,
+        &LeanOpts::default(),
+    )
+}
+
+/// Parallel batch variant of [`game_to_axis_graph_raw_lean`].
+pub fn game_to_axis_graph_batch_lean(
+    games: &[GameState],
+    prune_empty_edges: bool,
+    threat_features: bool,
+    relative_stones: bool,
+    lean: &LeanOpts,
+) -> Vec<AxisGraphData> {
     use rayon::prelude::*;
     games
         .par_iter()
-        .map(|g| game_to_axis_graph_raw_opts(g, prune_empty_edges, threat_features, relative_stones))
+        .map(|g| {
+            game_to_axis_graph_raw_lean(g, prune_empty_edges, threat_features, relative_stones, lean)
+        })
         .collect()
 }
 
@@ -515,6 +708,7 @@ pub fn augment_axis_graph_single(
         prune_empty_edges,
         threat_features,
         relative_stones,
+        &LeanOpts::default(),
     );
 
     if threat_features {
@@ -527,7 +721,7 @@ pub fn augment_axis_graph_single(
             game.moves_remaining_this_turn(),
             *game.config(),
         );
-        fill_axis_threat(&mut graph, &t_game, threat_features, relative_stones);
+        fill_axis_threat(&mut graph, &t_game, threat_features, relative_stones, &LeanOpts::default());
     }
 
     (graph, permutation)

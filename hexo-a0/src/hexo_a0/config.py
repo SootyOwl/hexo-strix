@@ -33,6 +33,13 @@ class ModelConfig:
     prune_empty_edges: bool = _f(True, "Drop empty→empty edges in axis-window graphs (reduces graph size, only affects graph_type='axis')", group="Graph construction")
     threat_features: bool = _f(False, "Append 4 threat-encoding node features (own/opp best clean-window line count through the node, own/opp count of axes holding a win_length-2 line through the node), relative to the side to move. Node features become 12-dim; resuming an 8-dim checkpoint requires training.graft_threat_features.", group="Graph construction")
     relative_stone_encoding: bool = _f(False, "Side-to-move-relative stone encoding: node features become [own_stone, opp_stone, empty, moves_remaining, norm_q, norm_r, inv_stone_dist] (7-dim base; own = current player, the absolute to_move dim is dropped). Threat features still append after the base (11-dim with threat_features). FROM-SCRATCH RUNS ONLY: the own/opp remap is input-dependent, so existing absolute-encoding checkpoints cannot be grafted; incompatible with training.graft_threat_features.", group="Graph construction")
+    # --- D6-invariant lean schema (FROM-SCRATCH RUNS ONLY; all default to the
+    #     legacy schema so existing checkpoints load and evaluate unchanged) ---
+    axis_relational: bool = _f(False, "Represent the 3 hex axes as an edge TYPE (edge_type in {0,1,2} + unsigned edge_dist) processed by a tied-weight AxisRelationalConv with a symmetric per-axis sum, instead of an absolute axis one-hot fed to GINE. Combined with an invariant node schema this makes the network EXACTLY D6-invariant by construction. Drops the edge src_player feature and the distance sign (both redundant). FROM-SCRATCH ONLY (edge representation + conv change).", group="Graph construction")
+    axis_window: int = _f(8, "Max unsigned hop distance for the axis-relational per-hop distance embedding table (only used when axis_relational=true). Must be >= win_length - 1 across all stages; distances are clamped into [1, axis_window]. Decouples the fixed model architecture from per-stage win_length.", group="Graph construction")
+    compact_stone_onehot: bool = _f(False, "Drop the redundant 'empty' stone one-hot dim (empty = neither own nor opp), shrinking the stone one-hot from 3 to 2. FROM-SCRATCH ONLY.", group="Graph construction")
+    node_coords: bool = _f(True, "Include the normalised (q, r) node coordinates. These are a rotation-symmetry leak and largely redundant with the axis-edge geometry; set False for the D6-invariant lean schema. FROM-SCRATCH ONLY.", group="Graph construction")
+    moves_scope: str = _f("node", "Where moves-remaining lives: 'node' (a per-node feature, legacy) or 'graph' (a single per-graph scalar injected in the model). Both are D6-invariant; 'graph' is a leaner representation. FROM-SCRATCH ONLY.", group="Graph construction")
 
 
 def node_feature_dim(model_config) -> int:
@@ -44,7 +51,15 @@ def node_feature_dim(model_config) -> int:
     """
     relative = getattr(model_config, "relative_stone_encoding", False)
     threat = getattr(model_config, "threat_features", False)
-    return (7 if relative else 8) + (4 if threat else 0)
+    base = 7 if relative else 8
+    # Lean-schema subtractions (all default to legacy: no change).
+    if getattr(model_config, "compact_stone_onehot", False):
+        base -= 1  # drop the redundant 'empty' one-hot dim
+    if not getattr(model_config, "node_coords", True):
+        base -= 2  # drop norm_q, norm_r
+    if getattr(model_config, "moves_scope", "node") == "graph":
+        base -= 1  # moves-remaining becomes a per-graph scalar (injected in model)
+    return base + (4 if threat else 0)
 
 
 def model_config_from_checkpoint(ckpt, fallback_dict=None) -> "ModelConfig":

@@ -10,6 +10,7 @@ from torch_geometric.data import Batch, Data
 from torch_geometric.nn import GATv2Conv, GINEConv
 from torch_geometric.nn.models.jumping_knowledge import JumpingKnowledge
 
+from hexo_a0.axis_conv import AxisRelationalConv
 from hexo_a0.config import ModelConfig, node_feature_dim
 
 logger = logging.getLogger(__name__)
@@ -45,15 +46,24 @@ class RepresentationNetwork(nn.Module):
         if graph_type not in ("hex", "axis"):
             raise ValueError(f"graph_type must be 'hex' or 'axis', got {graph_type!r}")
 
-        conv_type = getattr(config, "conv_type", "gatv2")
-        if conv_type not in ("gatv2", "gine"):
-            raise ValueError(f"conv_type must be 'gatv2' or 'gine', got {conv_type!r}")
+        # Axis-relational backbone: the 3 hex axes are an edge TYPE partition
+        # consumed by tied-weight AxisRelationalConv layers (exactly
+        # axis-permutation invariant), instead of the absolute axis one-hot
+        # edge feature fed to GINE/GATv2. Gated so the legacy path is untouched.
+        self.axis_relational = bool(getattr(config, "axis_relational", False))
 
-        if conv_type == "gatv2" and config.hidden_dim % config.num_heads != 0:
-            raise ValueError(
-                f"hidden_dim ({config.hidden_dim}) must be divisible by "
-                f"num_heads ({config.num_heads})."
-            )
+        conv_type = getattr(config, "conv_type", "gatv2")
+        if not self.axis_relational:
+            if conv_type not in ("gatv2", "gine"):
+                raise ValueError(
+                    f"conv_type must be 'gatv2' or 'gine', got {conv_type!r}"
+                )
+
+            if conv_type == "gatv2" and config.hidden_dim % config.num_heads != 0:
+                raise ValueError(
+                    f"hidden_dim ({config.hidden_dim}) must be divisible by "
+                    f"num_heads ({config.num_heads})."
+                )
 
         self.hidden_dim = config.hidden_dim
 
@@ -64,8 +74,11 @@ class RepresentationNetwork(nn.Module):
         in_dim = node_feature_dim(config)
         self.input_proj = nn.Linear(in_dim, config.hidden_dim)
 
-        # Edge feature projection for axis graphs
-        if graph_type == "axis":
+        # Edge feature handling. Relational mode does NOT create edge_proj: it
+        # consumes edge_type/edge_dist/global_edge_index directly in each conv.
+        if self.axis_relational:
+            self.axis_window = int(getattr(config, "axis_window", 8))
+        elif graph_type == "axis":
             self.edge_proj = nn.Linear(5, config.hidden_dim)
 
         # Stacked conv layers with residual connections
@@ -73,7 +86,13 @@ class RepresentationNetwork(nn.Module):
         self.norms = nn.ModuleList()
 
         for _ in range(config.num_layers):
-            conv = self._make_conv(config, conv_type, graph_type)
+            if self.axis_relational:
+                conv = AxisRelationalConv(
+                    config.hidden_dim, config.hidden_dim,
+                    window=self.axis_window, num_axes=3, use_global=True,
+                )
+            else:
+                conv = self._make_conv(config, conv_type, graph_type)
             self.convs.append(conv)
             self.norms.append(nn.LayerNorm(config.hidden_dim))
 
@@ -189,48 +208,87 @@ class RepresentationNetwork(nn.Module):
         raise ValueError(f"Unknown conv_type: {conv_type!r}")
 
     def forward(
-        self, x: Tensor, edge_index: Tensor, edge_attr: Tensor | None = None
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor | None = None,
+        *,
+        edge_type: Tensor | None = None,
+        edge_dist: Tensor | None = None,
+        global_edge_index: Tensor | None = None,
     ) -> Tensor:
         """Compute node embeddings.
 
         Args:
-            x:          Node feature matrix of shape (N, node_features).
-            edge_index: Graph connectivity of shape (2, E).
-            edge_attr:  Edge feature matrix of shape (E, 5), or None.
+            x:                 Node feature matrix of shape (N, node_features).
+            edge_index:        Graph connectivity of shape (2, E).
+            edge_attr:         Edge feature matrix of shape (E, 5), or None.
+                               Legacy (non-axis_relational) mode only.
+            edge_type:         Per-edge axis label in {0,1,2}, shape (E,).
+                               Axis-relational mode only.
+            edge_dist:         Per-edge unsigned hop distance, shape (E,).
+                               Axis-relational mode only; clamped into
+                               [1, axis_window] before the conv.
+            global_edge_index: Optional global-relation edges, shape (2, E_g).
+                               Axis-relational mode only.
 
         Returns:
             Node embedding matrix of shape (N, hidden_dim).
         """
         x = self.input_proj(x)  # (N, hidden_dim)
 
-        # Project edge features once; reuse across all layers
+        # Edge inputs. Relational mode consumes edge_type/edge_dist/global;
+        # legacy mode projects edge_attr once and reuses it across layers.
         projected_edge_attr = None
-        if hasattr(self, "edge_proj"):
-            if edge_attr is None:
+        if self.axis_relational:
+            if edge_attr is not None:
                 raise ValueError(
-                    "Axis-graph model requires edge_attr but received None. "
+                    "Axis-relational model received unexpected edge_attr. "
+                    "Relational mode consumes edge_type/edge_dist/"
+                    "global_edge_index; ensure the graph builder matches "
+                    "model.axis_relational=True."
+                )
+            if edge_type is None or edge_dist is None:
+                raise ValueError(
+                    "Axis-relational model requires edge_type and edge_dist "
+                    "but received None. Ensure the graph builder matches "
+                    "model.axis_relational=True."
+                )
+            # Defensive clamp into the per-hop embedding table's valid range.
+            edge_dist = edge_dist.long().clamp(1, self.axis_window)
+        else:
+            if hasattr(self, "edge_proj"):
+                if edge_attr is None:
+                    raise ValueError(
+                        "Axis-graph model requires edge_attr but received None. "
+                        "Ensure the graph builder matches the model's graph_type."
+                    )
+                projected_edge_attr = self.edge_proj(edge_attr)  # (E, hidden_dim)
+            elif edge_attr is not None:
+                raise ValueError(
+                    "Hex-graph model received unexpected edge_attr. "
                     "Ensure the graph builder matches the model's graph_type."
                 )
-            projected_edge_attr = self.edge_proj(edge_attr)  # (E, hidden_dim)
-        elif edge_attr is not None:
-            raise ValueError(
-                "Hex-graph model received unexpected edge_attr. "
-                "Ensure the graph builder matches the model's graph_type."
-            )
 
         hs: list[Tensor] = [] if self.use_jk else None  # type: ignore[assignment]
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
             residual = x
             if self.pre_norm:
                 x = norm(x)
-                x = conv(x, edge_index, edge_attr=projected_edge_attr)
+                if self.axis_relational:
+                    x = conv(x, edge_index, edge_type, edge_dist, global_edge_index)
+                else:
+                    x = conv(x, edge_index, edge_attr=projected_edge_attr)
                 if self.use_layer_scale:
                     x = self.layer_scales[i] * x
                 x = x + residual
                 x = self.activation(x)
                 x = self.dropout(x)
             else:
-                x = conv(x, edge_index, edge_attr=projected_edge_attr)
+                if self.axis_relational:
+                    x = conv(x, edge_index, edge_type, edge_dist, global_edge_index)
+                else:
+                    x = conv(x, edge_index, edge_attr=projected_edge_attr)
                 if self.use_layer_scale:
                     x = self.layer_scales[i] * x
                 x = x + residual
@@ -378,6 +436,9 @@ class HeXONet(nn.Module):
         stone_mask: Tensor | None = None,
         *,
         edge_attr: Tensor | None = None,
+        edge_type: Tensor | None = None,
+        edge_dist: Tensor | None = None,
+        global_edge_index: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Convenience single-graph forward.
 
@@ -385,11 +446,18 @@ class HeXONet(nn.Module):
         forward_batch, and unpacks the result.
 
         Args:
-            x:          Node feature matrix of shape (N, node_features).
-            edge_index: Graph connectivity of shape (2, E).
-            legal_mask: Boolean tensor of shape (N,).
-            stone_mask: Boolean tensor of shape (N,); True for stone nodes.
-            edge_attr:  Edge feature matrix of shape (E, 5), or None.
+            x:                 Node feature matrix of shape (N, node_features).
+            edge_index:        Graph connectivity of shape (2, E).
+            legal_mask:        Boolean tensor of shape (N,).
+            stone_mask:        Boolean tensor of shape (N,); True for stones.
+            edge_attr:         Edge feature matrix of shape (E, 5), or None.
+                               Legacy (non-axis_relational) mode only.
+            edge_type:         Per-edge axis label in {0,1,2}, shape (E,).
+                               Axis-relational mode only.
+            edge_dist:         Per-edge unsigned hop distance, shape (E,).
+                               Axis-relational mode only.
+            global_edge_index: Optional global-relation edges, shape (2, E_g).
+                               Axis-relational mode only.
 
         Returns:
             (policy_logits, value) where policy_logits has shape (num_legal,)
@@ -400,6 +468,12 @@ class HeXONet(nn.Module):
             data.stone_mask = stone_mask
         if edge_attr is not None:
             data.edge_attr = edge_attr
+        if edge_type is not None:
+            data.edge_type = edge_type
+        if edge_dist is not None:
+            data.edge_dist = edge_dist
+        if global_edge_index is not None:
+            data.global_edge_index = global_edge_index
         batch = Batch.from_data_list([data])
         policy_list, values = self.forward_batch(batch)
         return policy_list[0], values[0]
@@ -423,8 +497,20 @@ class HeXONet(nn.Module):
             flat (total_legal,), legal_counts is (num_graphs,) long, and
             values_tensor is (num_graphs,).
         """
-        edge_attr = getattr(batch, "edge_attr", None)
-        embeddings = self.representation(batch.x, batch.edge_index, edge_attr)
+        if self.representation.axis_relational:
+            # Edges never cross subgraph boundaries and PyG applies node-index
+            # offsets to both edge_index and global_edge_index, so the axis
+            # message passing is correct per-subgraph — batching is transparent.
+            embeddings = self.representation(
+                batch.x,
+                batch.edge_index,
+                edge_type=getattr(batch, "edge_type", None),
+                edge_dist=getattr(batch, "edge_dist", None),
+                global_edge_index=getattr(batch, "global_edge_index", None),
+            )
+        else:
+            edge_attr = getattr(batch, "edge_attr", None)
+            embeddings = self.representation(batch.x, batch.edge_index, edge_attr)
         num_graphs = batch.num_graphs
         device = embeddings.device
 

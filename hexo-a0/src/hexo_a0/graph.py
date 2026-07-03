@@ -87,27 +87,44 @@ def game_to_axis_graph(
     prune_empty_edges: bool = False,
     threat_features: bool = False,
     relative_stones: bool = False,
+    axis_relational: bool = False,
+    compact_stone_onehot: bool = False,
+    node_coords: bool = True,
+    moves_scope: str = "node",
 ) -> Data:
     """Convert a GameState to a PyG Data object using axis-window graph.
 
     Uses Rust-accelerated `hexo_rs.game_to_axis_graph_raw()` for the heavy
     computation (feature building, edge construction with axis edge attributes).
 
-    The returned Data includes `edge_attr` of shape (E, 5) encoding
-    axis-window information for each edge.
+    In the LEGACY schema the returned Data includes `edge_attr` of shape (E, 5)
+    encoding axis-window information for each edge. In the D6-invariant LEAN
+    schema (`axis_relational=True`) it instead carries `edge_type` (E,),
+    `edge_dist` (E,), and `global_edge_index` (2, E_g) — the axis one-hot becomes
+    an integer edge type, the signed distance becomes an unsigned `edge_dist`,
+    and the dummy/global edges are routed to a separate relation.
 
     Node features: 8-dim float32 absolute layout, 7-dim with relative_stones
     (side-to-move-relative stone one-hot, to_move dropped), +4 threat dims
-    with threat_features. See `game_to_graph` for the full feature schema.
+    with threat_features. The lean flags `compact_stone_onehot` (drop the empty
+    one-hot) and `node_coords=False` (drop norm_q/norm_r) shrink the layout
+    further. See `game_to_graph` for the full feature schema.
 
     Args:
         game: A hexo_rs.GameState (must not be terminal).
         prune_empty_edges: Drop empty→empty edges to reduce graph size.
         threat_features: Append 4 threat-encoding node features.
         relative_stones: Side-to-move-relative stone one-hot, to_move dropped.
+        axis_relational: Emit edge_type/edge_dist + a separate global relation
+            instead of the (E, 5) edge_attr.
+        compact_stone_onehot: Drop the redundant 'empty' stone one-hot column.
+        node_coords: Include the normalised (q, r) node coordinate columns.
+        moves_scope: 'node' (moves-remaining is a node column) or 'graph'
+            (per-graph scalar; not implemented in the native builder yet).
 
     Returns:
-        PyG Data with: x, edge_index, edge_attr, legal_mask, stone_mask, coords.
+        PyG Data with: x, edge_index, legal_mask, stone_mask, coords, and either
+        edge_attr (legacy) or edge_type/edge_dist/global_edge_index (relational).
 
     Raises:
         ValueError: if the game is in a terminal state.
@@ -116,27 +133,63 @@ def game_to_axis_graph(
 
     return _raw_to_axis_data(
         hexo_rs.game_to_axis_graph_raw(
-            game, prune_empty_edges, threat_features, relative_stones
+            game,
+            prune_empty_edges,
+            threat_features,
+            relative_stones,
+            axis_relational,
+            compact_stone_onehot,
+            node_coords,
+            moves_scope,
         )
     )
 
 
 def _raw_to_axis_data(g: dict) -> Data:
-    """Convert a raw axis-graph dict from Rust to a PyG Data object."""
+    """Convert a raw axis-graph dict from Rust to a PyG Data object.
+
+    Handles both the legacy schema (an `edge_attr` key) and the relational lean
+    schema (`edge_type`/`edge_dist`/`global_edge_src`/`global_edge_dst` keys).
+    """
     n = g["num_nodes"]
     x = torch.tensor(g["features"], dtype=torch.float32).reshape(n, -1)
     edge_src = g["edge_src"]
     edge_dst = g["edge_dst"]
     if edge_src:
         edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.int64)
-        E = len(edge_src)
-        edge_attr = torch.tensor(g["edge_attr"], dtype=torch.float32).reshape(E, 5)
     else:
         edge_index = torch.zeros((2, 0), dtype=torch.int64)
-        edge_attr = torch.zeros((0, 5), dtype=torch.float32)
     legal_mask = torch.tensor(g["legal_mask"], dtype=torch.bool)
     stone_mask = torch.tensor(g["stone_mask"], dtype=torch.bool)
     coords = torch.tensor(g["coords"], dtype=torch.int32).reshape(n, 2)
+
+    if "edge_type" in g:
+        # Relational lean schema: integer edge_type + unsigned edge_dist, with
+        # dummy/global edges in a separate relation.
+        edge_type = torch.tensor(g["edge_type"], dtype=torch.int64)
+        edge_dist = torch.tensor(g["edge_dist"], dtype=torch.int64)
+        gsrc = g["global_edge_src"]
+        gdst = g["global_edge_dst"]
+        if gsrc:
+            global_edge_index = torch.tensor([gsrc, gdst], dtype=torch.int64)
+        else:
+            global_edge_index = torch.zeros((2, 0), dtype=torch.int64)
+        return Data(
+            x=x,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            edge_dist=edge_dist,
+            global_edge_index=global_edge_index,
+            legal_mask=legal_mask,
+            stone_mask=stone_mask,
+            coords=coords,
+        )
+
+    E = len(edge_src)
+    if E:
+        edge_attr = torch.tensor(g["edge_attr"], dtype=torch.float32).reshape(E, 5)
+    else:
+        edge_attr = torch.zeros((0, 5), dtype=torch.float32)
     return Data(
         x=x,
         edge_index=edge_index,
@@ -159,10 +212,26 @@ def graph_fn_from_model_config(model_config):
     prune = model_config.prune_empty_edges
     threat = getattr(model_config, "threat_features", False)
     rel = getattr(model_config, "relative_stone_encoding", False)
+    lean = _lean_kwargs_from_model_config(model_config)
     if graph_type == "axis":
         return lambda g: game_to_axis_graph(
-            g, prune_empty_edges=prune, threat_features=threat, relative_stones=rel)
+            g, prune_empty_edges=prune, threat_features=threat, relative_stones=rel,
+            **lean)
     return lambda g: game_to_graph(g, threat_features=threat, relative_stones=rel)
+
+
+def _lean_kwargs_from_model_config(model_config) -> dict:
+    """Extract the D6-invariant lean axis-schema kwargs from a model config.
+
+    Duck-typed; missing attributes default to the legacy schema so older
+    configs keep producing the legacy edge_attr representation.
+    """
+    return dict(
+        axis_relational=getattr(model_config, "axis_relational", False),
+        compact_stone_onehot=getattr(model_config, "compact_stone_onehot", False),
+        node_coords=getattr(model_config, "node_coords", True),
+        moves_scope=getattr(model_config, "moves_scope", "node"),
+    )
 
 
 def graph_batch_fn_from_model_config(model_config):
@@ -175,9 +244,11 @@ def graph_batch_fn_from_model_config(model_config):
     prune = model_config.prune_empty_edges
     threat = getattr(model_config, "threat_features", False)
     rel = getattr(model_config, "relative_stone_encoding", False)
+    lean = _lean_kwargs_from_model_config(model_config)
     if graph_type == "axis":
         return lambda gs: game_to_axis_graph_batch(
-            gs, prune_empty_edges=prune, threat_features=threat, relative_stones=rel)
+            gs, prune_empty_edges=prune, threat_features=threat, relative_stones=rel,
+            **lean)
     return lambda gs: game_to_graph_batch(gs, threat_features=threat, relative_stones=rel)
 
 
@@ -187,18 +258,30 @@ def game_to_axis_graph_batch(
     prune_empty_edges: bool = False,
     threat_features: bool = False,
     relative_stones: bool = False,
+    axis_relational: bool = False,
+    compact_stone_onehot: bool = False,
+    node_coords: bool = True,
+    moves_scope: str = "node",
 ) -> list[Data]:
     """Convert a batch of GameStates to axis-graph PyG Data objects.
 
     Uses rayon for parallel graph construction across all states.
     Node features: 8-dim float32 absolute layout, 7-dim with relative_stones
     (to_move dropped), +4 threat dims with threat_features (see
-    `game_to_graph` for the full schema).
+    `game_to_graph` for the full schema). The lean flags mirror
+    `game_to_axis_graph` (relational edges + reduced node layout).
     """
     import hexo_rs
 
     raw_graphs = hexo_rs.game_to_axis_graph_batch(
-        games, prune_empty_edges, threat_features, relative_stones
+        games,
+        prune_empty_edges,
+        threat_features,
+        relative_stones,
+        axis_relational,
+        compact_stone_onehot,
+        node_coords,
+        moves_scope,
     )
     return [_raw_to_axis_data(g) for g in raw_graphs]
 
