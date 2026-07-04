@@ -1,0 +1,253 @@
+# D6-INVARIANT LEAN VARIANT — 2026-07-03 (FROM SCRATCH)
+#
+# HeXO AlphaZero — 4l-128p32v, exactly-D6-invariant axis-relational architecture.
+#
+# Fixes the "symmetric moves rated differently" bug (chan, 2026-07-03) BY
+# CONSTRUCTION: the 3 hex axes are an edge-TYPE partition consumed by
+# tied-weight AxisRelationalConv layers (symmetric per-axis sum), with an
+# invariant node schema (empty one-hot + norm-q/r dropped) and unsigned edge
+# distance. Symmetric positions get bit-identical evaluations — see
+# docs/superpowers/specs/2026-07-03-d6-invariant-axis-architecture-design.md.
+#
+# FROM SCRATCH: the lean schema (node dim 8 vs legacy 11, edge_type/edge_dist vs
+# edge_attr[E,5]) is incompatible with existing checkpoints — do NOT graft; start
+# a clean run. Because invariance is architectural, augment_symmetries is OFF
+# (D6 augmentation is redundant when the model is already exactly invariant).
+#
+# Differences from 4l-128p32v-jkcat-rel2.toml:
+#   [model]    axis_relational = true, compact_stone_onehot = true,
+#              node_coords = false, moves_scope = "node", axis_window = 8   (new)
+#   [training] augment_symmetries : true -> false   (redundant under invariance)
+#   [run]      checkpoint_dir / log_dir + stage log_dirs rebased to
+#              runs/gine-mini/4l-128p32v-lean-d6/
+#   (no graft flags — from-scratch run)
+#
+# Start:
+#     hexo-a0 curriculum --config configs/gine-mini/4l-128p32v-lean-d6.toml
+
+[curriculum]
+convergence_mode = "sprt"
+patience = 10
+min_steps_per_stage = 10000
+confirm_advance = true
+win_rate_threshold = 0.85
+improve_threshold = 0.55
+checkpoint_lag = 30
+champion_threshold = 0.55
+sprt_s0 = 0.50
+sprt_s1 = 0.525
+sprt_alpha = 0.01
+sprt_beta = 0.05
+sprt_alpha_stage = 0.0
+sprt_beta_stage = 0.0
+sprt_window_size = 0  # allow unbounded history
+sprt_mcts_sims = 64
+sprt_mcts_m_actions = 16
+sprt_device = "cpu"
+sprt_poll_interval = 2.0
+sprt_reject_patience = 0
+sprt_promotion_grace_steps = 1000
+sprt_pentanomial = true
+sprt_pair_variance = 0.5
+sprt_adaptive_pair_variance = true
+sprt_adaptive_pair_variance_floor = 0.20
+sprt_adaptive_pair_variance_ceil = 0.50
+sprt_adaptive_pair_variance_ema_alpha = 0.10
+sprt_prev_ckpt_patience = 8
+sprt_prev_ckpt_band_low = 0.40
+sprt_prev_ckpt_band_high = 0.60
+sprt_promo_velocity_factor = 3.0
+sprt_promo_velocity_min_intervals = 3
+sprt_eval_workers = 4
+
+[model]
+# Backbone
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"      # ignored under axis_relational (AxisRelationalConv encoder)
+pre_norm = true
+dropout = 0.0
+# Output heads — asymmetric
+policy_hidden = 128
+value_hidden = 32
+# Graph construction
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+use_jk = true
+jk_mode = "cat"
+# *** D6-invariant lean schema (from-scratch; exactly invariant by construction) ***
+axis_relational = true      # 3 axes as an edge-type partition + tied-weight sum
+compact_stone_onehot = true # drop redundant 'empty' one-hot dim
+node_coords = false         # drop norm-q/r (rotation leak, redundant with edges)
+moves_scope = "node"        # moves-remaining as a (D6-invariant) node feature
+axis_window = 8             # >= win_length - 1 across all stages
+
+[game]
+win_length = 6
+placement_radius = 8
+max_moves = 300
+
+[mcts]
+n_simulations = 128
+m_actions = 16
+c_scale = 1.0
+c_visit = 50
+exploration_moves = 15
+exploration_fraction = 0.20
+exploration_max = 0
+exploration_window = 2000
+exploration_exponent = 1.0
+exploration_distribution = "visit_counts"
+truncate_delta = 0.25
+
+[training]
+batch_size = 512
+edge_budget = 250_000
+grad_accumulation = true
+lr = 2e-04
+weight_decay = 0.0001
+max_grad_norm = 1.0
+lr_schedule = "cosine"
+lr_min = 2e-05
+lr_warmup_steps = 1000
+total_train_steps = 12000
+step_delay = 0.0
+target_reuse = 8.0
+max_step_delay = 5.0
+step_delay_smoothing = 0.8
+draw_value = 0
+pc_loss_weight = 0.0
+augment_symmetries = false  # redundant: the model is exactly D6-invariant
+buffer_capacity = 500_000
+reanalyze_fraction = 0
+reanalyze_sims = 24
+reanalyze_m_actions = 8
+
+[self_play]
+engine = "rust"
+device = "cuda"
+workers = 32
+precision = "bf16"
+model_update_interval = 100
+source = "trainee"
+
+[self_play.rust]
+max_batch = 512
+max_batch_edges = 45000
+batch_timeout_ms = 5
+padded_inference = false
+python_inference = true
+python_inference_workers = 2
+virtual_loss = 0
+max_file_mb = 128
+output_filename = "games"
+pool_fraction = 0
+pool_size = 8
+pool_snapshot_every = 1
+playout_cap_fraction = 0.0
+playout_cap_divisor = 4
+
+[self_play.actor]
+repo_dir = "/home/tyto/Documents/hexo"
+device = "cuda"
+python_bin = "/home/tyto/Documents/hexo/.venv/bin/python"
+torch_lib = ""
+games_pull_interval = 1.0
+
+[self_play.python]
+games_per_write = 50
+playout_cap_fraction = 0.75
+playout_cap_divisor = 4
+use_rust_mcts = true
+
+[eval]
+interval = 2000
+checkpoint_interval = 1000
+games = 100
+sims = 16
+m_actions = 16
+
+[eval.corpus]
+games = 2000
+device = "cpu"
+
+[eval.sealbot]
+games = 0
+sims = 32
+m_actions = 16
+adaptive = true
+time_limit = 0.5
+levels = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+promote_threshold = 0.7
+promote_patience = 2
+win_length = 6
+placement_radius = 8
+max_moves = 200
+workers = 8
+
+[run]
+device = "cuda"
+checkpoint_dir = "runs/gine-mini/4l-128p32v-lean-d6-one-stage/checkpoints"
+log_dir = "runs/gine-mini/4l-128p32v-lean-d6-one-stage"
+compile = true
+fp16 = true
+
+# --- Curriculum stages (from scratch: W1 -> S4) ---
+#
+# [[curriculum.stages]]
+# name = "W1: 4-in-a-row, radius 2"
+# log_dir = "runs/gine-mini/4l-128p32v-lean-d6/w1-4-2"
+# training_batch_size = 512
+# game_win_length = 4
+# game_placement_radius = 2
+# game_max_moves = 20
+# convergence_mode = "random"
+# win_rate_threshold = 0.90
+# patience = 5
+# min_steps_per_stage = 1000
+# confirm_advance = false
+# eval_sims = 0
+# eval_interval = 200
+# mcts_exploration_moves = 2
+#
+# [[curriculum.stages]]
+# name = "W2: 5-in-a-row, radius 2"
+# run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6/w2-5-2"
+# training_batch_size = 512
+# game_win_length = 5
+# game_placement_radius = 2
+# game_max_moves = 30
+# convergence_mode = "random"
+# win_rate_threshold = 0.90
+# patience = 5
+# min_steps_per_stage = 1000
+# confirm_advance = false
+# eval_sims = 0
+# eval_interval = 200
+# mcts_exploration_moves = 4
+#
+# [[curriculum.stages]]
+# name = "S1: 6-in-a-row, radius 2"
+# run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6/s1-6-2"
+# game_placement_radius = 2
+# min_steps_per_stage = 20000
+# confirm_advance = false
+#
+# [[curriculum.stages]]
+# name = "S2: 6-in-a-row, radius 4"
+# run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6/s2-6-4"
+# game_placement_radius = 4
+# min_steps_per_stage = 20000
+# confirm_advance = false
+#
+# [[curriculum.stages]]
+# name = "S3: 6-in-a-row, radius 6"
+# run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6/s3-6-6"
+# game_placement_radius = 6
+
+[[curriculum.stages]]
+name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-one-stage/s4-6-8"
