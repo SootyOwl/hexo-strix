@@ -1,10 +1,37 @@
 //! Fully-forcing (VCF) threat-space solver. Pure Rust; no NN dependency.
 //! Ports scripts/forcing_search_prototype.py (validated). See the design spec.
+//!
+//! Performance notes (2026-07-04 optimization pass):
+//! - `SolverBoard` is a dense, grow-on-demand grid (not a hash map): strip scans
+//!   read cells with one array load. Real game positions are spatially bounded
+//!   (every stone lands within `placement_radius` of another), so the grid stays
+//!   small; a pathological multi-thousand-cell coordinate spread would grow it
+//!   proportionally (guarded by `MAX_GRID_CELLS`).
+//! - In the tight-radius regime (`placement_radius < win_length - 1`, the live
+//!   self-play configuration) legality queries are O(1) reads of an incrementally
+//!   maintained per-cell "stones within radius" count.
+//! - Gap sets, covers, and attacker moves are copyable fixed-size cell sets
+//!   (`CellSet2`, `ThreatEntry`) — no per-window/per-candidate heap allocation,
+//!   and the per-position memo caches clone with a memcpy.
+//! - `min_covers2`/`cover_class` classify B into {0, 1, 2, >=3} with bitmask
+//!   hitting-set checks; the search never needs more (covers only materialize
+//!   for B <= 2), which also removes the old combinatorial subset enumeration.
 use hexo_engine::hex::{hex_distance as hex_dist, hex_offsets};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
+/// Max supported win_length: strip-scan buffers are stack arrays of 2*MAX_WL-1.
+const MAX_WL: usize = 16;
+const STRIP: usize = 2 * MAX_WL - 1;
+/// Grid border padding kept around every stone. Must be >= any tight-regime
+/// radius (which is < win_length - 1 <= MAX_WL - 1) so that reach-count updates
+/// for a just-placed stone never fall outside the grid.
+const GRID_PAD: i32 = 16;
+/// Hard cap on grid area — fails loudly on pathological coordinate spreads
+/// instead of attempting a multi-GB allocation.
+const MAX_GRID_CELLS: i64 = 64 * 1024 * 1024;
 
 #[inline]
 fn splitmix64(mut z: u64) -> u64 {
@@ -28,264 +55,839 @@ fn zob(coord: Coord, player: Player) -> u64 {
     )
 }
 
-/// Mutable board for make/unmake search — no per-node clone.
-pub struct SolverBoard {
-    pub stones: FxHashMap<Coord, Player>,
+#[inline]
+fn pcode(p: Player) -> u8 {
+    match p {
+        Player::P1 => 1,
+        Player::P2 => 2,
+    }
+}
+
+/// A sorted set of 0..=2 cells. Represents a completion's gap set, a defender
+/// cover, or an attacker move (1 or 2 placements; the sorted order is also the
+/// placement order, matching the old normalized-(min,max) convention).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct CellSet2 {
+    len: u8,
+    cells: [Coord; 2],
+}
+
+impl CellSet2 {
+    /// Padding for unused slots; never a real cell (real coords are bounded by
+    /// the grid, far below i32::MAX).
+    const PAD_CELL: Coord = (i32::MAX, i32::MAX);
+
+    pub fn empty() -> Self {
+        CellSet2 { len: 0, cells: [Self::PAD_CELL; 2] }
+    }
+    pub fn one(c: Coord) -> Self {
+        CellSet2 { len: 1, cells: [c, Self::PAD_CELL] }
+    }
+    pub fn two(a: Coord, b: Coord) -> Self {
+        debug_assert_ne!(a, b);
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        CellSet2 { len: 2, cells: [a, b] }
+    }
+    pub fn from_cells(cells: &[Coord]) -> Self {
+        match *cells {
+            [] => Self::empty(),
+            [a] => Self::one(a),
+            [a, b] => Self::two(a, b),
+            _ => unreachable!("CellSet2 holds at most 2 cells"),
+        }
+    }
+    #[inline]
+    pub fn cells(&self) -> &[Coord] {
+        &self.cells[..self.len as usize]
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    #[inline]
+    pub fn contains(&self, c: Coord) -> bool {
+        self.cells().contains(&c)
+    }
+    #[inline]
+    pub fn first(&self) -> Option<Coord> {
+        self.cells().first().copied()
+    }
+}
+
+/// Mutable board for make/unmake search — dense grid + stone list, no per-node
+/// clone. Cells outside the grid are empty by construction (the grid always
+/// covers every stone with `GRID_PAD` slack).
+struct SolverBoard {
+    grid: Vec<u8>, // 0 empty, 1 P1, 2 P2
+    /// Per-cell count of stones within `reach_radius` (tight regime only).
+    reach: Vec<u16>,
+    q0: i32,
+    r0: i32,
+    w: i32,
+    h: i32,
+    /// -1 = reach tracking off.
+    reach_radius: i32,
+    disk: Vec<Coord>,
+    pub stones: Vec<(Coord, Player)>,
     pub hash: u64,
+}
+
+impl Default for SolverBoard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SolverBoard {
     pub fn new() -> Self {
-        SolverBoard { stones: FxHashMap::default(), hash: 0 }
-    }
-    #[inline]
-    pub fn place(&mut self, coord: Coord, player: Player) {
-        debug_assert!(!self.stones.contains_key(&coord), "double-place corrupts Zobrist");
-        self.stones.insert(coord, player);
-        self.hash ^= zob(coord, player);
-    }
-    #[inline]
-    pub fn remove(&mut self, coord: Coord) {
-        if let Some(player) = self.stones.remove(&coord) {
-            self.hash ^= zob(coord, player);
+        SolverBoard {
+            grid: Vec::new(),
+            reach: Vec::new(),
+            q0: 0,
+            r0: 0,
+            w: 0,
+            h: 0,
+            reach_radius: -1,
+            disk: Vec::new(),
+            stones: Vec::new(),
+            hash: 0,
         }
     }
+
+    #[inline]
+    fn idx(&self, (q, r): Coord) -> Option<usize> {
+        let x = q - self.q0;
+        let y = r - self.r0;
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            None
+        } else {
+            Some((y * self.w + x) as usize)
+        }
+    }
+
+    /// Raw cell code: 0 empty (including out-of-grid), 1 P1, 2 P2.
+    #[inline]
+    fn raw(&self, c: Coord) -> u8 {
+        match self.idx(c) {
+            Some(i) => self.grid[i],
+            None => 0,
+        }
+    }
+
     #[inline]
     pub fn get(&self, coord: Coord) -> Option<Player> {
-        self.stones.get(&coord).copied()
+        match self.raw(coord) {
+            1 => Some(Player::P1),
+            2 => Some(Player::P2),
+            _ => None,
+        }
     }
+
+    /// Grow the grid so the GRID_PAD box around `c` is inside it.
+    #[inline]
+    fn ensure_cover(&mut self, c: Coord) {
+        if self.w == 0
+            || c.0 - GRID_PAD < self.q0
+            || c.1 - GRID_PAD < self.r0
+            || c.0 + GRID_PAD >= self.q0 + self.w
+            || c.1 + GRID_PAD >= self.r0 + self.h
+        {
+            self.grow(c, c);
+        }
+    }
+
+    /// Rebuild the grid to cover its current bounds plus the box [lo, hi] with
+    /// 2*GRID_PAD additive slack, so a placement drifting outward triggers a
+    /// rebuild at most every GRID_PAD cells (search growth is bounded by
+    /// depth_cap, so rebuilds stay rare; `solve` pre-sizes the common case).
+    fn grow(&mut self, lo: Coord, hi: Coord) {
+        let pad = 2 * GRID_PAD;
+        let (mut nq0, mut nr0, mut nq1, mut nr1) =
+            (lo.0 - pad, lo.1 - pad, hi.0 + pad, hi.1 + pad);
+        if self.w != 0 {
+            nq0 = nq0.min(self.q0);
+            nr0 = nr0.min(self.r0);
+            nq1 = nq1.max(self.q0 + self.w - 1);
+            nr1 = nr1.max(self.r0 + self.h - 1);
+        }
+        let (nw, nh) = (nq1 - nq0 + 1, nr1 - nr0 + 1);
+        assert!(
+            (nw as i64) * (nh as i64) <= MAX_GRID_CELLS,
+            "SolverBoard grid would exceed {MAX_GRID_CELLS} cells ({nw}x{nh}); \
+             positions with unbounded coordinate spread are unsupported"
+        );
+        let cells = (nw as i64 * nh as i64) as usize; // guarded above, fits usize
+        let mut ngrid = vec![0u8; cells];
+        let tracking = self.reach_radius >= 0;
+        let mut nreach = if tracking { vec![0u16; cells] } else { Vec::new() };
+        for y in 0..self.h {
+            let src = (y * self.w) as usize;
+            let dst = (((y + self.r0 - nr0) * nw) + (self.q0 - nq0)) as usize;
+            ngrid[dst..dst + self.w as usize].copy_from_slice(&self.grid[src..src + self.w as usize]);
+            if tracking {
+                nreach[dst..dst + self.w as usize]
+                    .copy_from_slice(&self.reach[src..src + self.w as usize]);
+            }
+        }
+        self.grid = ngrid;
+        self.reach = nreach;
+        self.q0 = nq0;
+        self.r0 = nr0;
+        self.w = nw;
+        self.h = nh;
+    }
+
+    /// Pre-size the grid to cover the box [lo, hi]; avoids repeated growth when
+    /// bulk-loading a position.
+    pub fn reserve(&mut self, lo: Coord, hi: Coord) {
+        debug_assert!(lo.0 <= hi.0 && lo.1 <= hi.1, "reserve expects lo <= hi componentwise");
+        if self.idx((lo.0 - GRID_PAD, lo.1 - GRID_PAD)).is_none()
+            || self.idx((hi.0 + GRID_PAD, hi.1 + GRID_PAD)).is_none()
+        {
+            self.grow(lo, hi);
+        }
+    }
+
+    /// Switch on O(1) `within_radius` queries for `radius` by maintaining, for
+    /// every grid cell, the count of stones within hex-distance `radius`.
+    /// Idempotent for the same radius. Only worthwhile in the tight regime.
+    pub fn enable_reach(&mut self, radius: i32) {
+        debug_assert!((0..=GRID_PAD).contains(&radius), "reach radius must fit in GRID_PAD");
+        if self.reach_radius == radius {
+            return;
+        }
+        self.reach_radius = radius;
+        self.disk = hex_offsets(radius);
+        self.reach = vec![0u16; self.grid.len()];
+        let (q0, r0, w) = (self.q0, self.r0, self.w);
+        for si in 0..self.stones.len() {
+            let (s, _) = self.stones[si];
+            for di in 0..self.disk.len() {
+                let (dq, dr) = self.disk[di];
+                // In bounds by the GRID_PAD >= radius invariant.
+                let i = ((s.1 + dr - r0) * w + (s.0 + dq - q0)) as usize;
+                self.reach[i] += 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn place(&mut self, coord: Coord, player: Player) {
+        debug_assert!(self.get(coord).is_none(), "double-place corrupts Zobrist");
+        self.ensure_cover(coord);
+        let i = self.idx(coord).unwrap();
+        self.grid[i] = pcode(player);
+        self.stones.push((coord, player));
+        self.hash ^= zob(coord, player);
+        if self.reach_radius >= 0 {
+            let (q0, r0, w) = (self.q0, self.r0, self.w);
+            for di in 0..self.disk.len() {
+                let (dq, dr) = self.disk[di];
+                let j = ((coord.1 + dr - r0) * w + (coord.0 + dq - q0)) as usize;
+                self.reach[j] += 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, coord: Coord) {
+        let Some(i) = self.idx(coord) else { return };
+        if self.grid[i] == 0 {
+            return;
+        }
+        let player = if self.grid[i] == 1 { Player::P1 } else { Player::P2 };
+        self.grid[i] = 0;
+        self.hash ^= zob(coord, player);
+        // Make/unmake removes are LIFO in the search, so scan from the end.
+        if let Some(pos) = self.stones.iter().rposition(|&(c, _)| c == coord) {
+            self.stones.swap_remove(pos);
+        }
+        if self.reach_radius >= 0 {
+            let (q0, r0, w) = (self.q0, self.r0, self.w);
+            for di in 0..self.disk.len() {
+                let (dq, dr) = self.disk[di];
+                let j = ((coord.1 + dr - r0) * w + (coord.0 + dq - q0)) as usize;
+                self.reach[j] -= 1;
+            }
+        }
+    }
+
     /// True iff `cell` is within hex-distance `radius` of some stone currently on
     /// the board. This is exactly the engine's legality disk (a cell is legal iff
-    /// empty AND within `placement_radius` of a stone; see `legal_moves::legal_moves`),
-    /// built directly from `hex::hex_offsets` so the solver and engine can never
-    /// silently desync on the disk shape. Only ever called in the tight-radius
-    /// regime (`radius < win_length - 1`), where the disk is small.
+    /// empty AND within `placement_radius` of a stone; see `legal_moves::legal_moves`).
+    /// O(1) when reach tracking is enabled for this radius (`solve_from` enables it
+    /// in the tight regime); otherwise a linear stone scan (unit tests, ad-hoc use).
     #[inline]
     pub fn within_radius(&self, cell: Coord, radius: i32) -> bool {
-        hex_offsets(radius)
-            .iter()
-            .any(|&(dq, dr)| self.stones.contains_key(&(cell.0 + dq, cell.1 + dr)))
+        debug_assert!(radius >= 0, "within_radius expects a real radius, not the off sentinel");
+        if radius == self.reach_radius {
+            return match self.idx(cell) {
+                Some(i) => self.reach[i] > 0,
+                // Out of grid => farther than GRID_PAD >= radius from every stone.
+                None => false,
+            };
+        }
+        self.stones.iter().any(|&(s, _)| hex_dist(cell, s) <= radius)
     }
 }
 
-/// Enemy-free length-wl windows through `player`'s stones holding >= wl-2 of them;
-/// each returned as its sorted empty cells (size 1 or 2). Strip-scan per (stone, axis).
-pub fn completions(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> FxHashSet<Vec<Coord>> {
+/// Scan all length-`wl` enemy-free windows for `player` whose stone count lies in
+/// [pc_lo, pc_hi] and (in the tight regime) whose gap cells are all playable,
+/// invoking `f(window_start, axis_index, pc, gap_cells)`. `f` returns true to stop
+/// the scan early. Gap cells are emitted in ascending coord order (strip order).
+///
+/// Radius-awareness: a window only counts if the attacker could legally fill ALL
+/// its gap cells. Skipped entirely when radius >= win_length-1 (every gap of a
+/// window through a stone is within wl-1 <= radius of that stone), keeping the
+/// wide-radius path byte-for-byte unchanged and zero-cost.
+fn scan_windows(
+    board: &SolverBoard,
+    player: Player,
+    wl: u8,
+    radius: i32,
+    pc_lo: i32,
+    pc_hi: i32,
+    f: &mut impl FnMut(Coord, usize, u8, &[Coord]) -> bool,
+) {
     let l = wl as i32;
-    // Radius-awareness: a window is a real completion only if the attacker can
-    // legally fill ALL its gap cells. Skip entirely when radius >= win_length-1
-    // (every gap of a >= wl-2 window is within wl-1 <= radius of a window stone),
-    // keeping the wide-radius path byte-for-byte unchanged and zero-cost.
+    debug_assert!((1..=MAX_WL as i32).contains(&l), "win_length must be 1..={MAX_WL}");
     let enforce = radius < l - 1;
-    let mut result: FxHashSet<Vec<Coord>> = FxHashSet::default();
-    let mut stones: Vec<Coord> = board.stones.iter()
-        .filter(|&(_, &owner)| owner == player)
-        .map(|(&c, _)| c)
-        .collect();
-    stones.sort_unstable();
-    for (sq, sr) in stones {
-        for &(dq, dr) in WIN_AXES.iter() {
+    let mine = pcode(player);
+    let n = (2 * l - 1) as usize;
+    let mut coords = [(0i32, 0i32); STRIP];
+    let mut owners = [0u8; STRIP]; // 0 empty, 1 mine, 2 enemy
+    let mut empties = [(0i32, 0i32); MAX_WL];
+    for si in 0..board.stones.len() {
+        let (s, owner) = board.stones[si];
+        if owner != player {
+            continue;
+        }
+        for (ai, &(dq, dr)) in WIN_AXES.iter().enumerate() {
             // strip of 2l-1 cells centered on the stone
-            let coords: Vec<Coord> = (1 - l..l).map(|o| (sq + o * dq, sr + o * dr)).collect();
-            let owners: Vec<Option<Player>> = coords.iter().map(|&c| board.get(c)).collect();
-            for k in 0..(l as usize) { // windows owners[k..k+l], each covers the center
-                let mut pc = 0u8;
-                let mut empties: Vec<Coord> = Vec::with_capacity(2);
+            for (t, item) in coords.iter_mut().enumerate().take(n) {
+                let o = t as i32 + 1 - l;
+                let c = (s.0 + o * dq, s.1 + o * dr);
+                *item = c;
+                let raw = board.raw(c);
+                owners[t] = if raw == 0 {
+                    0
+                } else if raw == mine {
+                    1
+                } else {
+                    2
+                };
+            }
+            for k in 0..(l as usize) {
+                // window owners[k..k+l], each covers the center stone
+                let mut pc = 0i32;
+                let mut ne = 0usize;
                 let mut enemy = false;
                 for j in k..k + l as usize {
                     match owners[j] {
-                        None => empties.push(coords[j]),
-                        Some(o) if o == player => pc += 1,
-                        Some(_) => { enemy = true; break; }
+                        0 => {
+                            empties[ne] = coords[j];
+                            ne += 1;
+                        }
+                        1 => pc += 1,
+                        _ => {
+                            enemy = true;
+                            break;
+                        }
                     }
                 }
-                if !enemy && (pc as i32) >= (wl as i32) - 2 && (pc as i32) <= (wl as i32) - 1 {
-                    // In the tight regime, drop the window if any gap is unplayable:
-                    // the attacker could not legally complete it, so it is not a real
-                    // completion (nor a legal defender block / cover).
-                    if enforce && empties.iter().any(|&e| !board.within_radius(e, radius)) {
-                        continue;
-                    }
-                    empties.sort_unstable();
-                    result.insert(empties);
-                }
-            }
-        }
-    }
-    result
-}
-
-/// (B, all size-B hitting sets) over the completion sets. Small inputs -> enumerate
-/// k-subsets of the involved cells by increasing k.
-pub fn min_covers(comps: &[Vec<Coord>]) -> (u8, Vec<Vec<Coord>>) {
-    if comps.is_empty() { return (0, vec![vec![]]); }
-    let mut universe: Vec<Coord> = comps.iter().flatten().copied().collect();
-    universe.sort_unstable();
-    universe.dedup();
-    let n = universe.len();
-    for k in 1..=n {
-        let mut covers: Vec<Vec<Coord>> = Vec::new();
-        // iterate all k-combinations of `universe`
-        let mut idx: Vec<usize> = (0..k).collect();
-        loop {
-            let sub: Vec<Coord> = idx.iter().map(|&i| universe[i]).collect();
-            let hits_all = comps.iter().all(|c| c.iter().any(|cell| sub.contains(cell)));
-            if hits_all { covers.push(sub); }
-            // advance combination
-            let mut i = k;
-            loop {
-                if i == 0 { break; }
-                i -= 1;
-                if idx[i] != i + n - k { break; }
-                if i == 0 { i = usize::MAX; break; }
-            }
-            if i == usize::MAX { break; }
-            idx[i] += 1;
-            for j in i + 1..k { idx[j] = idx[j - 1] + 1; }
-        }
-        if !covers.is_empty() { return (k as u8, covers); }
-    }
-    (n as u8, vec![universe])
-}
-
-/// Near-complete lines (enemy-free windows with wl-4..wl-3 stones), indexed by empty
-/// cell — so a move's B is a table lookup, not a rescan.
-pub fn threat_table(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> FxHashMap<Coord, Vec<(Vec<Coord>, u8)>> {
-    let l = wl as i32;
-    let enforce = radius < l - 1;
-    let mut index: FxHashMap<Coord, Vec<(Vec<Coord>, u8)>> = FxHashMap::default();
-    let mut seen: FxHashSet<Vec<Coord>> = FxHashSet::default();
-    let mut stones: Vec<Coord> = board.stones.iter()
-        .filter(|&(_, &owner)| owner == player)
-        .map(|(&c, _)| c)
-        .collect();
-    stones.sort_unstable();
-    for (sq, sr) in stones {
-        for &(dq, dr) in WIN_AXES.iter() {
-            let coords: Vec<Coord> = (1 - l..l).map(|o| (sq + o * dq, sr + o * dr)).collect();
-            let owners: Vec<Option<Player>> = coords.iter().map(|&c| board.get(c)).collect();
-            for k in 0..(l as usize) {
-                let mut pc = 0u8; let mut empties: Vec<Coord> = Vec::new(); let mut enemy = false;
-                for j in k..k + l as usize {
-                    match owners[j] {
-                        None => empties.push(coords[j]),
-                        Some(o) if o == player => pc += 1,
-                        Some(_) => { enemy = true; break; }
-                    }
-                }
-                if enemy || !((pc as i32) >= (wl as i32) - 4 && (pc as i32) <= (wl as i32) - 3) { continue; }
-                let window: Vec<Coord> = coords[k..k + l as usize].to_vec();
-                if !seen.insert(window) { continue; }
-                empties.sort_unstable();
-                // Window-level filtering (matches `completions()`'s semantics): in the
-                // tight regime, drop the WHOLE window if any of its empty cells is
-                // unplayable, rather than filtering per-cell. Per-cell filtering could
-                // leave an unplayable companion cell embedded in a *surviving* cell's
-                // payload, inflating that cell's `move_b` B-count with a gap the
-                // attacker could never legally fill.
-                if enforce && empties.iter().any(|&e| !board.within_radius(e, radius)) {
+                if enemy || pc < pc_lo || pc > pc_hi {
                     continue;
                 }
-                for &e in empties.iter() {
-                    index.entry(e).or_default().push((empties.clone(), pc));
+                // Window-level legality filter: drop the WHOLE window if any gap
+                // is unplayable — the attacker could not legally complete it, so
+                // it is neither a real completion/threat nor a legal defender
+                // block. (Per-cell filtering could leave an unplayable companion
+                // cell in a surviving cell's payload, inflating `move_b`.)
+                if enforce && empties[..ne].iter().any(|&e| !board.within_radius(e, radius)) {
+                    continue;
+                }
+                if f(coords[k], ai, pc as u8, &empties[..ne]) {
+                    return;
                 }
             }
         }
     }
+}
+
+/// Enemy-free length-wl windows through `player`'s stones holding >= wl-2 of them,
+/// each returned as its (sorted) gap-cell set of size 1 or 2. Sorted + deduped.
+fn completions(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> Vec<CellSet2> {
+    let l = wl as i32;
+    let mut out: Vec<CellSet2> = Vec::new();
+    scan_windows(board, player, wl, radius, l - 2, l - 1, &mut |_, _, _, empties| {
+        out.push(CellSet2::from_cells(empties));
+        false
+    });
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A near-complete window's gap cells (3..=4 of them) plus its stone count.
+#[derive(Clone, Copy, Debug)]
+struct ThreatEntry {
+    pc: u8,
+    len: u8,
+    cells: [Coord; 4],
+}
+
+impl ThreatEntry {
+    #[inline]
+    pub fn cells(&self) -> &[Coord] {
+        &self.cells[..self.len as usize]
+    }
+}
+
+type ThreatIndex = FxHashMap<Coord, Vec<ThreatEntry>>;
+
+/// Near-complete lines (enemy-free windows with wl-4..wl-3 stones), indexed by gap
+/// cell — so a move's B is a table lookup, not a rescan.
+fn threat_table(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> ThreatIndex {
+    let l = wl as i32;
+    let mut index: ThreatIndex = FxHashMap::default();
+    // Windows are visited once per stone they contain; dedup by identity
+    // (start cell, axis) — cheap, and equivalent to deduping the cell vec.
+    let mut seen: FxHashSet<(Coord, u8)> = FxHashSet::default();
+    scan_windows(board, player, wl, radius, l - 4, l - 3, &mut |start, ai, pc, empties| {
+        if !seen.insert((start, ai as u8)) {
+            return false;
+        }
+        debug_assert!(empties.len() <= 4 && empties.windows(2).all(|w| w[0] < w[1]));
+        let mut e = ThreatEntry { pc, len: empties.len() as u8, cells: [(0, 0); 4] };
+        e.cells[..empties.len()].copy_from_slice(empties);
+        for &c in empties {
+            index.entry(c).or_default().push(e);
+        }
+        false
+    });
     index
 }
 
-/// B after playing `mv`, read from the threat table (no board scan).
-pub fn move_b(index: &FxHashMap<Coord, Vec<(Vec<Coord>, u8)>>, mv: &[Coord], wl: u8) -> u8 {
-    let mut comps: FxHashSet<Vec<Coord>> = FxHashSet::default();
+/// B after playing `mv` (exact up to 4; 4 means ">= 4"), read from the threat
+/// table (no board scan). `scratch` is caller-provided to keep the hot pair
+/// loop allocation-free.
+fn move_b_with(index: &ThreatIndex, mv: &[Coord], wl: u8, scratch: &mut Vec<CellSet2>) -> u8 {
+    scratch.clear();
     for &cell in mv {
         if let Some(entries) = index.get(&cell) {
-            for (empties, pc) in entries {
-                let filled = empties.iter().filter(|e| mv.contains(e)).count() as u8;
-                if (*pc as i32) + (filled as i32) >= (wl as i32) - 2 {
-                    let mut remaining: Vec<Coord> = empties.iter().filter(|e| !mv.contains(e)).copied().collect();
-                    remaining.sort_unstable();
-                    comps.insert(remaining);
+            for e in entries {
+                let filled = e.cells().iter().filter(|c| mv.contains(c)).count() as i32;
+                if (e.pc as i32) + filled >= (wl as i32) - 2 {
+                    // remaining = gaps not filled by mv; <= 2 by arithmetic
+                    // (pc + filled >= wl-2 and |gaps| = wl - pc), never 0
+                    // (|gaps| >= 3 > |mv|).
+                    let mut rem = [CellSet2::PAD_CELL; 2];
+                    let mut nr = 0usize;
+                    for &g in e.cells() {
+                        if !mv.contains(&g) {
+                            rem[nr] = g;
+                            nr += 1;
+                        }
+                    }
+                    debug_assert!((1..=2).contains(&nr), "remaining gaps must be 1..=2");
+                    scratch.push(CellSet2::from_cells(&rem[..nr]));
                 }
             }
         }
     }
-    let v: Vec<Vec<Coord>> = comps.into_iter().collect();
-    min_covers(&v).0
+    scratch.sort_unstable();
+    scratch.dedup();
+    cover_class(scratch)
 }
 
-pub fn has_completion(board: &SolverBoard, player: Player, wl: u8, max_empties: u8, radius: i32) -> bool {
-    completions(board, player, wl, radius).iter().any(|c| c.len() as u8 <= max_empties)
+/// B after playing `mv` (allocating convenience wrapper).
+#[cfg(test)]
+fn move_b(index: &ThreatIndex, mv: &[Coord], wl: u8) -> u8 {
+    let mut scratch = Vec::new();
+    move_b_with(index, mv, wl, &mut scratch)
 }
 
-/// Sound gate: can the attacker make a four this turn? (any enemy-free window with
-/// >= wl-4 attacker stones). Equivalent to a non-empty threat table.
-pub fn any_four_gate(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> bool {
-    !threat_table(board, attacker, wl, radius).is_empty()
+/// Fill `cells` with the distinct sorted cells of `comps` and `masks[j]` with the
+/// bitmask of comps that cell `cells[j]` hits. Requires `comps.len() <= 64` (so at
+/// most 128 distinct cells). Returns the distinct-cell count.
+fn build_cell_masks(comps: &[CellSet2], cells: &mut [Coord; 128], masks: &mut [u64; 128]) -> usize {
+    debug_assert!(comps.len() <= 64, "mask fast path is sized for <= 64 comps");
+    let mut u = 0usize;
+    for cp in comps {
+        for &c in cp.cells() {
+            cells[u] = c;
+            u += 1;
+        }
+    }
+    cells[..u].sort_unstable();
+    let mut w = 0usize;
+    for i in 0..u {
+        if i == 0 || cells[i] != cells[w - 1] {
+            cells[w] = cells[i];
+            w += 1;
+        }
+    }
+    masks[..w].fill(0);
+    for (i, cp) in comps.iter().enumerate() {
+        for &c in cp.cells() {
+            let j = cells[..w].binary_search(&c).unwrap();
+            masks[j] |= 1u64 << i;
+        }
+    }
+    w
 }
 
-pub fn attacker_turns(board: &SolverBoard, attacker: Player, defender: Player, placements: u8, wl: u8, radius: i32) -> Vec<Vec<Coord>> {
+/// Core of the capped min-hitting-set computation. Returns B capped at 3 (3 means
+/// ">= 3": the search treats those identically — an unstoppable multi-threat).
+/// When `collect` is given, ALL minimum covers are pushed for B <= 2, in
+/// lexicographic cell order (parity with the old k-combination enumeration);
+/// for B >= 3 covers are never needed and none are collected.
+fn min_covers_capped(comps: &[CellSet2], collect: Option<&mut Vec<CellSet2>>) -> u8 {
+    let n = comps.len();
+    if n == 0 {
+        if let Some(out) = collect {
+            out.push(CellSet2::empty());
+        }
+        return 0;
+    }
+    debug_assert!(comps.iter().all(|c| !c.is_empty()));
+    if n > 64 {
+        return min_covers_big(comps, collect);
+    }
+    let full: u64 = if n == 64 { !0 } else { (1u64 << n) - 1 };
+    let mut cells = [(0i32, 0i32); 128];
+    let mut masks = [0u64; 128];
+    let u = build_cell_masks(comps, &mut cells, &mut masks);
+    let alive = full; // all comps alive at the root
+    let b = min_hit_masks(comps, &cells[..u], &masks, alive, 3);
+    if let Some(out) = collect {
+        match b {
+            1 => {
+                for j in 0..u {
+                    if masks[j] == full {
+                        out.push(CellSet2::one(cells[j]));
+                    }
+                }
+            }
+            2 => {
+                for ja in 0..u {
+                    for jb in ja + 1..u {
+                        if masks[ja] | masks[jb] == full {
+                            out.push(CellSet2::two(cells[ja], cells[jb]));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    b
+}
+
+/// Fallback for > 64 comps (rare): same semantics, chunked bitset words.
+fn min_covers_big(comps: &[CellSet2], mut collect: Option<&mut Vec<CellSet2>>) -> u8 {
+    let n = comps.len();
+    let words = n.div_ceil(64);
+    let mut cells: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let u = cells.len();
+    let mut masks = vec![0u64; u * words];
+    for (i, cp) in comps.iter().enumerate() {
+        for &c in cp.cells() {
+            let j = cells.binary_search(&c).unwrap();
+            masks[j * words + i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    let full_last: u64 = if n.is_multiple_of(64) { !0 } else { (1u64 << (n % 64)) - 1 };
+    let is_full = |m: &[u64]| {
+        m[..words - 1].iter().all(|&w| w == !0) && m[words - 1] == full_last
+    };
+    let mut b = 4u8;
+    for j in 0..u {
+        if is_full(&masks[j * words..(j + 1) * words]) {
+            if let Some(out) = collect.as_deref_mut() {
+                out.push(CellSet2::one(cells[j]));
+                b = 1;
+            } else {
+                return 1;
+            }
+        }
+    }
+    if b == 1 {
+        return 1;
+    }
+    let mut or_buf = vec![0u64; words];
+    for a in 0..u {
+        for bb in a + 1..u {
+            for wi in 0..words {
+                or_buf[wi] = masks[a * words + wi] | masks[bb * words + wi];
+            }
+            if is_full(&or_buf) {
+                if let Some(out) = collect.as_deref_mut() {
+                    out.push(CellSet2::two(cells[a], cells[bb]));
+                    b = 2;
+                } else {
+                    return 2;
+                }
+            }
+        }
+    }
+    if b == 2 { 2 } else { 3 }
+}
+
+/// Exact B capped at 4 (4 means ">= 4") without materializing covers — the
+/// hot-path classifier and move-ordering key. Exactness up to 4 preserves the
+/// prototype's preference for double-four moves (B=4) over triple threats
+/// (B=3); B >= 5 sorts equal to 4 (all B >= 3 moves win identically next turn,
+/// so only PV/first-move cosmetics could differ). Computed by branch-and-bound
+/// on the hitting set: every cover must hit the first un-hit comp with one of
+/// its <= 2 cells, so the tree has <= 2^4 leaves — no combinatorial enumeration.
+fn cover_class(comps: &[CellSet2]) -> u8 {
+    let n = comps.len();
+    if n == 0 {
+        return 0;
+    }
+    debug_assert!(comps.iter().all(|c| !c.is_empty()));
+    if n == 1 {
+        return 1;
+    }
+    if n == 2 {
+        // B=1 iff the two gap sets intersect.
+        let joint = comps[0].cells().iter().any(|&c| comps[1].contains(c));
+        return if joint { 1 } else { 2 };
+    }
+    if n > 64 {
+        return min_hit_slice(comps.to_vec(), 4);
+    }
+    let mut cells = [(0i32, 0i32); 128];
+    let mut masks = [0u64; 128];
+    let u = build_cell_masks(comps, &mut cells, &mut masks);
+    let alive: u64 = if n == 64 { !0 } else { (1u64 << n) - 1 };
+    min_hit_masks(comps, &cells[..u], &masks, alive, 4)
+}
+
+/// min(B, cap) over the still-alive comps (bitmask), branching on the first
+/// alive comp's cells. Depth is bounded by `cap`.
+fn min_hit_masks(comps: &[CellSet2], cells: &[Coord], masks: &[u64], alive: u64, cap: u8) -> u8 {
+    if alive == 0 {
+        return 0;
+    }
+    if cap == 0 {
+        return 0; // budget exhausted: min(B, 0) — reads as "B >= original cap"
+    }
+    let first = alive.trailing_zeros() as usize;
+    let mut best = cap;
+    for &c in comps[first].cells() {
+        let j = cells.binary_search(&c).unwrap();
+        let r = 1 + min_hit_masks(comps, cells, masks, alive & !masks[j], best - 1);
+        if r < best {
+            best = r;
+            if best == 1 {
+                break; // no branch can return < 1
+            }
+        }
+    }
+    best
+}
+
+/// Allocating branch-and-bound fallback for > 64 comps (rare).
+fn min_hit_slice(alive: Vec<CellSet2>, cap: u8) -> u8 {
+    if alive.is_empty() {
+        return 0;
+    }
+    if cap == 0 {
+        return 0;
+    }
+    let first = alive[0];
+    let mut best = cap;
+    for &c in first.cells() {
+        let sub: Vec<CellSet2> = alive.iter().filter(|cp| !cp.contains(c)).copied().collect();
+        let r = 1 + min_hit_slice(sub, best - 1);
+        if r < best {
+            best = r;
+            if best == 1 {
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// (B capped at 3, all size-B covers for B <= 2; empty for B >= 3 — the search
+/// never uses covers there: B >= 3 is an immediate attacker win).
+fn min_covers2(comps: &[CellSet2]) -> (u8, Vec<CellSet2>) {
+    let mut covers = Vec::new();
+    let b = min_covers_capped(comps, Some(&mut covers));
+    (b, covers)
+}
+
+/// Does the player have a completion needing at most `max_empties` placements?
+/// Early-exits on the first hit.
+fn has_completion(board: &SolverBoard, player: Player, wl: u8, max_empties: u8, radius: i32) -> bool {
+    let l = wl as i32;
+    let mut found = false;
+    scan_windows(board, player, wl, radius, l - 2, l - 1, &mut |_, _, _, empties| {
+        if empties.len() as u8 <= max_empties {
+            found = true;
+        }
+        found
+    });
+    found
+}
+
+/// Sound gate: can the attacker make a four this turn? Scans for enemy-free
+/// windows with wl-4..=wl-3 attacker stones (exactly the threat table's range;
+/// windows with more stones are completions, covered by `has_completion` at the
+/// `solve_from` gate). Equivalent to a non-empty threat table, but early-exits
+/// on the first qualifying window instead of building the table.
+fn any_four_gate(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> bool {
+    let l = wl as i32;
+    let mut found = false;
+    scan_windows(board, attacker, wl, radius, l - 4, l - 3, &mut |_, _, _, _| {
+        found = true;
+        true
+    });
+    found
+}
+
+/// Forcing attacker turns (B >= 2 after the move), best-first by B.
+fn attacker_turns(
+    board: &SolverBoard,
+    attacker: Player,
+    defender: Player,
+    placements: u8,
+    wl: u8,
+    radius: i32,
+) -> Vec<CellSet2> {
+    let dfn_comps = completions(board, defender, wl, radius);
+    attacker_turns_with(board, attacker, placements, wl, radius, &dfn_comps)
+}
+
+/// See `attacker_turns`; takes precomputed defender completions.
+fn attacker_turns_with(
+    board: &SolverBoard,
+    attacker: Player,
+    placements: u8,
+    wl: u8,
+    radius: i32,
+    dfn_comps: &[CellSet2],
+) -> Vec<CellSet2> {
     let enforce = radius < wl as i32 - 1;
     let index = threat_table(board, attacker, wl, radius);
     let mut hot: Vec<Coord> = index.keys().copied().collect();
     hot.sort_unstable();
-    let mut scored: Vec<(u8, Vec<Coord>)> = Vec::new();
+    // Per-hot-cell forcing potential, used to skip candidates that provably
+    // cannot reach B >= 2 without running `move_b`: `strong` counts entries the
+    // cell completes on its own (pc >= wl-3), `weak` the rest (need a second
+    // fill, so they only contribute when the partner is in the same window).
+    // A move's comp count is bounded by strong(h) + strong(a) + joint-weak
+    // <= strong(h) + strong(a) + min(weak(h), weak(a)); below 2 means B <= 1.
+    let potential: Vec<(u32, u32)> = hot
+        .iter()
+        .map(|c| {
+            let entries = &index[c];
+            let strong = entries.iter().filter(|e| e.pc as i32 >= wl as i32 - 3).count() as u32;
+            (strong, entries.len() as u32 - strong)
+        })
+        .collect();
+    let mut scored: Vec<(u8, CellSet2)> = Vec::new();
+    let mut scratch: Vec<CellSet2> = Vec::new();
     if placements == 1 {
-        for &c in &hot {
+        for (hi, &c) in hot.iter().enumerate() {
+            // A lone placement only converts its strong entries into completions.
+            if potential[hi].0 < 2 {
+                continue;
+            }
             // c must be a legal placement on the current board.
-            if enforce && !board.within_radius(c, radius) { continue; }
-            let b = move_b(&index, &[c], wl);
-            if b >= 2 { scored.push((b, vec![c])); }
+            if enforce && !board.within_radius(c, radius) {
+                continue;
+            }
+            let b = move_b_with(&index, &[c], wl, &mut scratch);
+            if b >= 2 {
+                scored.push((b, CellSet2::one(c)));
+            }
         }
     } else {
-        // partners = hot ∪ defender-block cells (cells of defender completions)
-        let mut partners: FxHashSet<Coord> = hot.iter().copied().collect();
-        for comp in completions(board, defender, wl, radius) {
-            for cell in comp { partners.insert(cell); }
+        // partners = hot ∪ defender-block cells (cells of defender completions),
+        // tagged is_hot so hot-hot pairs dedup by order (emit only when a > h)
+        // instead of via a seen-set — preserving the prototype's exact emission
+        // order (h ascending, partner ascending, first occurrence kept). Each
+        // partner carries its (strong, weak) potential; block-only cells are in
+        // no attacker window, so theirs is (0, 0).
+        let mut partners: Vec<(Coord, bool, u32, u32)> = hot
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, true, potential[i].0, potential[i].1))
+            .collect();
+        {
+            let mut blocks: Vec<Coord> =
+                dfn_comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            blocks.retain(|c| hot.binary_search(c).is_err());
+            partners.extend(blocks.into_iter().map(|c| (c, false, 0, 0)));
         }
-        let mut partners_sorted: Vec<Coord> = partners.into_iter().collect();
-        partners_sorted.sort_unstable();
-        let mut seen: FxHashSet<(Coord, Coord)> = FxHashSet::default();
-        for &h in &hot {
-            for &a in &partners_sorted {
-                if a == h { continue; }
-                let mv = if h < a { (h, a) } else { (a, h) };
-                if !seen.insert(mv) { continue; }
-                // Two-placement legality: mv.0 is played first, so it must be legal on
-                // the current board; mv.1 is played second, so it must be legal on the
-                // board AFTER mv.0 — i.e. within radius of an existing stone OR of mv.0.
-                if enforce {
-                    let (c1, c2) = mv;
-                    if !board.within_radius(c1, radius) { continue; }
-                    // `hex_dist(c1, c2) <= radius` is currently unreachable: `hot` and
-                    // `partners` are both pre-filtered to `within_radius` against the
-                    // pre-move board (via the window-level filtering in `threat_table`
-                    // / `completions`), so `board.within_radius(c2, radius)` is already
-                    // guaranteed true here. Retained for correctness if that
-                    // pre-filtering is ever relaxed -- a known completeness gap
-                    // (rejecting some legal two-placement moves), not a soundness one.
-                    if !(board.within_radius(c2, radius) || hex_dist(c1, c2) <= radius) { continue; }
+        partners.sort_unstable();
+        for (hi, &h) in hot.iter().enumerate() {
+            let (h_strong, h_weak) = potential[hi];
+            for &(a, a_hot, a_strong, a_weak) in partners.iter() {
+                if a == h || (a_hot && a < h) {
+                    continue;
                 }
-                let b = move_b(&index, &[mv.0, mv.1], wl);
-                if b >= 2 { scored.push((b, vec![mv.0, mv.1])); }
+                // Comp-count upper bound below 2 => B <= 1, filtered anyway.
+                if h_strong + a_strong + h_weak.min(a_weak) < 2 {
+                    continue;
+                }
+                let mv = CellSet2::two(h, a);
+                // Two-placement legality: mv cells are played in sorted order, so
+                // cells[0] must be legal on the current board; cells[1] is played
+                // second — legal within radius of an existing stone OR of cells[0].
+                if enforce {
+                    let [c1, c2] = [mv.cells[0], mv.cells[1]];
+                    if !board.within_radius(c1, radius) {
+                        continue;
+                    }
+                    // `hex_dist(c1, c2) <= radius` is currently unreachable: `hot`
+                    // and `blocks` are both pre-filtered to within-radius against
+                    // the pre-move board (window-level filtering in `scan_windows`),
+                    // so `within_radius(c2, ..)` is already true here. Retained for
+                    // correctness if that pre-filtering is ever relaxed — a known
+                    // completeness gap (rejecting some legal two-placement moves),
+                    // not a soundness one.
+                    if !(board.within_radius(c2, radius) || hex_dist(c1, c2) <= radius) {
+                        continue;
+                    }
+                }
+                let b = move_b_with(&index, mv.cells(), wl, &mut scratch);
+                if b >= 2 {
+                    scored.push((b, mv));
+                }
             }
         }
     }
-    scored.sort_by(|x, y| y.0.cmp(&x.0)); // best-first (higher B)
+    scored.sort_by(|x, y| y.0.cmp(&x.0)); // best-first (higher B), stable
     scored.into_iter().map(|(_, m)| m).collect()
 }
 
 #[derive(Debug)]
-pub enum SolveResult { Win { depth: u8 }, No, BudgetExceeded }
+enum SolveResult { Win { depth: u8 }, No, BudgetExceeded }
+
+/// (attacker completions, defender completions) of one position.
+type NodeComps = (Vec<CellSet2>, Vec<CellSet2>);
 
 struct SearchState {
     tt: FxHashMap<(u64, bool, u8, u8), (bool, bool)>, // (hash, is_or, placements, budget) -> (won, cutoff)
     // Per-position memo: forcing move list, budget-independent (mirrors the Python
     // prototype's `state["gencache"]`). Keyed by (board.hash, placements).
-    gencache: FxHashMap<(u64, u8), Vec<Vec<Coord>>>,
-    // Per-position memo: (attacker completions, defender completions), also
-    // budget-independent (mirrors `state["comps"]` / `_node_comps`). Keyed by board.hash.
-    comps: FxHashMap<u64, (Vec<Vec<Coord>>, Vec<Vec<Coord>>)>,
+    gencache: FxHashMap<(u64, u8), Rc<Vec<CellSet2>>>,
+    // Per-position memo: budget-independent (mirrors `state["comps"]` /
+    // `_node_comps`). Keyed by board.hash.
+    comps: FxHashMap<u64, Rc<NodeComps>>,
     nodes: u64,
     budget: u64,
     exceeded: bool,
@@ -293,6 +895,23 @@ struct SearchState {
     radius: i32,
     atk: Player,
     dfn: Player,
+}
+
+impl SearchState {
+    fn new(wl: u8, radius: i32, atk: Player, dfn: Player, node_budget: u64) -> Self {
+        SearchState {
+            tt: FxHashMap::default(),
+            gencache: FxHashMap::default(),
+            comps: FxHashMap::default(),
+            nodes: 0,
+            budget: node_budget,
+            exceeded: false,
+            wl,
+            radius,
+            atk,
+            dfn,
+        }
+    }
 }
 
 fn tick(s: &mut SearchState) -> bool {
@@ -304,42 +923,47 @@ fn tick(s: &mut SearchState) -> bool {
 /// (attacker completions, defender completions) for this position, computed once and
 /// cached by `board.hash` so the full-board scan runs once per position instead of
 /// once per visit (a position is revisited across deepening rounds and transpositions).
-/// Mirrors the prototype's `_node_comps`.
-fn node_comps(board: &SolverBoard, s: &mut SearchState) -> (Vec<Vec<Coord>>, Vec<Vec<Coord>>) {
-    if let Some(v) = s.comps.get(&board.hash) { return v.clone(); }
-    let mut atk_c: Vec<Vec<Coord>> = completions(board, s.atk, s.wl, s.radius).into_iter().collect();
-    let mut dfn_c: Vec<Vec<Coord>> = completions(board, s.dfn, s.wl, s.radius).into_iter().collect();
-    atk_c.sort_unstable();
-    dfn_c.sort_unstable();
-    let v = (atk_c, dfn_c);
-    s.comps.insert(board.hash, v.clone());
+/// Mirrors the prototype's `_node_comps`. Rc so cache hits are a refcount bump, not
+/// a Vec clone (the search is single-threaded).
+fn node_comps(board: &SolverBoard, s: &mut SearchState) -> Rc<NodeComps> {
+    if let Some(v) = s.comps.get(&board.hash) { return Rc::clone(v); }
+    let atk_c = completions(board, s.atk, s.wl, s.radius);
+    let dfn_c = completions(board, s.dfn, s.wl, s.radius);
+    let v = Rc::new((atk_c, dfn_c));
+    s.comps.insert(board.hash, Rc::clone(&v));
     v
 }
 
 /// `attacker_turns`, memoized per (board.hash, placements): the move list is
 /// budget-independent, so a transposition skips rebuilding the threat table entirely
 /// (the expensive part). Mirrors the prototype's `gencache`.
-fn attacker_turns_memo(board: &SolverBoard, placements: u8, s: &mut SearchState) -> Vec<Vec<Coord>> {
+fn attacker_turns_memo(
+    board: &SolverBoard,
+    placements: u8,
+    dfn_comps: &[CellSet2],
+    s: &mut SearchState,
+) -> Rc<Vec<CellSet2>> {
     let key = (board.hash, placements);
-    if let Some(v) = s.gencache.get(&key) { return v.clone(); }
-    let moves = attacker_turns(board, s.atk, s.dfn, placements, s.wl, s.radius);
-    s.gencache.insert(key, moves.clone());
+    if let Some(v) = s.gencache.get(&key) { return Rc::clone(v); }
+    let moves = Rc::new(attacker_turns_with(board, s.atk, placements, s.wl, s.radius, dfn_comps));
+    s.gencache.insert(key, Rc::clone(&moves));
     moves
 }
 
 /// Returns (won, cutoff).
 fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut SearchState) -> (bool, bool) {
     if s.exceeded || tick(s) { return (false, false); }
-    let (atk_comps, _) = node_comps(board, s);
+    let comps = node_comps(board, s);
+    let (atk_comps, dfn_comps) = (&comps.0, &comps.1);
     if atk_comps.iter().any(|c| c.len() as u8 <= placements) { return (true, false); }
     if budget < 2 { return (false, true); }
     let key = (board.hash, true, placements, budget);
     if let Some(&v) = s.tt.get(&key) { return v; }
     let (mut won, mut cut) = (false, false);
-    for mv in attacker_turns_memo(board, placements, s) {
-        for &c in &mv { board.place(c, s.atk); }
+    for &mv in attacker_turns_memo(board, placements, dfn_comps, s).iter() {
+        for &c in mv.cells() { board.place(c, s.atk); }
         let (w, subcut) = def_within(board, budget - 1, s);
-        for &c in &mv { board.remove(c); }
+        for &c in mv.cells() { board.remove(c); }
         cut |= subcut;
         if w { won = true; break; }
     }
@@ -350,46 +974,54 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
 
 fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool, bool) {
     if s.exceeded || tick(s) { return (false, false); }
-    let (atk_comps, dfn_comps) = node_comps(board, s);
+    let comps = node_comps(board, s);
+    let (atk_comps, dfn_comps) = (&comps.0, &comps.1);
     if dfn_comps.iter().any(|c| c.len() as u8 <= 2) { return (false, false); } // defender wins first
-    let (bnum, covers) = min_covers(&atk_comps);
+    let (bnum, covers) = min_covers2(atk_comps);
     if bnum < 2 { return (false, false); }
     if bnum >= 3 { return if budget >= 1 { (true, false) } else { (false, true) }; }
     let key = (board.hash, false, 0, budget);
     if let Some(&v) = s.tt.get(&key) { return v; }
     // Defender covers are single cells the defender plays to block; each must be a
     // legal placement. Covers are drawn only from the cells of `atk_comps`, which
-    // `completions` has already filtered to within-radius gaps in the tight regime,
+    // `scan_windows` has already filtered to within-radius gaps in the tight regime,
     // so every cover cell is playable by construction — assert the invariant.
     #[cfg(debug_assertions)]
     if s.radius < s.wl as i32 - 1 {
         for cover in &covers {
             debug_assert!(
-                cover.iter().all(|&c| board.within_radius(c, s.radius)),
+                cover.cells().iter().all(|&c| board.within_radius(c, s.radius)),
                 "defender cover cell is out of placement radius"
             );
         }
     }
     let mut result = (true, false);
     for cover in covers {
-        for &c in &cover { board.place(c, s.dfn); }
+        for &c in cover.cells() { board.place(c, s.dfn); }
         let (w, subcut) = atk_within(board, 2, budget, s);
-        for &c in &cover { board.remove(c); }
+        for &c in cover.cells() { board.remove(c); }
         if !w { result = (false, subcut); break; }
     }
     if !s.exceeded { s.tt.insert(key, result); }
     result
 }
 
-pub fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
+fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
                   placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64) -> SolveResult {
+    // The strip-scan buffers are stack-sized for win_length in 1..=MAX_WL; any
+    // other config cannot be analyzed — report an honest give-up, never a bogus `No`.
+    if !(1..=MAX_WL).contains(&(wl as usize)) {
+        return SolveResult::BudgetExceeded;
+    }
+    // Tight regime: switch legality queries to O(1) incremental counts.
+    if radius < wl as i32 - 1 {
+        board.enable_reach(radius);
+    }
     // sound gate
     if !any_four_gate(board, attacker, wl, radius) && !has_completion(board, attacker, wl, placements_remaining, radius) {
         return SolveResult::No;
     }
-    let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
-        comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-        exceeded: false, wl, radius, atk: attacker, dfn: defender };
+    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
     for depth in 1..=depth_cap {
         let (won, cut) = atk_within(board, placements_remaining, depth, &mut s);
         if won { return SolveResult::Win { depth }; }
@@ -410,7 +1042,44 @@ pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     let wl = game.config().win_length;
     let radius = game.config().placement_radius;
     let placements = game.moves_remaining_this_turn();
+    if !(1..=MAX_WL).contains(&(wl as usize)) {
+        return Outcome::BudgetExceeded; // see solve_from
+    }
     let mut board = SolverBoard::new();
+    // Pre-size once over the position's bounding box (avoids incremental regrowth),
+    // and enable reach tracking before bulk-loading so counts build incrementally.
+    let mut it = game.stones().iter();
+    if let Some((&c0, _)) = it.next() {
+        let (mut lo, mut hi) = (c0, c0);
+        for (&c, _) in it {
+            lo = (lo.0.min(c.0), lo.1.min(c.1));
+            hi = (hi.0.max(c.0), hi.1.max(c.1));
+        }
+        // A pathological coordinate spread would blow up the dense grid (`grow`
+        // panics past MAX_GRID_CELLS), and coordinates near the i32 extremes
+        // would overflow the grid arithmetic before that assert could fire.
+        // Real games are spatially bounded near the origin; if either bound
+        // trips, give up honestly instead of aborting the engine.
+        const MAX_COORD: i32 = 1 << 30;
+        if lo.0 < -MAX_COORD || lo.1 < -MAX_COORD || hi.0 > MAX_COORD || hi.1 > MAX_COORD {
+            return Outcome::BudgetExceeded;
+        }
+        let (span_q, span_r) = (
+            hi.0 as i64 - lo.0 as i64 + 6 * GRID_PAD as i64,
+            hi.1 as i64 - lo.1 as i64 + 6 * GRID_PAD as i64,
+        );
+        if span_q.saturating_mul(span_r) > MAX_GRID_CELLS {
+            return Outcome::BudgetExceeded;
+        }
+        board.reserve(lo, hi);
+    }
+    if radius < wl as i32 - 1 {
+        board.enable_reach(radius);
+    }
+    // `game.stones()` iteration order is nondeterministic (engine HashMap).
+    // Result determinism relies on the XOR-commutative Zobrist hash plus every
+    // derived list (completions, hot cells, partners, moves) being sorted —
+    // do not let stone/scan order leak into tie-breaking.
     for (&c, &p) in game.stones() { board.place(c, p); }
     match solve_from(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget) {
         SolveResult::No => Outcome::No,
@@ -439,17 +1108,15 @@ fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Playe
                        placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64) -> Option<Coord> {
     for c in completions(board, attacker, wl, radius) {
         if c.len() as u8 <= placements {
-            return c.first().copied();
+            return c.first();
         }
     }
     for mv in attacker_turns(board, attacker, defender, placements, wl, radius) {
-        for &c in &mv { board.place(c, attacker); }
-        let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
-            comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-            exceeded: false, wl, radius, atk: attacker, dfn: defender };
+        for &c in mv.cells() { board.place(c, attacker); }
+        let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
         let (w, _) = def_within(board, depth.saturating_sub(1), &mut s);
-        for &c in &mv { board.remove(c); }
-        if w { return mv.first().copied(); }
+        for &c in mv.cells() { board.remove(c); }
+        if w { return mv.first(); }
     }
     None
 }
@@ -462,58 +1129,56 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
     let mut remaining = depth;
     loop {
         // attacker to move: immediate completion?
-        let mut fin: Option<Vec<Coord>> = None;
+        let mut fin: Option<CellSet2> = None;
         for c in completions(board, attacker, wl, radius) {
             if c.len() as u8 <= placements { fin = Some(c); break; }
         }
         if let Some(cells) = fin {
-            for &c in &cells { board.place(c, attacker); pv.push(c); }
+            for &c in cells.cells() { board.place(c, attacker); pv.push(c); }
             break;
         }
         // find a winning forcing move
-        let mut chosen: Option<Vec<Coord>> = None;
+        let mut chosen: Option<CellSet2> = None;
         for mv in attacker_turns(board, attacker, defender, placements, wl, radius) {
-            for &c in &mv { board.place(c, attacker); }
-            let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
-                comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-                exceeded: false, wl, radius, atk: attacker, dfn: defender };
-            let (w, _) = def_within(board, remaining - 1, &mut s);
-            for &c in &mv { board.remove(c); }
+            for &c in mv.cells() { board.place(c, attacker); }
+            let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
+            let (w, _) = def_within(board, remaining.saturating_sub(1), &mut s);
+            for &c in mv.cells() { board.remove(c); }
             if w { chosen = Some(mv); break; }
         }
         let mv = match chosen { Some(m) => m, None => break };
-        for &c in &mv { board.place(c, attacker); pv.push(c); }
+        for &c in mv.cells() { board.place(c, attacker); pv.push(c); }
         placements = 2;
         // defender: B>=3 terminal, or prolonging cover
-        let comps: Vec<Vec<Coord>> = completions(board, attacker, wl, radius).into_iter().collect();
-        let (bnum, covers) = min_covers(&comps);
+        let comps = completions(board, attacker, wl, radius);
+        let (bnum, covers) = min_covers2(&comps);
         if bnum >= 3 {
             // defender blocks two threat cells (futile), attacker completes next loop
-            let mut cells: Vec<Coord> = comps.iter().flatten().copied().collect();
+            let mut cells: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
             cells.sort_unstable(); cells.dedup();
             for &c in cells.iter().take(2) { board.place(c, defender); pv.push(c); }
-            remaining -= 1;
+            remaining = remaining.saturating_sub(1);
             continue;
         }
         // pick the cover that prolongs the win the most
-        let mut best: Option<(u8, Vec<Coord>)> = None;
+        let mut best: Option<(u8, CellSet2)> = None;
         for cover in covers {
-            for &c in &cover { board.place(c, defender); }
+            for &c in cover.cells() { board.place(c, defender); }
             let mut sub: Option<u8> = None;
             for d in 1..remaining {
-                let mut s = SearchState { tt: FxHashMap::default(), gencache: FxHashMap::default(),
-                    comps: FxHashMap::default(), nodes: 0, budget: node_budget,
-                    exceeded: false, wl, radius, atk: attacker, dfn: defender };
+                let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
                 let (w, _) = atk_within(board, 2, d, &mut s);
                 if w { sub = Some(d); break; }
             }
-            for &c in &cover { board.remove(c); }
-            if let Some(sd) = sub {
-                if best.as_ref().map_or(true, |(bd, _)| sd > *bd) { best = Some((sd, cover)); }
+            for &c in cover.cells() { board.remove(c); }
+            if let Some(sd) = sub
+                && best.as_ref().is_none_or(|(bd, _)| sd > *bd)
+            {
+                best = Some((sd, cover));
             }
         }
         let (sd, cover) = match best { Some(b) => b, None => break };
-        for &c in &cover { board.place(c, defender); pv.push(c); }
+        for &c in cover.cells() { board.place(c, defender); pv.push(c); }
         remaining = sd;
     }
     pv
@@ -530,27 +1195,30 @@ mod tests {
         let mut b = SolverBoard::new();
         for q in 0..4 { b.place((q, 0), Player::P1); }
         let comps = completions(&b, Player::P1, 6, 8);
-        let want: FxHashSet<Vec<Coord>> = [
-            vec![(-2, 0), (-1, 0)],   // left
-            vec![(-1, 0), (4, 0)],    // straddle
-            vec![(4, 0), (5, 0)],     // right
-        ].into_iter().collect();
+        let want = vec![
+            CellSet2::two((-2, 0), (-1, 0)),   // left
+            CellSet2::two((-1, 0), (4, 0)),    // straddle
+            CellSet2::two((4, 0), (5, 0)),     // right
+        ];
         assert_eq!(comps, want);
     }
 
     #[test]
     fn min_covers_straddle_rejects_naive_block() {
         let comps = vec![
-            vec![(-2, 0), (-1, 0)], vec![(-1, 0), (4, 0)], vec![(4, 0), (5, 0)],
+            CellSet2::two((-2, 0), (-1, 0)),
+            CellSet2::two((-1, 0), (4, 0)),
+            CellSet2::two((4, 0), (5, 0)),
         ];
-        let (bnum, covers) = min_covers(&comps);
+        let (bnum, covers) = min_covers2(&comps);
         assert_eq!(bnum, 2);
-        let cset: FxHashSet<Vec<Coord>> = covers.into_iter().collect();
-        let want: FxHashSet<Vec<Coord>> = [
-            vec![(-2, 0), (4, 0)], vec![(-1, 0), (5, 0)], vec![(-1, 0), (4, 0)],
-        ].into_iter().collect();
-        assert_eq!(cset, want);
-        assert!(!cset.contains(&vec![(-2, 0), (5, 0)])); // misses the straddle
+        // Exact covers, in the documented lexicographic cell order.
+        assert_eq!(covers, vec![
+            CellSet2::two((-2, 0), (4, 0)),
+            CellSet2::two((-1, 0), (4, 0)),
+            CellSet2::two((-1, 0), (5, 0)),
+        ]);
+        assert!(!covers.contains(&CellSet2::two((-2, 0), (5, 0)))); // misses the straddle
     }
 
     #[test]
@@ -558,15 +1226,13 @@ mod tests {
         // 5-run open both ends -> B=2 unique cover
         let mut b = SolverBoard::new();
         for q in 0..5 { b.place((q, 0), Player::P1); }
-        assert_eq!(min_covers(&sorted_vec(completions(&b, Player::P1, 6, 8))).0, 2);
+        assert_eq!(min_covers2(&completions(&b, Player::P1, 6, 8)).0, 2);
         // walled 4-run (one empty each side) -> B=1
         let mut w = SolverBoard::new();
         for q in 0..4 { w.place((q, 0), Player::P1); }
         w.place((-2, 0), Player::P2); w.place((5, 0), Player::P2);
-        assert_eq!(min_covers(&sorted_vec(completions(&w, Player::P1, 6, 8))).0, 1);
+        assert_eq!(min_covers2(&completions(&w, Player::P1, 6, 8)).0, 1);
     }
-
-    fn sorted_vec(s: FxHashSet<Vec<Coord>>) -> Vec<Vec<Coord>> { s.into_iter().collect() }
 
     #[test]
     fn move_b_matches_double_four_fork() {
@@ -574,9 +1240,60 @@ mod tests {
         let mut b = SolverBoard::new();
         for c in [(0,0),(1,0),(2,0),(0,1),(0,2)] { b.place(c, Player::P1); }
         let idx = threat_table(&b, Player::P1, 6, 8);
-        assert!(move_b(&idx, &[(3,0),(0,3)], 6) >= 3);
-        // a lone extension is only B<=2
-        assert!(move_b(&idx, &[(3,0),(9,9)], 6) <= 2);
+        // Exactly 4: two independent open fours, each needing a 2-cell cover.
+        // Pins the B=4-over-B=3 move-ordering preference (double-four first).
+        assert_eq!(move_b(&idx, &[(3,0),(0,3)], 6), 4);
+        // a lone extension makes exactly one open four: B exactly 2
+        assert_eq!(move_b(&idx, &[(3,0),(9,9)], 6), 2);
+    }
+
+    #[test]
+    fn cover_class_is_exact_up_to_cap() {
+        // k pairwise-disjoint 2-cell comps -> B = k, reported capped at 4
+        let mk = |k: i32| (0..k).map(|i| CellSet2::two((10 * i, 0), (10 * i + 1, 0))).collect::<Vec<_>>();
+        assert_eq!(cover_class(&mk(0)), 0);
+        assert_eq!(cover_class(&mk(1)), 1);
+        assert_eq!(cover_class(&mk(2)), 2);
+        assert_eq!(cover_class(&mk(3)), 3);
+        assert_eq!(cover_class(&mk(4)), 4);
+        assert_eq!(cover_class(&mk(5)), 4, "B >= 5 reports the cap");
+        // a shared cell keeps B at 1 no matter how many comps
+        let shared: Vec<CellSet2> = (0..10).map(|i| CellSet2::two((0, 0), (i + 1, 5))).collect();
+        assert_eq!(cover_class(&shared), 1);
+        // all four hitting-set implementations must agree on the same inputs:
+        // fast mask paths vs the > 64-comp fallbacks (differential check)
+        // mk(64)/mk(65) pin the n == 64 mask boundary and the > 64 dispatch edge
+        for comps in [mk(0), mk(1), mk(2), mk(3), mk(4), mk(5), mk(64), mk(65), shared] {
+            let (b2, covers2) = min_covers2(&comps);
+            assert_eq!(b2, cover_class(&comps).min(3));
+            assert_eq!(min_hit_slice(comps.to_vec(), 4), cover_class(&comps), "slice fallback disagrees");
+            if b2 >= 3 {
+                assert!(covers2.is_empty(), "no covers may be collected for B >= 3");
+            }
+            if !comps.is_empty() {
+                let mut covers_fast = Vec::new();
+                let mut covers_big = Vec::new();
+                let b_fast = min_covers_capped(&comps, Some(&mut covers_fast));
+                let b_big = min_covers_big(&comps, Some(&mut covers_big));
+                assert_eq!(b_big, b_fast, "big fallback disagrees on B");
+                assert_eq!(covers_big, covers_fast, "big fallback disagrees on covers");
+            }
+        }
+    }
+
+    #[test]
+    fn hitting_set_big_fallback_matches_fast_path() {
+        // > 64 comps exercises min_covers_big / min_hit_slice
+        let disjoint: Vec<CellSet2> = (0..70).map(|i| CellSet2::two((10 * i, 0), (10 * i + 1, 0))).collect();
+        assert_eq!(cover_class(&disjoint), 4);
+        assert_eq!(min_covers2(&disjoint).0, 3);
+        // B=2 with a unique cover {(0,0),(1,1)}: 70 comps through (0,0), 3 through (1,1)
+        let mut c2: Vec<CellSet2> = (0..70).map(|i| CellSet2::two((0, 0), (i + 1, 7))).collect();
+        c2.extend((0..3).map(|i| CellSet2::two((1, 1), (i + 1, 9))));
+        assert_eq!(cover_class(&c2), 2);
+        let (b, covers) = min_covers2(&c2);
+        assert_eq!(b, 2);
+        assert_eq!(covers, vec![CellSet2::two((0, 0), (1, 1))]);
     }
 
     #[test]
@@ -585,9 +1302,12 @@ mod tests {
         for c in [(0,0),(1,0),(2,0),(0,1),(0,2)] { b.place(c, Player::P1); }
         let moves = attacker_turns(&b, Player::P1, Player::P2, 2, 6, 8);
         assert!(!moves.is_empty());
-        // the top move creates B>=3
         let idx = threat_table(&b, Player::P1, 6, 8);
-        assert!(move_b(&idx, &moves[0], 6) >= 3);
+        // the top move is a genuine double-four (B=4), not merely a triple threat
+        assert_eq!(move_b(&idx, moves[0].cells(), 6), 4);
+        // and the whole list is sorted best-first by B
+        let bs: Vec<u8> = moves.iter().map(|m| move_b(&idx, m.cells(), 6)).collect();
+        assert!(bs.windows(2).all(|w| w[0] >= w[1]), "moves not descending by B: {bs:?}");
     }
 
     #[test]
@@ -595,6 +1315,22 @@ mod tests {
         let mut b = SolverBoard::new();
         b.place((0,0), Player::P1); b.place((10,10), Player::P1);
         assert!(!any_four_gate(&b, Player::P1, 6, 8));
+        // and true once a window holds wl-4 stones (adjacent pair, wl=6)
+        let mut c = SolverBoard::new();
+        c.place((0,0), Player::P1); c.place((1,0), Player::P1);
+        assert!(any_four_gate(&c, Player::P1, 6, 8));
+        assert!(!any_four_gate(&c, Player::P2, 6, 8), "gate is per-player");
+    }
+
+    #[test]
+    fn tiny_budget_reports_budget_exceeded() {
+        // mate-in-two fork position: with a 1-node budget the search cannot finish,
+        // and must say so rather than returning a bogus Win or No.
+        let mut b = line(&[(0,0),(1,0),(2,0),(0,1),(0,2)], Player::P1);
+        assert!(matches!(
+            solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 1),
+            SolveResult::BudgetExceeded
+        ));
     }
 
     fn line(cells: &[Coord], p: Player) -> SolverBoard {
@@ -611,12 +1347,33 @@ mod tests {
     #[test]
     fn mate_in_two_fork() {
         let mut b = line(&[(0,0),(1,0),(2,0),(0,1),(0,2)], Player::P1);
+        let (h0, n0) = (b.hash, b.stones.len());
         assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000), SolveResult::Win { depth: 2 }));
+        // make/unmake must leave the board pristine (solve() relies on this to
+        // probe first_winning_move on a clean position)
+        assert_eq!((b.hash, b.stones.len()), (h0, n0), "solve_from must not leak stones");
     }
     #[test]
     fn no_forcing_win() {
+        // gate-level No: scattered stones, no near-complete window at all
         let mut b = line(&[(0,0),(10,10)], Player::P1);
         assert!(matches!(solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000), SolveResult::No));
+    }
+
+    /// A strict `No` proved by CLOSING the whole tree (`cut == false`) rather than
+    /// by the gate or a timeout: the attacker has live threats (gate passes), but
+    /// the defender holds an open four and completes first on every line — the
+    /// counter-threat refutation makes each branch resolve immediately.
+    #[test]
+    fn search_proves_strict_no_when_defender_wins_first() {
+        let mut b = SolverBoard::new();
+        for q in 0..3 { b.place((q, 0), Player::P1); }
+        for q in 10..14 { b.place((q, 0), Player::P2); }
+        assert!(any_four_gate(&b, Player::P1, 6, 8), "gate must pass for this to test the search");
+        assert!(matches!(
+            solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000),
+            SolveResult::No
+        ));
     }
 
     #[test]
@@ -637,6 +1394,16 @@ mod tests {
                         "first_move {:?} not a fork cell", w.first_move);
                 assert_eq!(w.pv.first(), Some(&w.first_move));
                 assert!(w.pv.len() >= 3); // >=2 attacker fork cells + a completion
+                // Replay the PV through the real engine: apply_move enforces turn
+                // structure (2 placements/turn) and legality, and the line must
+                // end in an attacker win — validating extract_pv end to end.
+                let mut g = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+                for &c in &w.pv {
+                    assert!(!g.is_terminal(), "PV continues after the game ended");
+                    g.apply_move(c).expect("every PV move must be legal");
+                }
+                assert!(g.is_terminal(), "PV must end the game");
+                assert_eq!(g.winner(), Some(Player::P1), "PV must end in an attacker win");
             }
             _ => panic!("expected Win"),
         }
@@ -659,24 +1426,184 @@ mod tests {
         b.remove((1, 0));
         assert_eq!(b.hash, h0);
         assert!(b.stones.is_empty());
+        // the player term must matter: same cell, different colour, different hash
+        let mut p1 = SolverBoard::new();
+        p1.place((0, 0), Player::P1);
+        let mut p2 = SolverBoard::new();
+        p2.place((0, 0), Player::P2);
+        assert_ne!(p1.hash, p2.hash, "zob must include the player");
     }
 
-    // FIX 2: wl-4/wl-3/wl-2 thresholds must not underflow (u8) for small win_length.
+    /// The dense grid must behave identically to a sparse map under growth:
+    /// stones placed far apart (forcing regrowth) stay readable, and reach
+    /// counts survive the copy.
+    #[test]
+    fn grid_growth_preserves_stones_and_reach() {
+        let mut b = SolverBoard::new();
+        b.enable_reach(2);
+        b.place((0, 0), Player::P1);
+        assert!(b.within_radius((2, 0), 2));
+        assert!(!b.within_radius((3, 0), 2));
+        // Far placement forces growth in both directions.
+        b.place((100, -80), Player::P2);
+        assert_eq!(b.get((0, 0)), Some(Player::P1));
+        assert_eq!(b.get((100, -80)), Some(Player::P2));
+        assert!(b.within_radius((2, 0), 2), "reach counts must survive grid growth");
+        assert!(b.within_radius((99, -79), 2));
+        assert!(!b.within_radius((50, -40), 2));
+        // Removing reverts reach.
+        b.remove((100, -80));
+        assert!(!b.within_radius((99, -79), 2));
+        // Untracked-radius queries fall back to a stone scan.
+        assert!(b.within_radius((5, 0), 8));
+    }
+
+    /// Differential: the O(1) tracked reach path must agree with the linear
+    /// stone-scan ground truth at the SAME radius, on every cell near the
+    /// stones, across place/remove/growth — the reach counts are the most
+    /// state-heavy machinery in the board.
+    #[test]
+    fn reach_counts_match_linear_scan() {
+        let radius = 2;
+        let mut tracked = SolverBoard::new();
+        tracked.enable_reach(radius);
+        let mut plain = SolverBoard::new(); // never tracked: within_radius scans stones
+        let script: &[(Coord, bool)] = &[
+            ((0, 0), true), ((1, 0), true), ((40, -25), true), // forces growth
+            ((1, 0), false), ((3, -2), true), ((40, -25), false),
+        ];
+        for &(c, place) in script {
+            if place {
+                tracked.place(c, Player::P1);
+                plain.place(c, Player::P1);
+            } else {
+                tracked.remove(c);
+                plain.remove(c);
+            }
+            for q in -6..8 {
+                for r in -6..8 {
+                    let cell = (q, r);
+                    assert_eq!(
+                        tracked.within_radius(cell, radius),
+                        plain.within_radius(cell, radius),
+                        "reach mismatch at {cell:?} after {c:?} place={place}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `has_completion` is half of the solve gate: pin its unique contribution
+    /// (a walled run that is a completion but NOT a fresh-four threat source).
+    #[test]
+    fn has_completion_thresholds() {
+        // open 4-run: completions with 1..2 gaps exist
+        let b = line(&[(0,0),(1,0),(2,0),(3,0)], Player::P1);
+        assert!(has_completion(&b, Player::P1, 6, 2, 8));
+        assert!(!has_completion(&b, Player::P1, 6, 1, 8), "no 1-gap completion yet");
+        // 5-run: a 1-gap completion appears
+        let b5 = line(&[(0,0),(1,0),(2,0),(3,0),(4,0)], Player::P1);
+        assert!(has_completion(&b5, Player::P1, 6, 1, 8));
+        // scattered stones: none
+        let s = line(&[(0,0),(10,10)], Player::P1);
+        assert!(!has_completion(&s, Player::P1, 6, 2, 8));
+        // and it is per-player
+        assert!(!has_completion(&b5, Player::P2, 6, 2, 8));
+    }
+
+    /// Unit-level pin of the tight-regime window filter: a window whose gap is
+    /// unreachable at the placement radius must be dropped from the threat
+    /// table (not just filtered later at move level).
+    #[test]
+    fn tight_regime_filters_unreachable_windows() {
+        let mut b = SolverBoard::new();
+        b.place((0, 0), Player::P1);
+        b.place((1, 0), Player::P1);
+        // Wide regime: the far gap (4,0) is indexed (window [0..5] and friends).
+        let wide = threat_table(&b, Player::P1, 6, 8);
+        assert!(wide.contains_key(&(4, 0)), "wide regime must index the far gap");
+        // Tight regime (radius 2): (4,0) is hex-distance 3 from the nearest stone,
+        // so every window containing it is unplayable and must be dropped...
+        b.enable_reach(2);
+        let tight = threat_table(&b, Player::P1, 6, 2);
+        assert!(!tight.contains_key(&(4, 0)), "unreachable-gap windows must be dropped");
+        // ...while fully-reachable windows survive.
+        assert!(tight.contains_key(&(-1, 0)), "reachable windows must survive");
+    }
+
+    // FIX 2: wl-4/wl-3/wl-2 thresholds must not underflow (u8) for small win_length —
+    // and small-wl results must be sane, not just panic-free: a 3-run at wl=4 and a
+    // lone stone at wl=2 are both one placement from a win.
     #[test]
     fn wl4_and_wl2_do_not_panic() {
         let mut b4 = line(&[(0,0),(1,0),(2,0)], Player::P1);
-        let _ = solve_from(&mut b4, Player::P1, Player::P2, 2, 4, 8, 10, 100_000);
+        assert!(matches!(
+            solve_from(&mut b4, Player::P1, Player::P2, 2, 4, 8, 10, 100_000),
+            SolveResult::Win { depth: 1 }
+        ));
         let _ = completions(&b4, Player::P1, 4, 8);
         let _ = threat_table(&b4, Player::P1, 4, 8);
 
         let mut b2 = line(&[(0,0)], Player::P1);
-        let _ = solve_from(&mut b2, Player::P1, Player::P2, 2, 2, 8, 10, 100_000);
+        assert!(matches!(
+            solve_from(&mut b2, Player::P1, Player::P2, 2, 2, 8, 10, 100_000),
+            SolveResult::Win { depth: 1 }
+        ));
         let _ = completions(&b2, Player::P1, 2, 8);
         let _ = threat_table(&b2, Player::P1, 2, 8);
     }
 
-    // FIX 3: candidate enumeration (board.stones / game.stones() hashmap iteration) must
-    // not leak into first_move/PV selection non-determinism.
+    /// Configs the solver cannot analyze must yield an honest give-up
+    /// (BudgetExceeded), never a bogus No or a panic/giant allocation.
+    #[test]
+    fn unsupported_configs_give_up_honestly() {
+        // win_length beyond the stack-buffer cap
+        let mut b = line(&[(0,0),(1,0),(2,0)], Player::P1);
+        assert!(matches!(
+            solve_from(&mut b, Player::P1, Player::P2, 2, 20, 8, 10, 100_000),
+            SolveResult::BudgetExceeded
+        ));
+        // win_length 0
+        let mut b0 = line(&[(0,0)], Player::P1);
+        assert!(matches!(
+            solve_from(&mut b0, Player::P1, Player::P2, 2, 0, 8, 10, 100_000),
+            SolveResult::BudgetExceeded
+        ));
+        // pathological coordinate spread: rejected before any grid allocation
+        use hexo_engine::game::{GameState, GameConfig};
+        let stones = vec![((0, 0), Player::P1), ((1_000_000, 1_000_000), Player::P2)];
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+        assert!(matches!(solve(&game, 6, 100_000), Outcome::BudgetExceeded));
+    }
+
+    /// The PRODUCTION regime is tight (placement_radius < win_length - 1, live
+    /// self-play runs radius 2): pin that a forced win IS found there — same
+    /// depth as the wide regime — and that its PV replays legally through the
+    /// engine under the radius-2 config. Guards against tight-regime
+    /// over-pruning silently turning every Win into No.
+    #[test]
+    fn tight_regime_finds_win_with_legal_pv() {
+        use hexo_engine::game::{GameState, GameConfig};
+        let stones: Vec<(Coord, Player)> = [(0,0),(1,0),(2,0),(0,1),(0,2)]
+            .into_iter().map(|c| (c, Player::P1)).collect();
+        let cfg = GameConfig { win_length: 6, placement_radius: 2, max_moves: 200 };
+        let game = GameState::from_state(&stones, Player::P1, 2, cfg);
+        match solve(&game, 40, 5_000_000) {
+            Outcome::Win(w) => {
+                assert_eq!(w.depth, 2, "tight regime must find the same fork win");
+                let mut g = GameState::from_state(&stones, Player::P1, 2, cfg);
+                for &c in &w.pv {
+                    assert!(!g.is_terminal(), "PV continues after the game ended");
+                    g.apply_move(c).expect("PV move must be legal at radius 2");
+                }
+                assert_eq!(g.winner(), Some(Player::P1));
+            }
+            _ => panic!("expected Win in the tight regime"),
+        }
+    }
+
+    // FIX 3: candidate enumeration must not leak into first_move/PV selection
+    // non-determinism.
     #[test]
     fn first_move_is_deterministic() {
         use hexo_engine::game::{GameState, GameConfig};
@@ -772,9 +1699,9 @@ mod tests {
         (&[((0,0), Player::P1), ((1,-1), Player::P2), ((2,-1), Player::P2), ((1,0), Player::P1), ((0,-1), Player::P1), ((3,-2), Player::P2), ((2,-2), Player::P2), ((2,-3), Player::P1), ((4,-2), Player::P1), ((3,-3), Player::P2), ((4,-3), Player::P2), ((3,-4), Player::P1), ((3,-1), Player::P1), ((10,-4), Player::P2), ((11,-4), Player::P2), ((10,-3), Player::P1), ((12,-4), Player::P1)], Player::P2, 2, None),
     ];
 
-    // The two largest/deepest fixtures live in a separate #[ignore]d test since the
-    // solver currently rebuilds its threat table per node (no memoization yet) and
-    // these are slow: jnzzmcm (67 stones -> depth 7), hu01jk4 (149 stones -> depth 6).
+    // The two largest/deepest fixtures live in a separate #[ignore]d test since they
+    // are still the slowest (~hundreds of ms release, seconds in debug):
+    // jnzzmcm (67 stones -> depth 7), hu01jk4 (149 stones -> depth 6).
     // run manually: cargo test -p hexo-mcts forcing::tests::parity_win_depths_match_python_slow -- --ignored --nocapture
     #[allow(clippy::type_complexity)]
     const SLOW_FIXTURES: &[(&[(Coord, Player)], Player, u8, Option<u8>)] = &[
@@ -788,6 +1715,25 @@ mod tests {
     /// Python prototype's win depths on real HDS puzzle positions.
     #[test]
     fn parity_win_depths_match_python() {
+        // End-to-end on one real puzzle (xsnfyll): solve() must return the parity
+        // depth AND a PV that replays legally through the engine to a win —
+        // real-board PV validation, not just depth agreement.
+        {
+            use hexo_engine::game::{GameState, GameConfig};
+            let (stones, attacker, placements, expected) = FIXTURES[0];
+            let game = GameState::from_state(stones, attacker, placements, GameConfig::FULL_HEXO);
+            let w = match solve(&game, 40, 80_000_000) {
+                Outcome::Win(w) => w,
+                _ => panic!("xsnfyll: expected Win"),
+            };
+            assert_eq!(Some(w.depth), expected, "xsnfyll depth");
+            let mut g = GameState::from_state(stones, attacker, placements, GameConfig::FULL_HEXO);
+            for &c in &w.pv {
+                assert!(!g.is_terminal(), "PV continues after the game ended");
+                g.apply_move(c).expect("xsnfyll PV move must be legal");
+            }
+            assert_eq!(g.winner(), Some(attacker), "xsnfyll PV must end in the attacker's win");
+        }
         for &(stones, attacker, placements, expected_depth) in FIXTURES.iter() {
             let Some(d) = expected_depth else { continue }; // No-fixtures covered separately
             let mut b = SolverBoard::new();
@@ -825,15 +1771,14 @@ mod tests {
     /// NOTE (perf discrepancy, not a correctness bug): the Rust port's `No` requires the
     /// *entire* forcing tree (every branch, not just a winning line) to resolve within
     /// `depth_cap` plies of budget (`cut == false`) -- exactly like the Python prototype's
-    /// `_atk_within`/`solve`. But the Rust port currently rebuilds its threat table per
-    /// node (no memoization yet), so on this branchy 17-stone position it does NOT close
-    /// out within a fast budget: empirically `depth_cap` up to 14 still has `cut=true`
-    /// (inconclusive) with per-depth time growing from ~0.1ms (depth 1) to ~35s (depth 14)
-    /// and climbing -- proving a strict `No` here is currently computationally infeasible
-    /// in a fast test. So instead of asserting `SolveResult::No` at depth_cap=6 (which the
-    /// plan assumed would be fast but is not -- it actually yields `BudgetExceeded`), we
-    /// assert the fast, sound invariant both implementations must agree on: the Rust
-    /// solver must not fabricate a forced Win where the validated Python solver found none.
+    /// `_atk_within`/`solve`. On this branchy 17-stone position the tree does NOT close
+    /// out within a fast budget: per-depth cost keeps growing with `cut=true`
+    /// (inconclusive), so proving a strict `No` here is computationally infeasible in a
+    /// fast test (deep cost is unique positions, so memoization doesn't rescue it). So
+    /// instead of asserting `SolveResult::No` at depth_cap=6 (which actually yields
+    /// `BudgetExceeded`), we assert the fast, sound invariant both implementations must
+    /// agree on: the Rust solver must not fabricate a forced Win where the validated
+    /// Python solver found none.
     #[test]
     fn parity_l9mxn59_is_not_forced() {
         let (stones, attacker, placements, expected_depth) = FIXTURES[3];
@@ -869,6 +1814,50 @@ mod tests {
             let r = solve_from(&mut b, attacker, defender, placements, 6, 8, 20, 300_000_000);
             let elapsed = t.elapsed();
             eprintln!("{code} -> {r:?}  ({elapsed:.2?})");
+        }
+    }
+
+    // Component-level cost decomposition on real fixture boards, in both the wide
+    // (radius 8, puzzles) and tight (radius 2, production self-play) regimes.
+    // run manually:
+    // cargo test --release -p hexo-mcts forcing::tests::component_micro_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn component_micro_bench() {
+        let boards: Vec<(&str, &[(Coord, Player)], Player)> = vec![
+            ("0hz3hty(21st)", FIXTURES[1].0, FIXTURES[1].1),
+            ("jnzzmcm(67st)", SLOW_FIXTURES[0].0, SLOW_FIXTURES[0].1),
+            ("hu01jk4(149st)", SLOW_FIXTURES[1].0, SLOW_FIXTURES[1].1),
+        ];
+        for (name, stones, atk) in boards {
+            let mut b = SolverBoard::new();
+            for &(c, p) in stones { b.place(c, p); }
+            let dfn = atk.opponent();
+            for radius in [8i32, 2] {
+                if radius == 2 { b.enable_reach(2); }
+                let n = 2000;
+                let t = std::time::Instant::now();
+                for _ in 0..n { std::hint::black_box(threat_table(&b, atk, 6, radius)); }
+                let tt_us = t.elapsed().as_micros() as f64 / n as f64;
+                let t = std::time::Instant::now();
+                for _ in 0..n { std::hint::black_box(completions(&b, atk, 6, radius)); }
+                let ca_us = t.elapsed().as_micros() as f64 / n as f64;
+                let t = std::time::Instant::now();
+                for _ in 0..n { std::hint::black_box(completions(&b, dfn, 6, radius)); }
+                let cd_us = t.elapsed().as_micros() as f64 / n as f64;
+                let t = std::time::Instant::now();
+                let n2 = 200;
+                for _ in 0..n2 { std::hint::black_box(attacker_turns(&b, atk, dfn, 2, 6, radius)); }
+                let at_us = t.elapsed().as_micros() as f64 / n2 as f64;
+                let idx = threat_table(&b, atk, 6, radius);
+                let hot = idx.len();
+                let moves = attacker_turns(&b, atk, dfn, 2, 6, radius).len();
+                let comps = completions(&b, atk, 6, radius);
+                let t = std::time::Instant::now();
+                for _ in 0..n { std::hint::black_box(min_covers2(&comps)); }
+                let mc_us = t.elapsed().as_micros() as f64 / n as f64;
+                eprintln!("{name} r={radius}: threat_table={tt_us:.1}us comps_atk={ca_us:.1}us comps_dfn={cd_us:.1}us attacker_turns={at_us:.1}us min_covers={mc_us:.2}us  (hot={hot} moves={moves} comps={})", comps.len());
+            }
         }
     }
 }
