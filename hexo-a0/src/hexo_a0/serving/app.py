@@ -25,7 +25,7 @@ import torch
 
 from hexo_a0.serving.analysis import (
     analyze_game_full, analyze_position, analyze_trajectory, build_state,
-    end_of_turn_indices)
+    end_of_turn_indices, TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET)
 from hexo_a0.serving.dbmigrate import apply_migrations
 from hexo_a0.serving import hds
 from hexo_a0.serving.game import DEFAULT_DIFFICULTY, DEFAULT_DIFFICULTY_SIMS, DIFFICULTY_ORDER, GameError, GameManager, ServerBusyError, UnknownGameError, make_bot_turn_fn
@@ -523,10 +523,13 @@ def handle_analyze(payload: dict, ctx: AnalyzeContext) -> tuple[int, dict]:
         moves = [(0, 0)]
 
     def _infer():
+        import hexo_rs as hr
         state = build_state(moves, ctx.win_length, ctx.placement_radius, ctx.max_moves)
+        cfg = hr.GameConfig(ctx.win_length, ctx.placement_radius, ctx.max_moves)
         result = analyze_position(
             ctx.model, ctx.model_config, state,
             mcts_sims=ctx.mcts_sims, mcts_m_actions=ctx.m_actions,
+            game_config=cfg,
         )
         return result.to_json()
 
@@ -657,13 +660,22 @@ def handle_analyze_game_sse(handler, ctx: AnalyzeContext, body: dict,
             def cancel_cb():
                 return disconnected["flag"]
 
+            import hexo_rs as hr
+            forcing_cfg = hr.GameConfig(ctx.win_length, ctx.placement_radius, ctx.max_moves)
+
             def run_mcts_fn(state):
                 # Per-prefix guard acquire (blocking=True): wait for bot moves,
-                # release between prefixes so play interleaves.
+                # release between prefixes so play interleaves. Uses the
+                # tighter TRAJECTORY_* forcing budget: this solves twice per
+                # placement across the whole game, unlike the single-position
+                # /analyze path (ANALYSIS_* default) — see analysis.py's consts.
                 return ctx.guard.run(
                     lambda: analyze_position(
                         ctx.model, ctx.model_config, state,
-                        mcts_sims=ctx.mcts_sims, mcts_m_actions=ctx.m_actions),
+                        mcts_sims=ctx.mcts_sims, mcts_m_actions=ctx.m_actions,
+                        game_config=forcing_cfg,
+                        forcing_depth_cap=TRAJECTORY_DEPTH_CAP,
+                        forcing_node_budget=TRAJECTORY_NODE_BUDGET),
                     blocking=True)
 
             # Warm-start from the longest cached prefix of this line (if any),

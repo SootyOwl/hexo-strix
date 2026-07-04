@@ -3,13 +3,16 @@
 Checkpoint-gated; skips gracefully if the champion checkpoint is absent.
 """
 import os
+import types
 
 import pytest
+import torch
 
 from hexo_a0.serving.model import load_model
 from hexo_a0.serving.analysis import (
     analyze_position, analyze_trajectory, analyze_game_full, build_state,
-    AnalysisResult,
+    AnalysisResult, ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET,
+    TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET,
 )
 
 
@@ -344,3 +347,207 @@ def test_analyze_game_full_warm_start_skips_shared_head():
     for i in range(len(warm)):
         if not out["trajectory"][i]["terminal"] and warm[i].get("q_hat") is not None:
             assert out["trajectory"][i]["q_hat"] == warm[i]["q_hat"]
+
+
+# --- forcing-line display: both-side VCF solve (analyze_position) ----------
+#
+# These use a stubbed model/config rather than the real checkpoint (mirrors
+# test_serving_game.py's live-play forcing tests): the forcing solve is pure
+# hexo_rs and the display concern is independent of model quality, so a
+# zero-logit stub keeps the fork constructions fast and deterministic.
+
+class _ZeroLogitModel:
+    """All-zero logits/value — analyze_position's raw-forward-pass branch
+    (mcts_sims=0, the default) only needs __call__, never forward_batch."""
+
+    def __call__(self, x, edge_index, legal_mask, stone_mask=None, edge_attr=None):
+        return torch.zeros(x.shape[0]), torch.tensor(0.0)
+
+
+def _forcing_fork_state(mover="P1"):
+    """wl=4 fork: P1 holds an open pair, ``mover`` gets 2 free placements this
+    turn (as in test_serving_game.py's test_forcing_bot_executes_own_forced_win).
+    ``mover="P1"`` gives the mover itself the forced win; ``mover="P2"`` puts
+    the (stoneless) opponent to move, so the forced win is on the FLIP side."""
+    import hexo_rs as hr
+    cfg = hr.GameConfig(4, 3, 60)
+    state = hr.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P1")], mover, 2, cfg)
+    return cfg, state
+
+
+def _forcing_fork_state_midturn():
+    """A wl=4 double-open-three fork where P1 has only 1 placement left this
+    turn (``moves_remaining=1``), so the solved PV's first chunk is length 1,
+    not the usual 2 — the shape review finding #1 flags as breaking the old
+    pairs-of-2 parity heuristic. Stones (away from the engine's (0,0) P1 seed,
+    which ``from_state`` always adds) form two open pairs crossing at (10,0);
+    P1's one remaining placement fills the crossing cell, creating a double
+    open three the opponent's one full turn (2 placements) can't fully block.
+    Verified empirically: solve_forcing returns a 5-cell PV with owner chunks
+    [1, 2, 2] (P1, P2, P2, P1, P1), not the [2, 2, ...] the old heuristic
+    assumed.
+    """
+    import hexo_rs as hr
+    cfg = hr.GameConfig(4, 3, 60)
+    state = hr.GameState.from_state(
+        [((9, 0), "P1"), ((11, 0), "P1"), ((10, -1), "P1"), ((10, 1), "P1")],
+        "P1", 1, cfg)
+    return cfg, state
+
+
+def test_analyze_position_reports_movers_forced_win():
+    cfg, state = _forcing_fork_state("P1")
+    mc = types.SimpleNamespace(graph_type="hex")
+    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    assert r.forcing is not None
+    assert r.forcing["winner"] == state.current_player() == "P1"
+    assert r.forcing["attacker_is_mover"] is True
+    legal = {tuple(c) for c in state.legal_moves()}
+    assert tuple(r.forcing["first_move"]) in legal
+    js = r.to_json()
+    pv = js["forcing"]["pv"]
+    assert pv and all(isinstance(m, list) and len(m) == 2 for m in pv)
+    assert js["forcing"]["pv_len"] == len(pv)
+
+
+def test_analyze_position_reports_opponents_forced_win():
+    # Same stones, but P2 (with no stones of its own) is to move: P2 has no
+    # win, so the solve flips and finds P1's win on the other side.
+    cfg, state = _forcing_fork_state("P2")
+    mc = types.SimpleNamespace(graph_type="hex")
+    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    assert r.forcing is not None
+    assert r.forcing["winner"] == "P1"
+    assert r.forcing["attacker_is_mover"] is False
+
+
+def test_analyze_position_no_forcing_is_none_and_config_none_skips_opponent(monkeypatch):
+    import hexo_rs as hr
+    state = build_state([(0, 0), (1, 0), (2, 0)], 6, 8, 400)  # no forced win either side
+    mc = types.SimpleNamespace(graph_type="hex")
+
+    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=None)
+    assert r.forcing is None
+
+    calls = {"n": 0}
+
+    def _counting_solve(*a, **k):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(hr, "solve_forcing", _counting_solve)
+    r2 = analyze_position(_ZeroLogitModel(), mc, state, game_config=None)
+    assert r2.forcing is None
+    # game_config=None must skip the opponent-side solve outright — only the
+    # mover-side call happens.
+    assert calls["n"] == 1
+
+
+def test_analyze_position_forcing_never_crashes_analysis(monkeypatch):
+    import hexo_rs as hr
+    cfg, state = _forcing_fork_state("P1")
+    mc = types.SimpleNamespace(graph_type="hex")
+
+    def _boom(*a, **k):
+        raise RuntimeError("solver exploded")
+
+    monkeypatch.setattr(hr, "solve_forcing", _boom)
+    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    assert r.forcing is None  # swallowed, not propagated
+    assert r.legal  # the rest of the analysis still completed
+
+
+def test_analyze_game_full_default_run_mcts_fn_threads_game_config(monkeypatch):
+    # Step 7: analyze_game_full's own default run_mcts_fn (used whenever the
+    # caller doesn't override it, as app.py's SSE handler does) must pass
+    # game_config through to analyze_position too — not just app.py's own
+    # call sites — so per-prefix `forcing` is populated on that path as well.
+    import hexo_a0.serving.analysis as analysis_mod
+    model, mc, _ = load_model(CKPT, "cpu")
+    real_analyze_position = analysis_mod.analyze_position
+    seen = []
+
+    def spy(*a, **kw):
+        seen.append(kw.get("game_config"))
+        return real_analyze_position(*a, **kw)
+
+    monkeypatch.setattr(analysis_mod, "analyze_position", spy)
+    analyze_game_full(model, mc, _GAME, 6, 8, 400, mcts_sims=16)
+    assert seen  # run_mcts_fn was invoked at least once
+    assert all(c is not None for c in seen)
+
+
+def test_analyze_position_pv_owners_variable_length_first_chunk():
+    # Review finding #1: the PV's chunk lengths are NOT a fixed pairs-of-2
+    # cadence — the first chunk is however many placements the analyzed side
+    # has left THIS turn (1 here, not 2), so a naive parity-of-2 heuristic
+    # mislabels everything after it. pv_owners must come from a real replay.
+    cfg, state = _forcing_fork_state_midturn()
+    mc = types.SimpleNamespace(graph_type="hex")
+    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    assert r.forcing is not None
+    js = r.to_json()["forcing"]
+    pv, owners = js["pv"], js["pv_owners"]
+    assert owners is not None
+    assert len(owners) == len(pv)
+    assert owners[0] == js["winner"]  # the analyzed (mover) side wins here
+
+    # Hand-replay via hexo_rs directly, independent of _solve_forcing's own
+    # replay, to confirm the reported owners match the engine's real turn
+    # order (not just internally self-consistent).
+    replay = state.clone()
+    expected_owners = []
+    for (q, r_) in pv:
+        expected_owners.append(replay.current_player())
+        replay.apply_move(q, r_)
+    assert owners == expected_owners
+    # This fixture's PV has a length-1 first chunk (not 2) — the input shape
+    # the old pairs-of-2 heuristic mislabelled from index 1 onward.
+    assert owners[0] != owners[1]
+
+
+def test_analyze_game_full_forcing_present_without_mcts():
+    # Review finding #3: `forcing` is independent of MCTS (computed even at
+    # mcts_sims=0), but was previously only copied into the trajectory inside
+    # the `q_hat is not None` gate — silently dropping it whenever MCTS
+    # produced no q_hat (e.g. mcts_sims=0). It must be present regardless.
+    model, mc, _ = load_model(CKPT, "cpu")
+    out = analyze_game_full(model, mc, _GAME, 6, 8, 400, mcts_sims=0)
+    non_terminal = [e for e in out["trajectory"] if not e["terminal"]]
+    assert non_terminal  # sanity: the fixture has non-terminal prefixes
+    assert all("forcing" in e for e in non_terminal)
+    assert all(e.get("q_hat") is None for e in non_terminal)  # confirms sims=0 path
+
+
+def test_analyze_position_defaults_to_analysis_budget(monkeypatch):
+    import hexo_rs as hr
+    cfg, state = _forcing_fork_state("P1")
+    mc = types.SimpleNamespace(graph_type="hex")
+    seen = []
+
+    def _spy(st, depth_cap, node_budget):
+        seen.append((depth_cap, node_budget))
+        return None
+
+    monkeypatch.setattr(hr, "solve_forcing", _spy)
+    analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    assert seen and seen[0] == (ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET)
+
+
+def test_analyze_game_full_default_run_mcts_fn_uses_trajectory_budget(monkeypatch):
+    # analyze_game_full's own default run_mcts_fn (no override) must use the
+    # tighter TRAJECTORY_* budget, not the single-position ANALYSIS_* default
+    # — it solves twice per prefix across a whole game and must stay bounded.
+    import hexo_rs as hr
+    model, mc, _ = load_model(CKPT, "cpu")
+    seen = []
+
+    def _spy(st, depth_cap, node_budget):
+        seen.append((depth_cap, node_budget))
+        return None
+
+    monkeypatch.setattr(hr, "solve_forcing", _spy)
+    analyze_game_full(model, mc, _GAME, 6, 8, 400, mcts_sims=0)
+    assert seen  # forcing was solved for at least one prefix
+    assert all(c == (TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET) for c in seen)

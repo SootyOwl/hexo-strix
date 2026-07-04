@@ -124,7 +124,7 @@ truncate_delta = 0.25  # Q-margin gate for exploration acting; 0 = off (docs/res
 batch_size = 512
 edge_budget = 250_000
 grad_accumulation = true
-lr = 2e-04
+lr = 4e-04
 weight_decay = 0.0001
 max_grad_norm = 1.0
 lr_schedule = "cosine"

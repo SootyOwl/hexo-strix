@@ -746,6 +746,33 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
   if (showHeat) for (const l of labels) {
     body += `<text x="${l.x}" y="${l.y + 1}" font-size="${Math.round(S * 0.34)}" fill="#f4efe5" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${l.t}</text>`;
   }
+  // Forcing-line (VCF) overlay: number every cell of the solved PV, attacker
+  // placements filled in the winner's stone colour, defender replies muted/
+  // outlined. Ownership comes from the server's per-cell replay
+  // (forcing.pv_owners) — the PV's chunk lengths are NOT a fixed pairs-of-2
+  // cadence (the first chunk is whatever moves_remaining_this_turn() was on
+  // the solved side, and the final chunk can be a single cell that ends the
+  // game), so it can't be inferred from position alone. If the server's
+  // replay failed (pv_owners null), fall back to styling every cell as
+  // attacker rather than guessing a cadence that's often wrong.
+  if (boardResult.forcing && boardResult.forcing.pv && boardResult.forcing.pv.length) {
+    const f = boardResult.forcing;
+    const attackerColor = f.winner === "P2" ? "#3fb6d9" : "#f08a3c";
+    f.pv.forEach((mv, i) => {
+      const p = axialToPixel(mv[0], mv[1]);
+      const isAttacker = f.pv_owners ? f.pv_owners[i] === f.winner : true;
+      const cls = `forcing-pv ${isAttacker ? "forcing-pv-attacker" : "forcing-pv-defender"}`;
+      const labelCls = `forcing-pv-label ${isAttacker ? "forcing-pv-label-attacker" : "forcing-pv-label-defender"}`;
+      const fontSize = Math.round(S * 0.42);
+      if (isAttacker) {
+        body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" fill="${attackerColor}"/>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}">${i + 1}</text>`;
+      } else {
+        body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" stroke="${attackerColor}"/>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${attackerColor}">${i + 1}</text>`;
+      }
+    });
+  }
   // Move-quality icon: mark EVERY placement of the verdict's turn (not just the
   // last stone), so a 2-placement blunder shows the whole turn. Falls back to
   // the single current move for side-line nodes with no turn context.
@@ -761,6 +788,31 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
   body += "</g>";
   svg.innerHTML = body;
   updateAnalysisTransform();
+  updateForcingBanner(boardResult.forcing);
+}
+
+// One-line banner above the board reporting the both-side VCF solve, if any
+// (result.forcing; see drawAnalysisBoard's PV overlay for the coordinate
+// rendering). Created on first use so no static markup needs to change.
+function updateForcingBanner(forcing) {
+  const container = document.getElementById("analysis-board-container");
+  if (!container) return;
+  let banner = document.getElementById("forcing-banner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "forcing-banner";
+    banner.className = "forcing-pv-banner";
+    container.insertBefore(banner, container.firstChild);
+  }
+  if (!forcing) { banner.hidden = true; banner.textContent = ""; return; }
+  banner.hidden = false;
+  banner.textContent = forcing.attacker_is_mover
+    ? `${forcing.winner} has a forced win (${forcing.pv_len}-move line)`
+    : `${forcing.winner} (opponent) has a forced win — this position is lost`;
+  // "win"/"loss" classes carry the colour (observatory.css); attacker_is_mover
+  // means it's good news for the side we're viewing the position from.
+  banner.classList.toggle("win", forcing.attacker_is_mover);
+  banner.classList.toggle("loss", !forcing.attacker_is_mover);
 }
 
 function updateAnalysisTransform() {

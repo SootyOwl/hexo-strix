@@ -14,6 +14,30 @@ from torch_geometric.data import Batch
 from hexo_a0.serving.model import make_graph_fn
 
 
+# Forcing-solver (VCF) budgets for the analysis display.
+#
+# Bench (2026-07-03, release build, 1,501 real wl6/r2 corpus roots, per-solve):
+#   depth= 6 / nodes=    2,000 ->  93/1501 wins found, max   49ms
+#   depth=10 / nodes=   20,000 ->  98/1501 wins found, max  0.4s
+#   depth=12 / nodes=  250,000 -> 100/1501 wins found, max  5.5s
+#   depth=16 / nodes=1,000,000 -> 100/1501 wins found, max 16.7s (zero extra
+#                                  over depth=12 — the tail beyond it is flat)
+#
+# ANALYSIS_* is for single-position solves (the /analyze endpoint — the user
+# is looking at one position, so the rare 5.5s worst case is acceptable). Note
+# this is now BELOW live play's LIVE_DEPTH_CAP/LIVE_NODE_BUDGET (game.py) —
+# live play only solves once per bot decision, whereas analyze_game_full below
+# solves twice per prefix across a whole game and needs a much tighter budget
+# to stay bounded (see TRAJECTORY_*).
+ANALYSIS_DEPTH_CAP = 12
+ANALYSIS_NODE_BUDGET = 250_000
+# Per-prefix budget for analyze_game_full's forcing solves (run twice per
+# placement inside the SSE loop) — the depth=10/20k row above caps the
+# per-solve worst case at ~0.4s, keeping a whole-game analysis bounded.
+TRAJECTORY_DEPTH_CAP = 10
+TRAJECTORY_NODE_BUDGET = 20_000
+
+
 def _finite(x):
     """Coerce NaN/Inf to 0.0 so JSON output stays standards-compliant."""
     try:
@@ -45,6 +69,16 @@ class AnalysisResult:
     terminal: bool = False
     winner: str | None = None
     current_player: str | None = None  # side to move (for P1-perspective flip)
+    # Both-side VCF solve for display: {"winner", "attacker_is_mover",
+    # "first_move", "pv", "pv_len", "pv_owners"} or None (no forced win found
+    # either way, or the solver wasn't consulted for the opponent side).
+    # "pv_owners" is a parallel array of "P1"/"P2" (or None if the replay that
+    # derives it failed) — the PV's per-cell chunk lengths are NOT a fixed
+    # pairs-of-2 cadence (the first chunk is however many placements the
+    # analyzed side has left THIS turn, and the final chunk can be a single
+    # cell that ends the game), so ownership can't be inferred from position
+    # alone. See _solve_forcing.
+    forcing: dict | None = None
 
     def to_json(self) -> dict:
         return {
@@ -69,6 +103,7 @@ class AnalysisResult:
             ],
             "terminal": self.terminal,
             "winner": self.winner,
+            "forcing": self.forcing,
         }
 
 
@@ -216,14 +251,79 @@ def _scan_threats(data, legal_coords, probs, *, current_player, relative_stones)
     return threats
 
 
+def _solve_forcing(state, game_config, depth_cap=ANALYSIS_DEPTH_CAP,
+                   node_budget=ANALYSIS_NODE_BUDGET):
+    """Both-side VCF solve for the analysis display.
+
+    Solves for the side to move first; only if THAT side has no forced win do
+    we flip perspective and check the opponent's (``game_config`` required for
+    the flip — ``None`` skips the opponent-side check, e.g. for callers that
+    don't have game rules handy). Never raises: any solver failure or absence
+    of a forced win on either side is reported as ``None`` — analysis must
+    never crash because the display solve had trouble.
+    """
+    try:
+        import hexo_rs as hr
+        mover = state.current_player()
+        res = hr.solve_forcing(state, depth_cap, node_budget)
+        winner, attacker_is_mover, solved_state = mover, True, state
+        if res is None:
+            if game_config is None:
+                return None
+            opp = "P1" if mover == "P2" else "P2"
+            opp_state = hr.GameState.from_state(state.placed_stones(), opp, 2, game_config)
+            res = hr.solve_forcing(opp_state, depth_cap, node_budget)
+            if res is None:
+                return None
+            winner, attacker_is_mover, solved_state = opp, False, opp_state
+        first_move, pv = res
+        pv = [[int(q), int(r)] for (q, r) in pv]
+        # Per-cell ownership: the PV's chunk lengths are NOT a fixed pairs-of-2
+        # cadence (the first chunk is whatever moves_remaining_this_turn() was
+        # on the solved side, and the final chunk can be a single cell that
+        # ends the game), so replay the PV on a clone to get the real mover at
+        # each step. Never let a replay hiccup take down the rest of `forcing`.
+        pv_owners = None
+        try:
+            replay = solved_state.clone()
+            owners = []
+            for (q, r) in pv:
+                owners.append(replay.current_player())
+                replay.apply_move(q, r)
+            pv_owners = owners
+        except Exception:
+            pv_owners = None
+        return {
+            "winner": winner,
+            "attacker_is_mover": attacker_is_mover,
+            "first_move": [int(first_move[0]), int(first_move[1])],
+            "pv": pv,
+            "pv_len": len(pv),
+            "pv_owners": pv_owners,
+        }
+    except Exception:
+        return None
+
+
 def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
-                     mcts_m_actions: int = 16) -> AnalysisResult:
+                     mcts_m_actions: int = 16, game_config=None,
+                     forcing_depth_cap=ANALYSIS_DEPTH_CAP,
+                     forcing_node_budget=ANALYSIS_NODE_BUDGET) -> AnalysisResult:
     """Evaluate a single position.
 
     With ``mcts_sims=0`` the result is a raw forward pass (softmax policy + value
     head). With ``mcts_sims > 0`` it runs Gumbel MCTS and returns visit-normalized
     ``probs`` plus ``q_hat`` / ``improved_policy`` / ``candidate_set`` for the
     visited candidates.
+
+    ``game_config`` (an ``hr.GameConfig``), if given, additionally solves for a
+    forced win (VCF) on either side via ``hr.solve_forcing`` — never the
+    ``gumbel_mcts`` shortcut, whose one-hot ``improved_policy`` would flatten
+    this eval heatmap. See ``AnalysisResult.forcing``. ``forcing_depth_cap`` /
+    ``forcing_node_budget`` default to the single-position ``ANALYSIS_*``
+    budgets; ``analyze_game_full`` overrides them with the tighter
+    ``TRAJECTORY_*`` budgets since it solves twice per prefix across a whole
+    game.
     """
     if state.is_terminal():
         return AnalysisResult(
@@ -298,6 +398,7 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
     threats = _scan_threats(data, legal_out, probs,
                             current_player=state.current_player(),
                             relative_stones=relative)
+    forcing = _solve_forcing(state, game_config, forcing_depth_cap, forcing_node_budget)
     return AnalysisResult(
         legal=[list(c) for c in legal_out],
         value=value,
@@ -310,6 +411,7 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
         terminal=False,
         winner=None,
         current_player=state.current_player(),
+        forcing=forcing,
     )
 
 
@@ -624,10 +726,10 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
 
     Returns the extended trajectory shape: per-prefix
     {value, current_player, terminal, winner, legal, probs, q_hat,
-     improved_policy, candidate_set, stones, threats, quality} (MCTS fields only
-     for non-terminal prefixes that completed; quality only at turn boundaries),
-    plus boundary_indices, evaluated_prefixes, mcts_sims, cancelled,
-    completed_prefixes, error_at.
+     improved_policy, candidate_set, stones, threats, forcing, quality} (MCTS
+     fields only for non-terminal prefixes that completed; quality only at
+     turn boundaries), plus boundary_indices, evaluated_prefixes, mcts_sims,
+    cancelled, completed_prefixes, error_at.
     """
     import hexo_rs as hr
     graph_fn = make_graph_fn(model_config)
@@ -637,8 +739,14 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
 
     if run_mcts_fn is None:
         def run_mcts_fn(st):
+            # Trajectory solves run twice per placement across the whole game,
+            # so they use the tighter TRAJECTORY_* budget, not ANALYSIS_*
+            # (the single-position /analyze default) — see the consts' bench.
             return analyze_position(model, model_config, st,
-                                    mcts_sims=mcts_sims, mcts_m_actions=mcts_m_actions)
+                                    mcts_sims=mcts_sims, mcts_m_actions=mcts_m_actions,
+                                    game_config=cfg,
+                                    forcing_depth_cap=TRAJECTORY_DEPTH_CAP,
+                                    forcing_node_budget=TRAJECTORY_NODE_BUDGET)
 
     # Pass 1: batched value + raw policy + legal over all non-terminal prefixes.
     non_terminal_idx = [i for i, s in enumerate(prefix_states) if not s.is_terminal()]
@@ -723,12 +831,17 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     # (expensive) search entirely — only the newly-appended tail runs MCTS.
     warm = warm_trajectory or []
     _MCTS_FIELDS = ("q_hat", "improved_policy", "candidate_set", "legal",
-                    "probs", "value", "threats")
+                    "probs", "value", "threats", "forcing")
     cancelled = False
     completed = 0
     for i, st in enumerate(prefix_states):
         if not st.is_terminal():
             wi = warm[i] if i < len(warm) else None
+            # forcing is independent of MCTS (computed even at mcts_sims=0), so
+            # a warm entry that carries one is reusable regardless of whether
+            # q_hat/MCTS diagnostics were also cached for this position.
+            if wi is not None and "forcing" in wi:
+                trajectory[i]["forcing"] = wi["forcing"]
             if wi is not None and wi.get("q_hat") is not None:
                 # Reuse the cached MCTS for this shared-prefix position.
                 for k in _MCTS_FIELDS:
@@ -742,6 +855,9 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
                 try:
                     res = run_mcts_fn(st)
                     js = res.to_json() if hasattr(res, "to_json") else res
+                    # forcing is independent of q_hat/MCTS success — always set
+                    # it (a fresh compute at mcts_sims=0 still has one to report).
+                    trajectory[i]["forcing"] = js.get("forcing")
                     if js.get("q_hat") is not None:
                         trajectory[i]["q_hat"] = js["q_hat"]
                         trajectory[i]["improved_policy"] = js.get("improved_policy")

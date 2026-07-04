@@ -271,3 +271,27 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 .ro-pos b, .ro-eval b{color:var(--text);}
 .ro-eval b{color:var(--phos);}
 .ro-note{color:var(--faint); font-style:italic; font-size:11px;}
+
+/* Forcing-line (VCF) overlay + banner (analysis board). ------------------- */
+/* PV cell markers: attacker placements are a filled circle in the winner's
+   colour (set inline per-render, since it depends on which side is winning);
+   defender replies are the same circle outlined/dashed instead. */
+.forcing-pv-attacker, .forcing-pv-defender{opacity:.85; pointer-events:none;}
+.forcing-pv-defender{fill:none; stroke-width:2; stroke-dasharray:2,2;}
+.forcing-pv-label{font-weight:bold; text-anchor:middle; dominant-baseline:middle; pointer-events:none;}
+.forcing-pv-label-attacker{fill:#0d0f0e;} /* dark ink reads on any winner colour */
+
+/* One-line "forced win" banner. #analysis-board-container already stacks
+   #gauge-wrap (absolute, top:0, z-index:3) and #analysis-board (absolute,
+   inset:0, z-index:1) — an unpositioned banner would paint BEHIND both (static
+   in-flow boxes paint before any positioned descendant, regardless of DOM
+   order), making it invisible. Anchor it below the gauge strip instead: the
+   gauge's tallest state (poles line ~29px + 6px margin + gauge 15px + scale
+   line ~11px + 4px margin, padded 16px/10px) is ~91px, so top:96px clears it
+   with a few px to spare; z-index:2 sits above the board but below the gauge/
+   legend (z-index:3) so either would win a rendering ambiguity, not the banner. */
+.forcing-pv-banner{position:absolute; left:0; right:0; top:96px; z-index:2;
+  text-align:center; font-weight:600; font-size:13px; padding:2px 10px; pointer-events:none;}
+.forcing-pv-banner[hidden]{display:none;}
+.forcing-pv-banner.win{color:var(--good);}
+.forcing-pv-banner.loss{color:var(--bad);}
