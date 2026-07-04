@@ -5,16 +5,20 @@ Parity target: scripts/play_server.py:310-400 (make_bot_turn_fn) and 456-663
 play-through; here we inject a no-op bot to test the manager plumbing.
 """
 import random
+import types
 from datetime import datetime, timezone
 
 import hexo_rs
 import pytest
 
+import hexo_a0.serving.game as game_mod
 from hexo_a0.serving.analysis import build_state
 from hexo_a0.serving.game import (
     GameManager, GameAlreadyOverError, GameError, GameRecord,
     IllegalMoveError, NotYourTurnError, ServerBusyError, UnknownGameError,
+    make_bot_turn_fn,
 )
+from hexo_a0.serving.inference import InferenceGuard
 
 
 def _mgr(bot_turn_fn=lambda rec: None):
@@ -498,3 +502,197 @@ def test_restore_skips_and_deletes_bad_bot_side(tmp_path):
     m2, _ = _pmgr(tmp_path)
     assert m2.restore_active_games() == 0
     assert recorder.load_active() == []
+
+
+# --------------------------------------------------------------------------
+# Live-play forcing: PV-cached win execution + pre-emptive VCF defense.
+#
+# `make_bot_turn_fn` needs a real model/graph_fn to reach the raw-argmax
+# fallback path, so these tests stub the model rather than injecting a no-op
+# bot_turn_fn like the GameManager tests above. `mcts_sims=0` keeps every
+# non-forcing fallback on the raw-argmax path (no GPU, no gumbel_mcts).
+# --------------------------------------------------------------------------
+
+class _ZeroLogitModel:
+    """All-zero logits/value: raw-argmax degenerates to "first candidate" (or,
+    restricted, the sole candidate) with no need to control learned weights."""
+
+    def __call__(self, x, edge_index, legal_mask, stone_mask=None, edge_attr=None):
+        import torch
+        return torch.zeros(x.shape[0]), torch.tensor(0.0)
+
+    def forward_batch(self, batch):
+        # Not exercised (mcts_sims=0 in these tests); _eval_fn would recover
+        # via its per-graph fallback (calling __call__) if it ever were.
+        raise NotImplementedError
+
+
+def _bot_turn_fn(game_kwargs):
+    return make_bot_turn_fn(
+        model=_ZeroLogitModel(),
+        model_config=types.SimpleNamespace(graph_type="hex"),
+        m_actions=16,
+        mcts_sims=0,
+        guard=InferenceGuard(),
+        game_kwargs=game_kwargs,
+    )
+
+
+def _seq_moves(cfg, n, pick=lambda legal: legal[0]):
+    """Replay `n` real, legal placements from a fresh GameState. Returns the
+    (q, r) sequence, in play order. `pick` selects among `legal_moves()` at
+    each step (default: the engine's first, deterministic)."""
+    state = hexo_rs.GameState(cfg)
+    moves = []
+    for _ in range(n):
+        q, r = pick(state.legal_moves())
+        state.apply_move(q, r)
+        moves.append((q, r))
+    return moves
+
+
+def test_forcing_bot_executes_own_forced_win():
+    # Bot (P1) has an open pair; with 2 free placements this turn (no
+    # opponent reply in between), solve_forcing finds a 2-move forced win.
+    cfg_kwargs = {"win_length": 4, "placement_radius": 3, "max_moves": 60}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P1")], "P1", 2, cfg)
+    expected = hexo_rs.solve_forcing(state, game_mod.LIVE_DEPTH_CAP, game_mod.LIVE_NODE_BUDGET)
+    assert expected is not None
+    first_move, pv = expected
+    assert len(pv) == 2  # both placements land in the same (bot's) turn
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-forcing-win", created_at=now, last_active_at=now, state=state,
+        human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P1")],
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert rec.move_log[-2:] == [
+        (first_move[0], first_move[1], "P1"),
+        (pv[1][0], pv[1][1], "P1"),
+    ]
+    assert rec.state.is_terminal() and rec.state.winner() == "P1"
+
+
+def test_forcing_pv_cache_replay_skips_resolve(monkeypatch):
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    # Deliberately pick the LAST-ordered legal move at each step (not the
+    # first): the raw-argmax fallback's node ordering favours the lexically
+    # smallest coordinate, so if the cache check were bypassed the fallback
+    # would land on a different cell and this test would (correctly) fail.
+    pv = _seq_moves(cfg, 6, pick=lambda legal: max(legal))
+
+    state = hexo_rs.GameState(cfg)  # fresh, right after the (0,0) seed
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-forcing-replay", created_at=now, last_active_at=now, state=state,
+        human_side="P1", bot_side="P2", human_name="a",
+        move_log=[(0, 0, "P1")],
+        forcing_pv=list(pv),
+        forcing_base=1,
+    )
+
+    calls = {"n": 0}
+
+    def _counting_solve(*a, **k):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _counting_solve)
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert calls["n"] == 0  # cache hit — solver never invoked
+    assert rec.move_log[-2:] == [(pv[0][0], pv[0][1], "P2"), (pv[1][0], pv[1][1], "P2")]
+    assert rec.forcing_pv == list(pv)  # untouched
+
+
+def test_forcing_pv_cache_invalidated_on_deviation(monkeypatch):
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    pv = _seq_moves(cfg, 6)  # bot(P2): pv[0:2] ; opp(P1): pv[2:4] ; bot(P2): pv[4:6]
+
+    # Replay the bot's cached turn for real, then have the opponent deviate on
+    # the first of their two placements (their second placement is arbitrary).
+    state = hexo_rs.GameState(cfg)
+    state.apply_move(*pv[0])
+    state.apply_move(*pv[1])
+    legal = {tuple(c) for c in state.legal_moves()}
+    deviation = next(c for c in legal if c != pv[2])
+    state.apply_move(*deviation)
+    other = state.legal_moves()[0]
+    state.apply_move(*other)
+    assert state.current_player() == "P2"  # bot to move again
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-forcing-deviate", created_at=now, last_active_at=now, state=state,
+        human_side="P1", bot_side="P2", human_name="a",
+        move_log=[
+            (0, 0, "P1"), (*pv[0], "P2"), (*pv[1], "P2"),
+            (*deviation, "P1"), (*other, "P1"),
+        ],
+        forcing_pv=list(pv),
+        forcing_base=1,
+    )
+
+    calls = {"n": 0}
+
+    def _counting_solve(*a, **k):
+        calls["n"] += 1
+        return None  # avoid discovering an unrelated real win mid-test
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _counting_solve)
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert calls["n"] >= 1  # deviation forced a re-solve
+    assert rec.forcing_pv is None
+
+
+def test_forcing_defensive_block_plays_the_only_killer(monkeypatch):
+    # Bot (P1) has no forced win of its own; the opponent (P2), hypothetically
+    # to move, has a mate-in-1 (a three blocked on one side); a single legal
+    # cell on the open side kills it.
+    monkeypatch.setattr(game_mod, "LIVE_DEPTH_CAP", 2)
+    monkeypatch.setattr(game_mod, "DEF_DEPTH_CAP", 1)
+
+    cfg_kwargs = {"win_length": 4, "placement_radius": 3, "max_moves": 60}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    stones = [((0, 0), "P1"), ((7, 0), "P1"),
+              ((8, 0), "P2"), ((9, 0), "P2"), ((10, 0), "P2")]
+    state = hexo_rs.GameState.from_state(stones, "P1", 2, cfg)
+
+    # Replicate the trial re-solve loop directly to derive the expected
+    # killer set, per the brief.
+    assert hexo_rs.solve_forcing(state, 2, 200_000) is None  # bot has no own VCF
+    legal = {tuple(c) for c in state.legal_moves()}
+    opp_win = hexo_rs.solve_forcing(
+        hexo_rs.GameState.from_state(state.placed_stones(), "P2", 2, cfg), 1, 200_000)
+    assert opp_win is not None
+    _ofm, opv = opp_win
+    candidates = [c for c in {tuple(m) for m in opv} if c in legal]
+    killers = []
+    for c in candidates:
+        trial = state.clone()
+        trial.apply_move(*c)
+        re_res = hexo_rs.solve_forcing(
+            hexo_rs.GameState.from_state(trial.placed_stones(), "P2", 2, cfg), 1, 200_000)
+        if re_res is None:
+            killers.append(c)
+    assert killers == [(11, 0)]  # exactly one legal killing cell
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-forcing-defend", created_at=now, last_active_at=now, state=state,
+        human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(q, r, side) for (q, r), side in stones],
+    )
+    before = len(rec.move_log)
+    _bot_turn_fn(cfg_kwargs)(rec)
+    new_moves = [m[:2] for m in rec.move_log[before:]]
+
+    assert (11, 0) in new_moves

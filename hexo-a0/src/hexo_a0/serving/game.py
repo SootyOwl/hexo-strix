@@ -32,6 +32,14 @@ DEFAULT_DIFFICULTY_SIMS: dict[str, int] = {
 }
 DEFAULT_DIFFICULTY = "standard"
 
+# Live-play forcing (VCF) search budgets. Post-9x-speedup these are sub-second
+# at live board sizes; the defensive check runs up to ~1+|PV| solves per bot
+# placement, so it gets the smaller budget.
+LIVE_DEPTH_CAP = 16
+LIVE_NODE_BUDGET = 2_000_000
+DEF_DEPTH_CAP = 10
+DEF_NODE_BUDGET = 200_000
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -64,6 +72,11 @@ class GameRecord:
     terminal_recorded: bool = False  # set after Recorder.record_completed
     evicted: bool = False  # detached from GameManager._games; never re-persist
     difficulty: str = DEFAULT_DIFFICULTY
+    # Cached forced-win PV from a previous solve_forcing call: the bot replays
+    # it move-for-move as long as move_log stays in lockstep, without
+    # re-invoking the solver. In-memory only — a restart just re-solves.
+    forcing_pv: list[tuple[int, int]] | None = None
+    forcing_base: int = 0  # len(move_log) at the time forcing_pv was solved
     # Phase 5: optional self-reported opponent Elo. Added now so the record is
     # forward-compatible; defaults are anonymous.
     opp_elo: float | None = None
@@ -105,12 +118,15 @@ def make_bot_turn_fn(
     mcts_sims: int = 0,
     difficulty_sims: dict[str, int] | None = None,
     guard: InferenceGuard,
+    game_kwargs: dict,
 ):
     """Build a closure that runs a full bot turn under the inference guard.
 
     When ``difficulty_sims`` is provided, the sim count for each move is looked
     up from ``rec.difficulty``; otherwise the legacy fixed ``mcts_sims`` is used
-    for every game.
+    for every game. ``game_kwargs`` (the same dict given to ``GameManager``) is
+    needed to build hypothetical opponent-perspective positions for the
+    defensive forcing check.
 
     The closure mutates ``rec.state`` and ``rec.move_log`` in place. Caller must
     already hold ``rec.lock``; the guard serializes the actual GPU work.
@@ -150,20 +166,13 @@ def make_bot_turn_fn(
         return ([p.tolist() for p in logits_list],
                 [float(v.item()) for v in values])
 
-    def _pick_move(state, sims: int):
-        if sims > 0:
-            mcts_cfg = hr.MCTSConfig(
-                n_simulations=sims,
-                m_actions=m_actions,
-                c_visit=50,
-                c_scale=1.0,
-                # Deterministic, paper-style eval: no Gumbel noise on the bot's
-                # move selection (reproducible + optimal play vs humans).
-                disable_gumbel_noise=True,
-            )
-            action, _improved = hr.gumbel_mcts(state, _eval_fn, mcts_cfg)
-            return action
-        # Raw argmax fallback (mcts_sims == 0).
+    def _policy_argmax(state, restrict_to: set | None = None):
+        """Raw-argmax move choice: one forward pass, no MCTS.
+
+        Shared by ``_pick_move``'s fallback (``restrict_to=None``) and the
+        defensive forcing check, which restricts the choice to a specific set
+        of legal killer cells.
+        """
         data = graph_fn(state)
         with torch.no_grad():
             logits, _ = model(
@@ -179,9 +188,123 @@ def make_bot_turn_fn(
             # Refuse rather than mis-index a logit onto the wrong coordinate.
             raise RuntimeError(
                 f"logits/legal length mismatch: {legal_logits.shape[0]} vs {len(legal_coords)}")
-        idx = int(legal_logits.argmax().item())
-        q, r = legal_coords[idx]
+        if restrict_to is not None:
+            idxs = [i for i, c in enumerate(legal_coords)
+                    if (int(c[0]), int(c[1])) in restrict_to]
+            if not idxs:
+                raise RuntimeError("no legal moves within restrict_to")
+        else:
+            idxs = range(len(legal_coords))
+        best = max(idxs, key=lambda i: legal_logits[i].item())
+        q, r = legal_coords[best]
         return (int(q), int(r))
+
+    def _pick_move(state, sims: int):
+        if sims > 0:
+            mcts_cfg = hr.MCTSConfig(
+                n_simulations=sims,
+                m_actions=m_actions,
+                c_visit=50,
+                c_scale=1.0,
+                # Deterministic, paper-style eval: no Gumbel noise on the bot's
+                # move selection (reproducible + optimal play vs humans).
+                disable_gumbel_noise=True,
+            )
+            action, _improved = hr.gumbel_mcts(state, _eval_fn, mcts_cfg)
+            return action
+        # Raw argmax fallback (mcts_sims == 0).
+        return _policy_argmax(state)
+
+    def _defensive_move(rec: GameRecord, legal: set):
+        """Step 3: pre-emptive VCF defense, run only when the bot has no own
+        forced win. Exploits monotonicity: the bot's stones only remove
+        opponent threat cells, so "no VCF for the opponent right now
+        (hypothetically to move)" implies "none at their next turn start"
+        either — safe to fall through to normal MCTS in that case.
+        """
+        state = rec.state
+        opp = "P1" if rec.bot_side == "P2" else "P2"
+        cfg = hr.GameConfig(**game_kwargs)
+        opp_state = hr.GameState.from_state(state.placed_stones(), opp, 2, cfg)
+        opp_win = hr.solve_forcing(opp_state, DEF_DEPTH_CAP, DEF_NODE_BUDGET)
+        if opp_win is None:
+            return None
+
+        _opp_first, opp_pv = opp_win
+        seen: set = set()
+        candidates: list = []
+        for c in opp_pv:
+            c = tuple(c)
+            if c in legal and c not in seen:
+                seen.add(c)
+                candidates.append(c)
+        if not candidates:
+            return None
+
+        killers = []
+        survivors = []  # (cell, surviving PV length) — delay/disruption proxy
+        for c in candidates:
+            trial = state.clone()
+            trial.apply_move(*c)
+            if trial.is_terminal():
+                # The placer can only WIN by placing (the engine has no
+                # self-loss rule), so a terminal trial means this cell
+                # completes a bot win — play it outright. Also keeps the
+                # from_state call below on its documented non-terminal-only
+                # contract.
+                return c
+            trial_opp = hr.GameState.from_state(trial.placed_stones(), opp, 2, cfg)
+            re_res = hr.solve_forcing(trial_opp, DEF_DEPTH_CAP, DEF_NODE_BUDGET)
+            if re_res is None:
+                killers.append(c)
+            else:
+                survivors.append((c, len(re_res[1])))
+
+        if killers:
+            return _policy_argmax(state, restrict_to=set(killers))
+        # No killer this placement: play the survivor with the longest
+        # surviving PV (max delay). The next placement re-runs this whole
+        # check, giving the pair a second chance to kill the win.
+        best_cell, _pv_len = max(survivors, key=lambda t: t[1])
+        return best_cell
+
+    def _forcing_move(rec: GameRecord):
+        """Steps 1-3 of the live-play forcing check, run before `_pick_move`
+        on every bot placement. Returns a move to play, or None to fall
+        through to the existing MCTS / raw-argmax path unchanged.
+        """
+        state = rec.state
+        legal = {tuple(c) for c in state.legal_moves()}
+
+        # 1. PV-cache replay: if the opponent has followed the cached forced
+        # line so far, play the next PV move without calling the solver.
+        if rec.forcing_pv is not None:
+            k = len(rec.move_log) - rec.forcing_base
+            played = [(m[0], m[1]) for m in rec.move_log[rec.forcing_base:]]
+            pv_prefix = [tuple(m) for m in rec.forcing_pv[:k]]
+            if 0 <= k < len(rec.forcing_pv) and played == pv_prefix:
+                nxt = tuple(rec.forcing_pv[k])
+                if nxt in legal:
+                    return nxt
+            # Deviation (or an exhausted/stale cache): re-solve from scratch.
+            rec.forcing_pv = None
+
+        # 2. Own-win solve.
+        res = hr.solve_forcing(state, LIVE_DEPTH_CAP, LIVE_NODE_BUDGET)
+        if res is not None:
+            first_move, pv = res
+            first_move = tuple(first_move)
+            if first_move in legal:
+                rec.forcing_pv = [tuple(m) for m in pv]
+                rec.forcing_base = len(rec.move_log)
+                return first_move
+            logger.error(
+                "solve_forcing returned illegal first_move %r for game %s",
+                first_move, rec.game_id,
+            )
+
+        # 3. Defensive pre-emptive check (only when step 2 found nothing).
+        return _defensive_move(rec, legal)
 
     def _sims_for(rec: GameRecord) -> int:
         if difficulty_sims is None:
@@ -200,7 +323,16 @@ def make_bot_turn_fn(
                     return
                 if rec.state.current_player() != rec.bot_side:
                     return
-                q, r = _pick_move(rec.state, sims)
+                try:
+                    move = _forcing_move(rec)
+                except Exception:
+                    # The solver must never take down live play.
+                    logger.exception(
+                        "forcing check failed for game %s; falling back to MCTS",
+                        rec.game_id,
+                    )
+                    move = None
+                q, r = move if move is not None else _pick_move(rec.state, sims)
                 rec.state.apply_move(q, r)
                 rec.move_log.append((q, r, rec.bot_side))
 

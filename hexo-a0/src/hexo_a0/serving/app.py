@@ -1243,18 +1243,20 @@ def _serve(cfg, analyze_ctx):
     model_label = cfg.model_label or _derive_model_label(cfg.checkpoint, ckpt)
     model_step = _derive_step(cfg.checkpoint, ckpt)
 
+    game_kwargs = dict(
+        win_length=cfg.win_length,
+        placement_radius=cfg.placement_radius,
+        max_moves=cfg.max_moves,
+    )
     bot_fn = make_bot_turn_fn(
         model=model, model_config=mc,
         mcts_sims=cfg.mcts_sims, m_actions=cfg.m_actions,
         difficulty_sims=difficulty_sims,
         guard=guard,
+        game_kwargs=game_kwargs,
     )
     mgr = GameManager(
-        game_kwargs=dict(
-            win_length=cfg.win_length,
-            placement_radius=cfg.placement_radius,
-            max_moves=cfg.max_moves,
-        ),
+        game_kwargs=game_kwargs,
         bot_turn_fn=bot_fn,
         mcts_sims=cfg.mcts_sims,
         m_actions=cfg.m_actions,
