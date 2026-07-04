@@ -261,12 +261,17 @@ function buildTreeFromTrajectory(result) {
 
 function setCurrent(node) {
   analysisCurrent = node;
+  // Any ordinary navigation (slider, undo, board click, a plain move link)
+  // dismisses a selected missed-win callout; showMissedWin re-selects it
+  // AFTER calling this, once its own navigation has landed.
+  missedWinSelected = null;
   const slider = document.getElementById("analysis-slider");
   // Sync the slider to the depth IF the node is on the mainline.
   if (node && analysisMain[node.depth] === node) slider.value = node.depth;
   renderNode(node);
   renderEvalBar();
   renderMoveTree();
+  renderMissedWinCallout();
   updateAnalysisHash();
 }
 
@@ -871,8 +876,65 @@ async function branchFrom(node, q, r) {
 // --- PGN-style move tree rendering -----------------------------------------
 function _moveLink(node) {
   const active = node === analysisCurrent ? " move-active" : "";
+  // missed_win is per-PLACEMENT (server-computed, analyze_game_full only —
+  // side-line nodes from /analyze never carry it), so it's checked here
+  // rather than once per turn: whichever of the turn's (up to 2) move links
+  // squandered the win gets the badge, not necessarily the turn-end one.
+  const mw = node.result && node.result.missed_win;
+  const badge = mw
+    ? ` <span class="missed-win-badge" onclick="showMissedWin(${node._id})" `
+    + `title="A forced win existed one placement earlier">&#9889; Missed win!</span>`
+    : "";
   return `<span class="move-link${active}" onclick="scrubToNodeId(${node._id})">`
-       + `[${node.move[0]},${node.move[1]}]</span>`;
+       + `[${node.move[0]},${node.move[1]}]</span>${badge}`;
+}
+
+// Selected missed-win callout: the {by, at_prefix, first_move, pv, pv_len,
+// pv_owners} dict from the badge that's currently pinned open, or null.
+let missedWinSelected = null;
+
+// Click a "Missed win!" badge: navigate the board to `at_prefix` (the
+// position where the win still existed — Task 2's forcing-pv overlay
+// renders the line there automatically via that node's own `forcing` field,
+// which is exactly what `missed_win` was copied from) and pin the callout
+// panel open describing it.
+function showMissedWin(nodeId) {
+  const node = _nodeById[nodeId];
+  const mw = node && node.result && node.result.missed_win;
+  if (!mw) return;
+  const target = analysisMain[mw.at_prefix];
+  if (target) setCurrent(target);   // clears missedWinSelected + navigates
+  missedWinSelected = mw;
+  renderMissedWinCallout();
+}
+
+// Compact callout panel for the selected missed-win badge: "P1 had a forced
+// win in N" + the squandered PV as numbered coordinate chips, attacker
+// placements emphasized and defender replies muted per `pv_owners` (falling
+// back to "every cell is attacker" if the server's replay couldn't determine
+// ownership — mirrors drawAnalysisBoard's forcing-pv overlay fallback).
+// Created on first use, like updateForcingBanner, so no static markup needs
+// to change.
+function renderMissedWinCallout() {
+  const movetree = document.getElementById("analysis-movetree");
+  if (!movetree) return;
+  let panel = document.getElementById("missed-win-callout");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "missed-win-callout";
+    panel.className = "missed-win-callout";
+    movetree.insertAdjacentElement("afterend", panel);
+  }
+  const mw = missedWinSelected;
+  if (!mw) { panel.hidden = true; panel.innerHTML = ""; return; }
+  panel.hidden = false;
+  const chips = mw.pv.map((c, i) => {
+    const isAttacker = mw.pv_owners ? mw.pv_owners[i] === mw.by : true;
+    const cls = `pv-chip ${isAttacker ? "pv-chip-attacker" : "pv-chip-defender"}`;
+    return `<span class="${cls}">${i + 1}. [${c[0]},${c[1]}]</span>`;
+  }).join("");
+  panel.innerHTML = `<div class="mwc-head">${mw.by} had a forced win in ${mw.pv_len}</div>`
+                   + `<div class="mwc-pv">${chips}</div>`;
 }
 
 // Assign ids so onclick can find nodes. Re-runs on every render: clears the

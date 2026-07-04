@@ -295,3 +295,35 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 .forcing-pv-banner[hidden]{display:none;}
 .forcing-pv-banner.win{color:var(--good);}
 .forcing-pv-banner.loss{color:var(--bad);}
+
+/* "Missed win!" badge (Task 3) — a per-PLACEMENT marker on the move list for
+   a squandered forced win. Must read as a bigger event than the mv-q ★✓?✗
+   glyphs it sits beside, so it borrows their chip geometry (inline height,
+   3px border-radius) but goes gold-on-crimson with a one-shot shimmer on
+   first paint (CSS animation, `1` iteration — no infinite loop) instead of
+   their flat colour-only styling. */
+.missed-win-badge{display:inline-flex; align-items:center; cursor:pointer;
+  font-size:10px; font-weight:700; letter-spacing:.2px;
+  padding:1px 5px; margin-left:4px; border-radius:3px; color:var(--best);
+  background:linear-gradient(135deg, #5a1414, var(--bad));
+  border:1px solid color-mix(in srgb, var(--best) 55%, transparent);
+  box-shadow:0 0 7px -1px rgba(226,92,92,.6);
+  animation:mwb-shimmer 1.2s ease-out 1;}
+.missed-win-badge:hover{filter:brightness(1.15);}
+@keyframes mwb-shimmer{
+  0%{box-shadow:0 0 0 0 rgba(242,193,78,.8), 0 0 7px -1px rgba(226,92,92,.6);}
+  45%{box-shadow:0 0 0 4px rgba(242,193,78,0), 0 0 7px -1px rgba(226,92,92,.6);}
+  100%{box-shadow:0 0 7px -1px rgba(226,92,92,.6);}}
+
+/* Callout for a selected missed-win badge — echoes .vc-sec's rhythm (a left
+   accent bar + a muted body) so it reads as part of the same info system as
+   the verdict card, not a bolted-on widget. */
+.missed-win-callout{padding:8px 9px; background:var(--panel-2);
+  border-radius:4px; border-left:3px solid var(--bad); font-size:12px;}
+.missed-win-callout[hidden]{display:none;}
+.mwc-head{font-family:var(--serif); font-size:14px; color:var(--best); margin-bottom:6px;}
+.mwc-pv{display:flex; flex-wrap:wrap; gap:4px;}
+.pv-chip{font-family:var(--mono); font-size:10.5px; padding:2px 6px; border-radius:3px;
+  background:#1a2422; color:#a9b0a4;}
+.pv-chip-attacker{background:color-mix(in srgb, var(--phos) 20%, #1a2422); color:var(--text); font-weight:600;}
+.pv-chip-defender{opacity:.6;}

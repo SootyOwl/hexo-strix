@@ -551,3 +551,115 @@ def test_analyze_game_full_default_run_mcts_fn_uses_trajectory_budget(monkeypatc
     analyze_game_full(model, mc, _GAME, 6, 8, 400, mcts_sims=0)
     assert seen  # forcing was solved for at least one prefix
     assert all(c == (TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET) for c in seen)
+
+
+# --- "missed win!" flag: post-processing walk over analyze_game_full's
+# trajectory (Task 3) ---------------------------------------------------
+#
+# The walk itself is pure trajectory-dict logic (no new solves), so these
+# tests monkeypatch `_solve_forcing` directly (keyed on the EXACT stone set
+# of the position it's called on, never on stone COUNT — analyze_game_full's
+# off-line quality evaluator probes positions one placement past a real
+# prefix, which would collide with a count-based key) rather than trying to
+# hand-construct a genuinely solvable multi-turn forced win via natural play.
+# This isolates the walk's branching from the (already-tested, in the
+# forcing-line section above) solver-integration concern.
+#
+# All three walk into `analyze_game_full` over a linear, collision-free move
+# sequence (no 6-in-a-row for either side, so the wl=6 game never terminates
+# early): seed P1@(0,0), then P2/P1 alternate full turns of 2 placements
+# along axis (1,0).
+_MISSED_GAME = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0)]
+# Prefix 2 = after P2's first full turn: stones {(0,0):P1, (1,0):P2, (2,0):P2},
+# P1 to move with a fresh turn (moves[3] is P1's placement from here).
+_PREFIX2_STONES = [((0, 0), "P1"), ((1, 0), "P2"), ((2, 0), "P2")]
+
+
+def _forcing_stub(*rules):
+    """A `_solve_forcing`-shaped stub: for each `(stones, forcing_dict)` rule,
+    return `forcing_dict` when called on a state whose exact placed-stone set
+    matches `stones`; `None` for every other position."""
+    targets = [(frozenset(stones), dict(forcing)) for stones, forcing in rules]
+    def _stub(state, game_config, depth_cap, node_budget):
+        current = frozenset(state.placed_stones())
+        for stones, forcing in targets:
+            if current == stones:
+                return dict(forcing)
+        return None
+    return _stub
+
+
+def test_analyze_game_full_missed_win_flagged(monkeypatch):
+    # Step 1: P1 has a proven win at prefix 2 (first_move (10, 0)) but the
+    # actual game plays (3, 0) instead — the resulting placement (trajectory
+    # index 3) must carry the missed_win flag with the squandered line.
+    import hexo_a0.serving.analysis as analysis_mod
+    forcing = {
+        "winner": "P1", "attacker_is_mover": True,
+        "first_move": [10, 0], "pv": [[10, 0], [10, 1]], "pv_len": 2,
+        "pv_owners": ["P1", "P1"],
+    }
+    monkeypatch.setattr(analysis_mod, "_solve_forcing",
+                        _forcing_stub((_PREFIX2_STONES, forcing)))
+    mc = types.SimpleNamespace(graph_type="hex")
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
+    traj = out["trajectory"]
+    assert traj[2]["forcing"]["attacker_is_mover"] is True
+    assert "missed_win" not in traj[2]  # flag lands on the squander, not the win itself
+    assert traj[3]["missed_win"] == {
+        "by": "P1", "at_prefix": 2, "first_move": [10, 0],
+        "pv": [[10, 0], [10, 1]], "pv_len": 2, "pv_owners": ["P1", "P1"],
+    }
+
+
+def test_analyze_game_full_alternative_win_not_flagged(monkeypatch):
+    # Step 2: P1's actually-played move (3, 0) isn't the proven first_move
+    # (10, 0), but it ALSO proves a forced win for P1 (an alternative
+    # winner) — not a missed win.
+    import hexo_a0.serving.analysis as analysis_mod
+    prefix3_stones = _PREFIX2_STONES + [((3, 0), "P1")]
+    monkeypatch.setattr(analysis_mod, "_solve_forcing", _forcing_stub(
+        (_PREFIX2_STONES, {"winner": "P1", "attacker_is_mover": True,
+                           "first_move": [10, 0], "pv": [[10, 0], [10, 1]],
+                           "pv_len": 2, "pv_owners": ["P1", "P1"]}),
+        (prefix3_stones, {"winner": "P1", "attacker_is_mover": True,
+                          "first_move": [9, 9], "pv": [[9, 9]],
+                          "pv_len": 1, "pv_owners": ["P1"]}),
+    ))
+    mc = types.SimpleNamespace(graph_type="hex")
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
+    assert "missed_win" not in out["trajectory"][3]
+
+
+def test_analyze_game_full_following_the_line_not_flagged(monkeypatch):
+    # Step 3: the proven first_move IS what's actually played — not missed.
+    import hexo_a0.serving.analysis as analysis_mod
+    monkeypatch.setattr(analysis_mod, "_solve_forcing", _forcing_stub(
+        (_PREFIX2_STONES, {"winner": "P1", "attacker_is_mover": True,
+                           "first_move": [3, 0], "pv": [[3, 0], [4, 0]],
+                           "pv_len": 2, "pv_owners": ["P1", "P1"]}),
+    ))
+    mc = types.SimpleNamespace(graph_type="hex")
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
+    assert "missed_win" not in out["trajectory"][3]
+
+
+def test_analyze_game_full_warm_trajectory_never_carries_stale_missed_win(monkeypatch):
+    # The walk recomputes over the FULL merged trajectory every call and must
+    # never trust a `missed_win` carried in `warm_trajectory` — simulate one
+    # left over from an earlier response (e.g. before a since-updated forcing
+    # solve) and confirm it's stripped rather than reused.
+    import hexo_a0.serving.analysis as analysis_mod
+    monkeypatch.setattr(analysis_mod, "_solve_forcing", _forcing_stub(
+        (_PREFIX2_STONES, {"winner": "P1", "attacker_is_mover": True,
+                           "first_move": [3, 0], "pv": [[3, 0], [4, 0]],
+                           "pv_len": 2, "pv_owners": ["P1", "P1"]}),
+    ))  # on-line: (3, 0) IS the proven first_move, so no real missed_win
+    mc = types.SimpleNamespace(graph_type="hex")
+    warm = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400,
+                             mcts_sims=0)["trajectory"]
+    warm[3]["missed_win"] = {"by": "P1", "at_prefix": 2, "first_move": [99, 99],
+                             "pv": [[99, 99]], "pv_len": 1, "pv_owners": None}
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400,
+                            mcts_sims=0, warm_trajectory=warm)
+    assert "missed_win" not in out["trajectory"][3]

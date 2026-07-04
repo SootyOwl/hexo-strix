@@ -917,6 +917,52 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
         if q is not None:
             trajectory[b]["quality"] = q
 
+    # Missed-win walk: pure post-processing over the trajectory, no new
+    # solves (Task 3). For each non-terminal prefix i where the side to move
+    # X had a proven forced win (trajectory[i]["forcing"] with
+    # attacker_is_mover == True), check whether the move actually played from
+    # i abandoned it, and if so flag the RESULTING placement
+    # (trajectory[i + 1], matching classify_turn_quality's moves[i+1]
+    # convention) with a ``missed_win`` dict carrying the squandered line.
+    #
+    # Recomputed over the FULL merged trajectory on every call — warm_trajectory
+    # reuse above only ever copies MCTS/forcing/quality fields, never
+    # missed_win, but strip any that leaked in from an earlier response
+    # anyway (defensive: a stale flag would be wrong the moment a later
+    # request's forcing solve disagrees with an earlier one, and this walk is
+    # cheap enough that recomputing it is free).
+    #
+    # Accepted limitation: the ``forcing`` fields this walk reads were solved
+    # at the tight TRAJECTORY_* budgets (far below live play's), so (a) a win
+    # beyond that budget just never flags here (conservative, fine), and (b)
+    # rarely, an alternative winning move at i+1 may fail to re-prove within
+    # budget, so this walk reports a false-positive "missed" flag instead of
+    # recognizing the kept win (accepted).
+    for entry in trajectory:
+        entry.pop("missed_win", None)
+    for i in range(len(trajectory) - 1):
+        forcing = trajectory[i].get("forcing")
+        if not forcing or not forcing.get("attacker_is_mover"):
+            continue
+        if i + 1 >= len(moves) or len(moves[i + 1]) < 2:
+            continue  # bounds guard: no placement follows this prefix
+        played = tuple(moves[i + 1][:2])
+        if played == tuple(forcing["first_move"]):
+            continue  # on the proven line
+        mover = forcing["winner"]
+        next_forcing = trajectory[i + 1].get("forcing")
+        if (next_forcing and next_forcing.get("attacker_is_mover")
+                and next_forcing.get("winner") == mover):
+            continue  # kept a proven win via an alternative move
+        trajectory[i + 1]["missed_win"] = {
+            "by": mover,
+            "at_prefix": i,
+            "first_move": forcing["first_move"],
+            "pv": forcing["pv"],
+            "pv_len": forcing["pv_len"],
+            "pv_owners": forcing.get("pv_owners"),
+        }
+
     out = {
         "trajectory": trajectory,
         "boundary_indices": boundary_indices,
