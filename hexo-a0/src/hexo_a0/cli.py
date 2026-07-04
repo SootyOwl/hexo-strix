@@ -249,6 +249,11 @@ def main(argv=None):
                               help="Difficulty served when /new_game omits the field")
     serve_parser.add_argument("--request-timeout", type=int, default=60,
                               help="Socket/request timeout in seconds")
+    serve_parser.add_argument("--no-live-forcing", dest="live_forcing",
+                              action="store_false", default=True,
+                              help="Disable the live VCF forcing solver (win execution + "
+                                   "pre-emptive defense) for ALL difficulty tiers; falls "
+                                   "back to byte-identical pre-forcing-feature MCTS/argmax play.")
 
     # --- default-config ---
     subparsers.add_parser(

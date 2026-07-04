@@ -644,6 +644,58 @@ def test_analyze_game_full_following_the_line_not_flagged(monkeypatch):
     assert "missed_win" not in out["trajectory"][3]
 
 
+_PREFIX3_STONES = _PREFIX2_STONES + [((3, 0), "P1")]
+# Prefix 6 = after P2's second full turn: P1 to move again with a fresh turn
+# (moves[7] is P1's placement from here) — the forward-scan's landing point
+# for a deviation on the turn-ENDING placement at prefix 3 (moves[4]).
+_PREFIX6_STONES = _PREFIX3_STONES + [((4, 0), "P1"), ((5, 0), "P2"), ((6, 0), "P2")]
+
+
+def test_analyze_game_full_turn_ending_alternative_win_not_flagged(monkeypatch):
+    # Regression: the OLD rule only ever looked at trajectory[i + 1], which
+    # for a deviation on the turn-ENDING placement is the OPPONENT's
+    # to-move prefix — never P1's own next chance to move — so it could
+    # never see that P1 kept a proven win across the opponent's reply, and
+    # would falsely flag this as squandered. P1 has a proven win at prefix 3
+    # (mid-turn, one placement left) but plays (4, 0) instead of the proven
+    # first_move (10, 0); P1's win survives (a different forced win, still
+    # proven) at prefix 6 (P1's next to-move prefix, after P2's full reply
+    # turn) — the forward-scan must land there and see it, so this must NOT
+    # be flagged as a missed win.
+    import hexo_a0.serving.analysis as analysis_mod
+    monkeypatch.setattr(analysis_mod, "_solve_forcing", _forcing_stub(
+        (_PREFIX3_STONES, {"winner": "P1", "attacker_is_mover": True,
+                           "first_move": [10, 0], "pv": [[10, 0], [10, 1]],
+                           "pv_len": 2, "pv_owners": ["P1", "P1"]}),
+        (_PREFIX6_STONES, {"winner": "P1", "attacker_is_mover": True,
+                           "first_move": [11, 0], "pv": [[11, 0]],
+                           "pv_len": 1, "pv_owners": ["P1"]}),
+    ))
+    mc = types.SimpleNamespace(graph_type="hex")
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
+    assert "missed_win" not in out["trajectory"][4]
+
+
+def test_analyze_game_full_turn_ending_squandered_win_flagged(monkeypatch):
+    # Same deviation as above, but P1 does NOT still hold a proven win at
+    # prefix 6 (no stub there -> forcing is None) — this really was
+    # squandered, and the flag must still land on the deviating placement
+    # (trajectory[4], the result of the turn-ending move), not be swallowed
+    # by the lookahead.
+    import hexo_a0.serving.analysis as analysis_mod
+    monkeypatch.setattr(analysis_mod, "_solve_forcing", _forcing_stub(
+        (_PREFIX3_STONES, {"winner": "P1", "attacker_is_mover": True,
+                           "first_move": [10, 0], "pv": [[10, 0], [10, 1]],
+                           "pv_len": 2, "pv_owners": ["P1", "P1"]}),
+    ))
+    mc = types.SimpleNamespace(graph_type="hex")
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
+    assert out["trajectory"][4]["missed_win"] == {
+        "by": "P1", "at_prefix": 3, "first_move": [10, 0],
+        "pv": [[10, 0], [10, 1]], "pv_len": 2, "pv_owners": ["P1", "P1"],
+    }
+
+
 def test_analyze_game_full_warm_trajectory_never_carries_stale_missed_win(monkeypatch):
     # The walk recomputes over the FULL merged trajectory every call and must
     # never trust a `missed_win` carried in `warm_trajectory` — simulate one

@@ -24,11 +24,14 @@ from hexo_a0.serving.model import make_graph_fn
 #                                  over depth=12 — the tail beyond it is flat)
 #
 # ANALYSIS_* is for single-position solves (the /analyze endpoint — the user
-# is looking at one position, so the rare 5.5s worst case is acceptable). Note
-# this is now BELOW live play's LIVE_DEPTH_CAP/LIVE_NODE_BUDGET (game.py) —
-# live play only solves once per bot decision, whereas analyze_game_full below
-# solves twice per prefix across a whole game and needs a much tighter budget
-# to stay bounded (see TRAJECTORY_*).
+# is looking at one position, so the rare 5.5s worst case is acceptable).
+# Note this is now ABOVE live play's LIVE_DEPTH_CAP/LIVE_NODE_BUDGET (game.py,
+# re-tuned 2026-07-04 to 10/20,000 from r=8 measurement showing deeper
+# budgets find nothing extra on real positions) — analysis affords the
+# richer budget because it solves once for a human looking at one position,
+# whereas analyze_game_full below solves twice per prefix across a whole
+# game and needs a much tighter budget to stay bounded (see TRAJECTORY_*,
+# which happens to land on the same depth/budget as live play's).
 ANALYSIS_DEPTH_CAP = 12
 ANALYSIS_NODE_BUDGET = 250_000
 # Per-prefix budget for analyze_game_full's forcing solves (run twice per
@@ -925,6 +928,25 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     # (trajectory[i + 1], matching classify_turn_quality's moves[i+1]
     # convention) with a ``missed_win`` dict carrying the squandered line.
     #
+    # Deviating from the proven `first_move` is not itself damning: X might
+    # play a DIFFERENT winning move on the same (turn-ending) placement, or
+    # keep the win alive as a threat into the opponent's reply. So rather than
+    # judging the single next entry, forward-scan from i + 1 to the first
+    # entry that can actually settle it:
+    #   (a) a terminal entry — exempt iff its winner is X (a draw counts as a
+    #       squandered win: draw is strictly worse than the win X held).
+    #   (b) an entry where X is to move again (mid-turn continuation at
+    #       i + 1 itself, or X's next turn after the opponent replies) —
+    #       exempt iff that entry still has a proven win for X (its
+    #       ``forcing`` has attacker_is_mover == True and winner == X).
+    # An opponent-to-move entry with attacker_is_mover == False and
+    # winner == X (X still holds the win as a THREAT, opponent to move) does
+    # NOT exempt by itself — it only defers the verdict to X's next
+    # to-move entry, which the scan reaches next. If the scan runs off the
+    # end of the trajectory without hitting (a) or (b) (game record ends
+    # non-terminal before X moves again), there isn't enough information to
+    # call it squandered — don't flag (conservative).
+    #
     # Recomputed over the FULL merged trajectory on every call — warm_trajectory
     # reuse above only ever copies MCTS/forcing/quality fields, never
     # missed_win, but strip any that leaked in from an earlier response
@@ -935,9 +957,9 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     # Accepted limitation: the ``forcing`` fields this walk reads were solved
     # at the tight TRAJECTORY_* budgets (far below live play's), so (a) a win
     # beyond that budget just never flags here (conservative, fine), and (b)
-    # rarely, an alternative winning move at i+1 may fail to re-prove within
-    # budget, so this walk reports a false-positive "missed" flag instead of
-    # recognizing the kept win (accepted).
+    # rarely, an alternative winning move at a scan point may fail to
+    # re-prove within budget, so this walk reports a false-positive "missed"
+    # flag instead of recognizing the kept win (accepted).
     for entry in trajectory:
         entry.pop("missed_win", None)
     for i in range(len(trajectory) - 1):
@@ -950,10 +972,19 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
         if played == tuple(forcing["first_move"]):
             continue  # on the proven line
         mover = forcing["winner"]
-        next_forcing = trajectory[i + 1].get("forcing")
-        if (next_forcing and next_forcing.get("attacker_is_mover")
-                and next_forcing.get("winner") == mover):
-            continue  # kept a proven win via an alternative move
+        exempt = None  # None = scan ran off the end -> conservative, no flag
+        for j in range(i + 1, len(trajectory)):
+            entry = trajectory[j]
+            if entry.get("terminal"):
+                exempt = entry.get("winner") == mover
+                break
+            if entry.get("current_player") == mover:
+                nf = entry.get("forcing")
+                exempt = bool(nf and nf.get("attacker_is_mover")
+                              and nf.get("winner") == mover)
+                break
+        if exempt is None or exempt:
+            continue  # inconclusive, or X kept/reclaimed the win — not missed
         trajectory[i + 1]["missed_win"] = {
             "by": mover,
             "at_prefix": i,

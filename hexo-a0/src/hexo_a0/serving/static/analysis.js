@@ -811,13 +811,19 @@ function updateForcingBanner(forcing) {
   }
   if (!forcing) { banner.hidden = true; banner.textContent = ""; return; }
   banner.hidden = false;
+  // attacker_is_mover=true is a PROVEN win (the side to move executes it).
+  // attacker_is_mover=false comes from a perspective-FLIP solve ("winner
+  // would win if it were their turn") — the actual side to move places
+  // first and may break it, so it is a threat to answer, NOT a lost
+  // position. Don't overstate it.
+  const defender = forcing.winner === "P1" ? "P2" : "P1";
   banner.textContent = forcing.attacker_is_mover
     ? `${forcing.winner} has a forced win (${forcing.pv_len}-move line)`
-    : `${forcing.winner} (opponent) has a forced win — this position is lost`;
-  // "win"/"loss" classes carry the colour (observatory.css); attacker_is_mover
-  // means it's good news for the side we're viewing the position from.
+    : `${forcing.winner} threatens a forced win — ${defender} must defend this turn`;
+  // "win"/"threat" classes carry the colour (observatory.css);
+  // attacker_is_mover means the win is proven, not merely threatened.
   banner.classList.toggle("win", forcing.attacker_is_mover);
-  banner.classList.toggle("loss", !forcing.attacker_is_mover);
+  banner.classList.toggle("threat", !forcing.attacker_is_mover);
 }
 
 function updateAnalysisTransform() {

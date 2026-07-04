@@ -10,6 +10,7 @@ import json
 import logging
 import random
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,13 +33,80 @@ DEFAULT_DIFFICULTY_SIMS: dict[str, int] = {
 }
 DEFAULT_DIFFICULTY = "standard"
 
-# Live-play forcing (VCF) search budgets. Post-9x-speedup these are sub-second
-# at live board sizes; the defensive check runs up to ~1+|PV| solves per bot
-# placement, so it gets the smaller budget.
-LIVE_DEPTH_CAP = 16
-LIVE_NODE_BUDGET = 2_000_000
-DEF_DEPTH_CAP = 10
-DEF_NODE_BUDGET = 200_000
+# Per-difficulty forcing-solver DEPTH cap (see LIVE_NODE_BUDGET/DEF_NODE_BUDGET
+# below for why node budgets stay flat while depth is the tier lever): all
+# tiers get the SAME honest forcing tactics (own-win execution + defense, see
+# `_play`), but a shallower depth cap means weaker tiers only catch shallow
+# mates and let deeper ones through, same as a human of that strength would.
+# "strong" gets the full measured budget (depth=10, p99 354ms/max 780ms at
+# r=8 — see the bench table below); "casual" only executes/blocks depth-2
+# (a single-move) mate.
+DEFAULT_DIFFICULTY_FORCING_DEPTH: dict[str, int] = {
+    "casual":   2,
+    "easy":     4,
+    "standard": 6,
+    "strong":  10,
+}
+
+# Live-play forcing (VCF) search NODE budgets, re-tuned 2026-07-04 from r=8
+# NN-guided-position measurement (the actual live config), replacing the
+# original from-first-principles 2_000_000 and 200_000 guesses:
+#
+#   depth/budget      p99 solve    max solve   win coverage
+#   16 / 2_000_000     10.4 s        15.9 s        22.5%
+#   12 /   250_000      2.5 s         8.6 s        22.5%
+#   10 /    20_000    354 ms       780 ms          23.5%  <- best coverage
+#
+# Deeper budgets find NOTHING extra on real positions (coverage is flat or
+# worse) while costing an order of magnitude more wall-clock — 20_000 wins on
+# both axes, for both the own-win solve and the defensive sweep. Node budget
+# stays FLAT across difficulty tiers (it's a search-efficiency cap, not a
+# strength lever); DEPTH is the per-tier lever (see
+# `DEFAULT_DIFFICULTY_FORCING_DEPTH` above and `_forcing_depth_for` below) —
+# `strong`'s depth (10) is exactly the depth this bench was measured at.
+LIVE_NODE_BUDGET = 20_000
+DEF_NODE_BUDGET = 20_000
+# Fallback depth cap for a difficulty tier missing from the map (defensive;
+# should be unreachable given DEFAULT_DIFFICULTY_FORCING_DEPTH covers every
+# DIFFICULTY_ORDER entry) — the "strong"/full-measured-budget depth.
+FALLBACK_FORCING_DEPTH = DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
+# Wall-clock backstop for the defensive candidate-verification loop (see
+# `_defensive_move`): even at the tuned budget above, a pathological position
+# could stack enough candidate re-solves to blow past a live turn's latency
+# budget, so bail out after this many seconds and use whatever killers/
+# survivors were verified so far.
+DEFENSE_DEADLINE_S = 3.0
+
+# Rate-limit for the "forcing check failed" exception log (see
+# `_log_forcing_exception`): a systematic bug would otherwise flood the log
+# with a full traceback on every bot placement.
+_FORCING_LOG_INTERVAL_S = 60.0
+_forcing_log_lock = threading.Lock()
+_last_forcing_log_ts = 0.0
+
+
+def _log_forcing_exception(game_id: str, exc: Exception) -> None:
+    """Log a live-play forcing-check failure, at most one full traceback per
+    `_FORCING_LOG_INTERVAL_S` module-wide; suppressed occurrences in between
+    still get a one-line warning so the signal isn't lost entirely, just
+    throttled. Must be called from within the `except` block that caught
+    `exc` (relies on the ambient exception context for `logger.exception`).
+    """
+    global _last_forcing_log_ts
+    now = time.monotonic()
+    with _forcing_log_lock:
+        emit_full = (now - _last_forcing_log_ts) >= _FORCING_LOG_INTERVAL_S
+        if emit_full:
+            _last_forcing_log_ts = now
+    if emit_full:
+        logger.exception(
+            "forcing check failed for game %s; falling back to MCTS", game_id,
+        )
+    else:
+        logger.warning(
+            "forcing check failed for game %s; falling back to MCTS: %s",
+            game_id, exc,
+        )
 
 
 def _now_utc() -> datetime:
@@ -117,8 +185,10 @@ def make_bot_turn_fn(
     m_actions: int,
     mcts_sims: int = 0,
     difficulty_sims: dict[str, int] | None = None,
+    difficulty_forcing_depth: dict[str, int] | None = None,
     guard: InferenceGuard,
     game_kwargs: dict,
+    live_forcing: bool = True,
 ):
     """Build a closure that runs a full bot turn under the inference guard.
 
@@ -128,6 +198,18 @@ def make_bot_turn_fn(
     needed to build hypothetical opponent-perspective positions for the
     defensive forcing check.
 
+    ``difficulty_forcing_depth`` (default ``None`` -> ``DEFAULT_DIFFICULTY_FORCING_DEPTH``)
+    maps ``rec.difficulty`` to the forcing solver's DEPTH cap, used for both the
+    own-win solve and the defensive solves (node budget stays flat across
+    tiers — see ``_forcing_depth_for``). Unlike ``difficulty_sims``, there is no
+    "off" state: forcing is always graded by tier, never flattened to a single
+    depth, since honesty of tactics (not depth) is what stays uniform.
+
+    ``live_forcing`` (default True) is a kill-switch: when False, `_forcing_move`
+    is never consulted and bot placements come exclusively from the pre-forcing-
+    feature MCTS/argmax path (`--no-live-forcing` on the CLI), byte-identical to
+    serving before this feature existed.
+
     The closure mutates ``rec.state`` and ``rec.move_log`` in place. Caller must
     already hold ``rec.lock``; the guard serializes the actual GPU work.
     """
@@ -135,6 +217,7 @@ def make_bot_turn_fn(
     from torch_geometric.data import Batch
     import hexo_rs as hr
 
+    forcing_depth_map = difficulty_forcing_depth or DEFAULT_DIFFICULTY_FORCING_DEPTH
     graph_fn = make_graph_fn(model_config)
 
     def _eval_fn(states):
@@ -215,18 +298,28 @@ def make_bot_turn_fn(
         # Raw argmax fallback (mcts_sims == 0).
         return _policy_argmax(state)
 
-    def _defensive_move(rec: GameRecord, legal: set):
+    def _forcing_depth_for(rec: GameRecord) -> int:
+        return forcing_depth_map.get(
+            rec.difficulty,
+            forcing_depth_map.get(DEFAULT_DIFFICULTY, FALLBACK_FORCING_DEPTH),
+        )
+
+    def _defensive_move(rec: GameRecord, legal: set, depth_cap: int):
         """Step 3: pre-emptive VCF defense, run only when the bot has no own
         forced win. Exploits monotonicity: the bot's stones only remove
         opponent threat cells, so "no VCF for the opponent right now
         (hypothetically to move)" implies "none at their next turn start"
         either — safe to fall through to normal MCTS in that case.
+
+        ``depth_cap`` is the per-difficulty forcing depth (see
+        ``_forcing_depth_for``), shared with the own-win solve in
+        ``_forcing_move`` — the SAME tier sees the SAME depth on both sides.
         """
         state = rec.state
         opp = "P1" if rec.bot_side == "P2" else "P2"
         cfg = hr.GameConfig(**game_kwargs)
         opp_state = hr.GameState.from_state(state.placed_stones(), opp, 2, cfg)
-        opp_win = hr.solve_forcing(opp_state, DEF_DEPTH_CAP, DEF_NODE_BUDGET)
+        opp_win = hr.solve_forcing(opp_state, depth_cap, DEF_NODE_BUDGET)
         if opp_win is None:
             return None
 
@@ -243,18 +336,27 @@ def make_bot_turn_fn(
 
         killers = []
         survivors = []  # (cell, surviving PV length) — delay/disruption proxy
+        t0 = time.monotonic()
         for c in candidates:
+            if time.monotonic() - t0 > DEFENSE_DEADLINE_S:
+                # Wall-clock backstop: stop verifying further candidates and
+                # use whatever killers/survivors were found so far (unverified
+                # candidates are simply not considered this placement).
+                break
             trial = state.clone()
             trial.apply_move(*c)
             if trial.is_terminal():
-                # The placer can only WIN by placing (the engine has no
-                # self-loss rule), so a terminal trial means this cell
-                # completes a bot win — play it outright. Also keeps the
-                # from_state call below on its documented non-terminal-only
-                # contract.
+                # A terminal trial is either a bot win (the engine has no
+                # self-loss rule, so completing wl-in-a-row here is the only
+                # way the BOT ends the game by placing) or a max_moves draw —
+                # either way it's strictly better than letting the opponent's
+                # VCF stand (draw > loss, win > loss), so playing it outright
+                # is correct without needing the survivor/killer comparison
+                # below. Also keeps the from_state call below on its
+                # documented non-terminal-only contract.
                 return c
             trial_opp = hr.GameState.from_state(trial.placed_stones(), opp, 2, cfg)
-            re_res = hr.solve_forcing(trial_opp, DEF_DEPTH_CAP, DEF_NODE_BUDGET)
+            re_res = hr.solve_forcing(trial_opp, depth_cap, DEF_NODE_BUDGET)
             if re_res is None:
                 killers.append(c)
             else:
@@ -262,6 +364,10 @@ def make_bot_turn_fn(
 
         if killers:
             return _policy_argmax(state, restrict_to=set(killers))
+        if not survivors:
+            # Deadline hit before any candidate could be verified: fall
+            # through to MCTS, same as the no-candidate path above.
+            return None
         # No killer this placement: play the survivor with the longest
         # surviving PV (max delay). The next placement re-runs this whole
         # check, giving the pair a second chance to kill the win.
@@ -275,6 +381,7 @@ def make_bot_turn_fn(
         """
         state = rec.state
         legal = {tuple(c) for c in state.legal_moves()}
+        depth_cap = _forcing_depth_for(rec)
 
         # 1. PV-cache replay: if the opponent has followed the cached forced
         # line so far, play the next PV move without calling the solver.
@@ -289,8 +396,8 @@ def make_bot_turn_fn(
             # Deviation (or an exhausted/stale cache): re-solve from scratch.
             rec.forcing_pv = None
 
-        # 2. Own-win solve.
-        res = hr.solve_forcing(state, LIVE_DEPTH_CAP, LIVE_NODE_BUDGET)
+        # 2. Own-win solve, at this tier's forcing depth.
+        res = hr.solve_forcing(state, depth_cap, LIVE_NODE_BUDGET)
         if res is not None:
             first_move, pv = res
             first_move = tuple(first_move)
@@ -304,7 +411,7 @@ def make_bot_turn_fn(
             )
 
         # 3. Defensive pre-emptive check (only when step 2 found nothing).
-        return _defensive_move(rec, legal)
+        return _defensive_move(rec, legal, depth_cap)
 
     def _sims_for(rec: GameRecord) -> int:
         if difficulty_sims is None:
@@ -323,15 +430,19 @@ def make_bot_turn_fn(
                     return
                 if rec.state.current_player() != rec.bot_side:
                     return
-                try:
-                    move = _forcing_move(rec)
-                except Exception:
-                    # The solver must never take down live play.
-                    logger.exception(
-                        "forcing check failed for game %s; falling back to MCTS",
-                        rec.game_id,
-                    )
-                    move = None
+                move = None
+                # All difficulty tiers get forcing (win execution + defense) —
+                # deliberately never OFF for weaker tiers: what varies is HOW
+                # DEEP each tier's forcing search reaches (`_forcing_depth_for`,
+                # graded like sim count) and how many sims back up MCTS, not
+                # whether a tier is allowed to notice a forced win at all.
+                if live_forcing:
+                    try:
+                        move = _forcing_move(rec)
+                    except Exception as e:
+                        # The solver must never take down live play.
+                        _log_forcing_exception(rec.game_id, e)
+                        move = None
                 q, r = move if move is not None else _pick_move(rec.state, sims)
                 rec.state.apply_move(q, r)
                 rec.move_log.append((q, r, rec.bot_side))

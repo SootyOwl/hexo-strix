@@ -1200,7 +1200,9 @@ def run(cfg, analyze_ctx: AnalyzeContext | None = None):
     ``cfg`` is any object exposing the attributes listed in the plan:
     config, checkpoint, win_length, placement_radius, max_moves,
     mcts_sims, m_actions, db, port, bind, url_prefix, admin_token,
-    model_label, difficulty_sims, default_difficulty, request_timeout.
+    model_label, difficulty_sims, default_difficulty, request_timeout,
+    live_forcing (optional, defaults to True), difficulty_forcing_depth
+    (optional, defaults to game.py's DEFAULT_DIFFICULTY_FORCING_DEPTH).
 
     The advisory flock on ``<db>.lock`` prevents two ``hexo-a0 serve``
     processes from sharing the same SQLite DB. It does NOT protect against
@@ -1264,8 +1266,13 @@ def _serve(cfg, analyze_ctx):
         model=model, model_config=mc,
         mcts_sims=cfg.mcts_sims, m_actions=cfg.m_actions,
         difficulty_sims=difficulty_sims,
+        # No CLI knob for this (yet): every tier's forcing depth comes from
+        # game.py's measured DEFAULT_DIFFICULTY_FORCING_DEPTH map unless a
+        # caller-built cfg opts into a custom one.
+        difficulty_forcing_depth=getattr(cfg, "difficulty_forcing_depth", None),
         guard=guard,
         game_kwargs=game_kwargs,
+        live_forcing=getattr(cfg, "live_forcing", True),
     )
     mgr = GameManager(
         game_kwargs=game_kwargs,
