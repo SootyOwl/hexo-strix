@@ -249,6 +249,11 @@ def main(argv=None):
                               help="Difficulty served when /new_game omits the field")
     serve_parser.add_argument("--request-timeout", type=int, default=60,
                               help="Socket/request timeout in seconds")
+    serve_parser.add_argument("--inference-workers", type=int, default=2,
+                              help="Concurrent inference slots shared by the bot and the "
+                                   "analysis endpoints. The server runs the model on CPU, so "
+                                   ">1 lets a side-line /analyze run while the bot thinks; "
+                                   "torch intra-op threads are capped to cores/workers.")
     serve_parser.add_argument("--no-live-forcing", dest="live_forcing",
                               action="store_false", default=True,
                               help="Disable the live VCF forcing solver (win execution + "

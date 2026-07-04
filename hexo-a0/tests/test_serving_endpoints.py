@@ -44,6 +44,48 @@ def test_trajectory_rejects_overlong():
     assert status == 400
 
 
+def test_analyze_busy_waits_up_to_timeout_then_503():
+    """/analyze must wait briefly for the guard (so side-line clicks queue
+    behind a running inference) and only 503 once the bounded wait expires."""
+    import threading
+    import time
+    from hexo_a0.serving.app import AnalyzeContext, handle_analyze
+    from hexo_a0.serving.inference import InferenceGuard
+
+    g = InferenceGuard()
+    ctx = AnalyzeContext(object(), object(), g,
+                         win_length=6, placement_radius=8, max_moves=400,
+                         analyze_wait_timeout=0.05)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hog():
+        held.set()
+        release.wait()
+        return 1
+
+    t = threading.Thread(target=lambda: g.run(hog))
+    t.start()
+    held.wait()
+    try:
+        t0 = time.perf_counter()
+        status, body = handle_analyze({"moves": [[0, 0]]}, ctx)
+        waited = time.perf_counter() - t0
+        assert status == 503
+        assert "busy" in body["error"]
+        assert waited >= 0.04  # bounded wait, not fail-fast
+    finally:
+        release.set()
+        t.join()
+
+
+def test_serve_has_inference_workers_flag(capsys):
+    with pytest.raises(SystemExit):
+        from hexo_a0 import cli
+        cli.main(["serve", "--help"])
+    assert "inference-workers" in capsys.readouterr().out
+
+
 @pytest.mark.skipif(not os.path.exists(CKPT), reason="ckpt absent")
 def test_analyze_returns_candidate_set():
     from hexo_a0.serving.app import AnalyzeContext, handle_analyze

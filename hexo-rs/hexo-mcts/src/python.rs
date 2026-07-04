@@ -1633,14 +1633,23 @@ fn py_augment_axis_states_to_batch_bytes(
 #[pyfunction]
 #[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000))]
 fn solve_forcing(
+    py: Python<'_>,
     state: &PyGameState,
     depth_cap: u8,
     node_budget: u64,
 ) -> Option<((i32, i32), Vec<(i32, i32)>)> {
-    match crate::mcts::forcing::solve(&state.inner, depth_cap, node_budget) {
-        crate::mcts::forcing::Outcome::Win(w) => Some((w.first_move, w.pv)),
-        crate::mcts::forcing::Outcome::No | crate::mcts::forcing::Outcome::BudgetExceeded => None,
-    }
+    // Clone the state and release the GIL: a budget-bound solve runs for
+    // seconds, and holding the GIL would freeze every other Python thread in
+    // the process (the play server calls this from HTTP handler threads).
+    let inner = state.inner.clone();
+    py.detach(
+        move || match crate::mcts::forcing::solve(&inner, depth_cap, node_budget) {
+            crate::mcts::forcing::Outcome::Win(w) => Some((w.first_move, w.pv)),
+            crate::mcts::forcing::Outcome::No | crate::mcts::forcing::Outcome::BudgetExceeded => {
+                None
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -337,7 +337,8 @@ def test_cache_control_no_store_on_responses():
 
 
 def test_inference_busy_returns_503():
-    # When the shared guard is held (bot thinking), analysis non-blocking → 503.
+    # When the shared guard stays saturated past the bounded wait (bot
+    # thinking), analysis → 503.
     from types import SimpleNamespace
     import threading as _t
     from hexo_a0.serving.app import handle_analyze
@@ -355,7 +356,8 @@ def test_inference_busy_returns_503():
     th.start()
     held.wait()
     try:
-        ctx = SimpleNamespace(guard=g, max_analyze_moves=220)
+        ctx = SimpleNamespace(guard=g, max_analyze_moves=220,
+                              analyze_wait_timeout=0.05)
         status, body = handle_analyze({"moves": [[0, 0], [1, 0]]}, ctx=ctx)
         assert status == 503
         assert "busy" in body["error"]

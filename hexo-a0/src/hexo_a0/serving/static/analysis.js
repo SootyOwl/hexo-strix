@@ -871,7 +871,7 @@ async function branchFrom(node, q, r) {
       body: JSON.stringify({moves}),
     });
     const r2 = await resp.json();
-    if (!resp.ok) { info.textContent = r2.error || resp.statusText; return; }
+    if (!resp.ok) { discardSideLine(node, child, r2.error || resp.statusText); return; }
     // /analyze returns the position AFTER the move; carry current_player + value.
     child.result = r2;
     // If this move completed a turn, judge it (best/good/mistake/blunder) just
@@ -879,8 +879,23 @@ async function branchFrom(node, q, r) {
     await attachSideLineVerdict(child);
     if (analysisCurrent === child) { renderNode(child); renderMoveTree(); }
   } catch (e) {
-    info.textContent = `Network error: ${e}`;
+    discardSideLine(node, child, `Network error: ${e}`);
   }
+}
+
+// A failed /analyze must not leave `child` in the tree: branchFrom's
+// existing-child early-exit would then forever navigate to a node that renders
+// nothing (result=null) and never re-fetch — the "stuck side line". Drop the
+// placeholder and step back so re-clicking the cell retries from scratch.
+function discardSideLine(parent, child, message) {
+  const i = parent.children.indexOf(child);
+  if (i >= 0) parent.children.splice(i, 1);
+  if (analysisCurrent === child) setCurrent(parent);
+  else renderMoveTree();
+  // After setCurrent repaints the parent's info line, surface why the side
+  // line vanished.
+  const info = document.getElementById("analysis-info");
+  if (info) info.textContent = message;
 }
 
 // --- PGN-style move tree rendering -----------------------------------------

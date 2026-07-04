@@ -324,17 +324,19 @@ class AnalyzeContext:
     """Container for the analysis endpoints' model + game rules + inference guard.
 
     In ``run()`` the ``guard`` MUST be the same instance the bot uses so
-    analysis and bot play share one serializing lock (analysis is non-blocking
-    → 503 while the bot is thinking). ``from_checkpoint`` builds its OWN guard
-    and is intended for standalone analysis (no bot running) — do NOT wire it
-    into ``run()`` alongside a bot, or the two will oversubscribe the GPU.
+    analysis and bot play share one inference cap (analysis waits up to
+    ``analyze_wait_timeout`` seconds for a slot → 503 only if the guard stays
+    saturated). ``from_checkpoint`` builds its OWN guard and is intended for
+    standalone analysis (no bot running) — do NOT wire it into ``run()``
+    alongside a bot, or the two will oversubscribe the inference budget.
     """
 
     def __init__(self, model, model_config, guard: InferenceGuard,
                  win_length: int, placement_radius: int, max_moves: int,
                  max_analyze_moves: int = 220, mcts_sims: int = 64, m_actions: int = 16,
                  cache_size: int = 4096, model_id: str | None = None,
-                 cache_db_path: str | None = None):
+                 cache_db_path: str | None = None,
+                 analyze_wait_timeout: float = 8.0):
         self.model = model
         self.model_config = model_config
         self.guard = guard
@@ -344,6 +346,10 @@ class AnalyzeContext:
         self.max_analyze_moves = max_analyze_moves
         self.mcts_sims = mcts_sims
         self.m_actions = m_actions
+        # How long /analyze and /analyze_trajectory wait for a guard slot
+        # before 503ing. Bounded (not infinite) so a stampede can't pile
+        # threads up behind a long solve indefinitely.
+        self.analyze_wait_timeout = analyze_wait_timeout
         # Serializes full-game analysis jobs across sessions (only one at a time);
         # a second /analyze_game streams `queued` events while blocked on this.
         self._job_lock = threading.Lock()
@@ -534,7 +540,7 @@ def handle_analyze(payload: dict, ctx: AnalyzeContext) -> tuple[int, dict]:
         return result.to_json()
 
     try:
-        body = ctx.guard.run(_infer, blocking=False)
+        body = ctx.guard.run(_infer, timeout=ctx.analyze_wait_timeout)
     except InferenceBusy:
         return 503, {"error": "analysis busy — another inference is in flight"}
     except ValueError as e:
@@ -563,7 +569,7 @@ def handle_trajectory(payload: dict, ctx: AnalyzeContext) -> tuple[int, dict]:
         )
 
     try:
-        body = ctx.guard.run(_infer, blocking=False)
+        body = ctx.guard.run(_infer, timeout=ctx.analyze_wait_timeout)
     except InferenceBusy:
         return 503, {"error": "analysis busy — another inference is in flight"}
     except ValueError as e:
@@ -1245,7 +1251,12 @@ def _serve(cfg, analyze_ctx):
     model, mc, ckpt = load_model(cfg.checkpoint, "cpu",
                                  model_config_dict=_model_config_fallback(cfg))
 
-    guard = InferenceGuard()
+    # CPU inference: N slots let analysis run beside the bot instead of 503ing.
+    # Cap torch's intra-op threads so N concurrent forward passes don't
+    # oversubscribe the cores (torch defaults to using all of them per op).
+    inference_workers = max(1, getattr(cfg, "inference_workers", 2))
+    torch.set_num_threads(max(1, (os.cpu_count() or 8) // inference_workers))
+    guard = InferenceGuard(capacity=inference_workers)
     recorder = Recorder(cfg.db)
     difficulty_sims = _parse_difficulty_sims(cfg.difficulty_sims)
     if cfg.default_difficulty not in difficulty_sims:
