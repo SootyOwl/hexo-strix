@@ -1208,6 +1208,34 @@ fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Playe
     None
 }
 
+/// The defender's cosmetic 2-cell reply for a `B >= 3` (futile, unstoppable) position:
+/// no 2-cell block can change the verdict, but `extract_pv` still needs a legal-looking
+/// pair to keep the PV an alternating line. Rather than an arbitrary canonical-order
+/// pair (which can land both cells on the same threat and read as a redundant
+/// non-defense), greedily pick the pair that blocks the most: c1 is the cell hitting
+/// (a member of) the most completions, c2 the cell hitting the most completions NOT
+/// already hit by c1. Deterministic — ties broken by total-hit count then canonical
+/// cell order, never iteration order (see module determinism notes).
+fn futile_defender_pair(comps: &[CellSet2]) -> CellSet2 {
+    let mut cells: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let degree = |c: Coord| comps.iter().filter(|s| s.cells().contains(&c)).count();
+    let c1 = *cells
+        .iter()
+        .max_by_key(|&&c| (degree(c), std::cmp::Reverse(c)))
+        .expect("futile branch only reached with >= 1 completion");
+    let c2 = *cells
+        .iter()
+        .filter(|&&c| c != c1)
+        .max_by_key(|&&c| {
+            let new_hits = comps.iter().filter(|s| !s.cells().contains(&c1) && s.cells().contains(&c)).count();
+            (new_hits, degree(c), std::cmp::Reverse(c))
+        })
+        .expect("B >= 3 implies a minimum hitting set of size >= 3, so >= 2 distinct cells exist");
+    CellSet2::two(c1, c2)
+}
+
 /// Port of principal_variation: returns the flat placement sequence of one winning line
 /// (attacker turns interleaved with prolonging defender covers), ending in six-in-a-row.
 fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
@@ -1242,9 +1270,8 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
         let (bnum, covers) = min_covers2(&comps);
         if bnum >= 3 {
             // defender blocks two threat cells (futile), attacker completes next loop
-            let mut cells: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
-            cells.sort_unstable(); cells.dedup();
-            for &c in cells.iter().take(2) { board.place(c, defender); pv.push(c); }
+            let pair = futile_defender_pair(&comps);
+            for &c in pair.cells() { board.place(c, defender); pv.push(c); }
             remaining = remaining.saturating_sub(1);
             continue;
         }
@@ -1307,6 +1334,102 @@ mod tests {
             CellSet2::two((-1, 0), (5, 0)),
         ]);
         assert!(!covers.contains(&CellSet2::two((-2, 0), (5, 0)))); // misses the straddle
+    }
+
+    /// The B >= 3 (futile) branch of `extract_pv` still needs a 2-cell defender
+    /// reply to keep the PV alternating, even though no block changes the verdict.
+    /// The naive canonical-order-first-two choice (`(-2,0),(-1,0)`) hits only the
+    /// left two completions (`c0`, `c1`) and never reaches the straddle's far side
+    /// (`c2`) or the independent threat (`c3`) — exactly the "drifts to a corner"
+    /// look reported on the analysis board. The greedy max-coverage pair instead
+    /// spans the shared straddle cells and hits ALL THREE open-four completions.
+    #[test]
+    fn futile_defender_pair_prefers_max_coverage_over_canonical_order() {
+        let comps = vec![
+            CellSet2::two((-2, 0), (-1, 0)), // c0
+            CellSet2::two((-1, 0), (4, 0)),  // c1 (straddle)
+            CellSet2::two((4, 0), (5, 0)),   // c2
+            CellSet2::two((0, 4), (0, 5)),   // c3: independent, disjoint threat
+        ];
+        assert_eq!(min_covers2(&comps).0, 3, "test fixture must actually be B >= 3");
+
+        // The naive canonical-order-first-two pair the old code used.
+        let mut canonical: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
+        canonical.sort_unstable();
+        canonical.dedup();
+        let canonical_pair = CellSet2::two(canonical[0], canonical[1]);
+        assert_eq!(canonical_pair, CellSet2::two((-2, 0), (-1, 0)));
+        let canonical_hits = comps.iter().filter(|c| c.cells().iter().any(|x| canonical_pair.cells().contains(x))).count();
+        assert_eq!(canonical_hits, 2, "canonical pair only reaches c0 and c1, missing c2 and c3");
+
+        let greedy = futile_defender_pair(&comps);
+        assert_eq!(greedy, CellSet2::two((-1, 0), (4, 0)));
+        assert_ne!(greedy, canonical_pair, "greedy must differ from the naive canonical pair here");
+        let greedy_hits = comps.iter().filter(|c| c.cells().iter().any(|x| greedy.cells().contains(x))).count();
+        assert_eq!(greedy_hits, 3, "greedy pair hits 3 distinct completions, not just 1");
+        assert!(greedy_hits >= 2);
+    }
+
+    /// End-to-end: a real board reaching the `B >= 3` futile branch through the
+    /// public `solve()` path, with an asymmetric block (`(-1,0)`) so the fork is
+    /// deterministic instead of the fully-symmetric double-four in
+    /// `solve_from_gamestate_returns_pv_that_wins`. After the fork move
+    /// `(0,-1),(3,0)`, the r-axis run is a genuine open four (3 completions,
+    /// B=2) and the q-axis run is closed on the left (1 completion, B=1) —
+    /// combined B=3. The naive canonical-order-first-two defender pair would be
+    /// `(0,-3),(0,-2)`, hitting only 2 of the 4 completions and leaving the
+    /// r-axis straddle's far side alive; the greedy pair spans the straddle
+    /// (`(0,-2),(0,3)`) and kills the WHOLE r-axis open four (3 completions),
+    /// forcing the finishing move onto the independent q-axis threat.
+    #[test]
+    fn futile_pv_pair_is_greedy_not_canonical_on_real_board() {
+        use hexo_engine::game::{GameState, GameConfig};
+        let mut stones: Vec<(Coord, Player)> = [(0,0),(1,0),(2,0),(0,1),(0,2)]
+            .into_iter().map(|c| (c, Player::P1)).collect();
+        stones.push(((-1, 0), Player::P2));
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+        let w = match solve(&game, 40, 5_000_000) {
+            Outcome::Win(w) => w,
+            _ => panic!("expected a forced win"),
+        };
+        assert_eq!(w.depth, 2);
+        assert_eq!(w.pv.first(), Some(&w.first_move));
+        assert_eq!(w.pv.len(), 6, "fork(2) + futile defender pair(2) + completion(2)");
+
+        // Reconstruct the board exactly as extract_pv sees it right after the
+        // fork move, to compute the greedy expectation independently of the
+        // production code path (same helper, real completions() call).
+        let mut b = SolverBoard::new();
+        for &(c, p) in &stones { b.place(c, p); }
+        for &c in &w.pv[..2] { b.place(c, Player::P1); }
+        let comps = completions(&b, Player::P1, 6, 8);
+        assert_eq!(min_covers2(&comps).0, 3, "must actually be the B >= 3 futile branch");
+        let expected = futile_defender_pair(&comps);
+        assert_eq!(
+            CellSet2::two(w.pv[2], w.pv[3]), expected,
+            "emitted futile pair must equal the greedy max-coverage expectation"
+        );
+        let hits = comps.iter()
+            .filter(|comp| comp.cells().iter().any(|x| expected.cells().contains(x)))
+            .count();
+        assert!(hits >= 2, "futile pair must hit >= 2 distinct completions, hit {hits}");
+        assert_eq!(hits, 3, "greedy pair kills the entire open-four axis (3 of 4 completions)");
+
+        // The naive canonical-order pair the old code used is a strictly worse,
+        // more redundant-looking choice — pin it as a regression guard.
+        let mut canonical: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
+        canonical.sort_unstable(); canonical.dedup();
+        let canonical_pair = CellSet2::two(canonical[0], canonical[1]);
+        assert_ne!(expected, canonical_pair, "greedy must differ from the naive canonical pair here");
+
+        // Replay the PV through the real engine end to end (legality + verdict).
+        let mut g = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+        for &c in &w.pv {
+            assert!(!g.is_terminal(), "PV continues after the game ended");
+            g.apply_move(c).expect("every PV move must be legal");
+        }
+        assert!(g.is_terminal());
+        assert_eq!(g.winner(), Some(Player::P1));
     }
 
     #[test]
