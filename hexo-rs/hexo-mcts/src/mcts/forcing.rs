@@ -20,11 +20,25 @@ use hexo_engine::hex::{hex_distance as hex_dist, hex_offsets};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// Research-only search cutoffs threaded into `SearchState` (`idtt` prover driver
+/// + portfolio racing). The production default is `Limits::default()` (both
+/// `None`), which makes `tick` behave byte-for-byte as before. `deadline` is a
+/// wall-clock cutoff; `cancel`, when set by a racing thread, cooperatively stops
+/// this search. Both are sampled sparsely so `Instant::now()`/atomic loads never
+/// dominate the ~10µs/node hot path.
+#[derive(Clone, Default)]
+pub(crate) struct Limits {
+    pub deadline: Option<Instant>,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
 
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 /// Max supported win_length: strip-scan buffers are stack arrays of 2*MAX_WL-1.
-const MAX_WL: usize = 16;
+pub(crate) const MAX_WL: usize = 16;
 const STRIP: usize = 2 * MAX_WL - 1;
 /// Grid border padding kept around every stone. Must be >= any tight-regime
 /// radius (which is < win_length - 1 <= MAX_WL - 1) so that reach-count updates
@@ -68,7 +82,7 @@ fn pcode(p: Player) -> u8 {
 /// cover, or an attacker move (1 or 2 placements; the sorted order is also the
 /// placement order, matching the old normalized-(min,max) convention).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct CellSet2 {
+pub(crate) struct CellSet2 {
     len: u8,
     cells: [Coord; 2],
 }
@@ -122,7 +136,7 @@ impl CellSet2 {
 /// Mutable board for make/unmake search — dense grid + stone list, no per-node
 /// clone. Cells outside the grid are empty by construction (the grid always
 /// covers every stone with `GRID_PAD` slack).
-struct SolverBoard {
+pub(crate) struct SolverBoard {
     grid: Vec<u8>, // 0 empty, 1 P1, 2 P2
     /// Per-cell count of stones within `reach_radius` (tight regime only).
     reach: Vec<u16>,
@@ -421,7 +435,7 @@ fn scan_windows(
 
 /// Enemy-free length-wl windows through `player`'s stones holding >= wl-2 of them,
 /// each returned as its (sorted) gap-cell set of size 1 or 2. Sorted + deduped.
-fn completions(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> Vec<CellSet2> {
+pub(crate) fn completions(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> Vec<CellSet2> {
     let l = wl as i32;
     let mut out: Vec<CellSet2> = Vec::new();
     scan_windows(board, player, wl, radius, l - 2, l - 1, &mut |_, _, _, empties| {
@@ -721,7 +735,7 @@ fn min_hit_slice(alive: Vec<CellSet2>, cap: u8) -> u8 {
 
 /// (B capped at 3, all size-B covers for B <= 2; empty for B >= 3 — the search
 /// never uses covers there: B >= 3 is an immediate attacker win).
-fn min_covers2(comps: &[CellSet2]) -> (u8, Vec<CellSet2>) {
+pub(crate) fn min_covers2(comps: &[CellSet2]) -> (u8, Vec<CellSet2>) {
     let mut covers = Vec::new();
     let b = min_covers_capped(comps, Some(&mut covers));
     (b, covers)
@@ -805,7 +819,7 @@ fn attacker_turns(
 }
 
 /// See `attacker_turns`; takes precomputed defender completions.
-fn attacker_turns_with(
+pub(crate) fn attacker_turns_with(
     board: &SolverBoard,
     attacker: Player,
     placements: u8,
@@ -955,6 +969,9 @@ struct SearchState {
     /// the lifetime of a single search, so the gencache/tt keys need no extra
     /// dimension for it.
     wide: bool,
+    /// Research-only wall-clock deadline + cooperative cancel (see `Limits`). The
+    /// production default is empty, making `tick` byte-identical to before.
+    limits: Limits,
 }
 
 impl SearchState {
@@ -971,13 +988,30 @@ impl SearchState {
             atk,
             dfn,
             wide,
+            limits: Limits::default(),
         }
     }
 }
 
 fn tick(s: &mut SearchState) -> bool {
     s.nodes += 1;
-    if s.nodes > s.budget { s.exceeded = true; }
+    if s.nodes > s.budget {
+        s.exceeded = true;
+    } else if (s.limits.deadline.is_some() || s.limits.cancel.is_some()) && s.nodes & 0x1FFF == 0 {
+        // Sample clock/atomic sparsely so they never dominate the ~10µs/node hot
+        // path. Only reachable when a limit is set (research prover); production
+        // callers pass `Limits::default()` and skip this branch entirely.
+        if let Some(dl) = s.limits.deadline
+            && Instant::now() >= dl
+        {
+            s.exceeded = true;
+        }
+        if let Some(c) = &s.limits.cancel
+            && c.load(Ordering::Relaxed)
+        {
+            s.exceeded = true;
+        }
+    }
     s.exceeded
 }
 
@@ -1072,14 +1106,16 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
 #[cfg(test)]
 fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
                   placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64) -> SolveResult {
-    solve_from_ex(board, attacker, defender, placements_remaining, wl, radius, depth_cap, node_budget, false)
+    solve_from_ex(board, attacker, defender, placements_remaining, wl, radius, depth_cap, node_budget, false, Limits::default())
 }
 
 /// See `solve_from`; `wide` gates the experimental wide-partner-width knob (see
-/// `wide_partner_cells`) — false reproduces `solve_from` exactly.
+/// `wide_partner_cells`) — false reproduces `solve_from` exactly. `limits` are
+/// research-only cutoffs (`Limits::default()` for every production caller —
+/// identical behaviour to before).
 fn solve_from_ex(board: &mut SolverBoard, attacker: Player, defender: Player,
                   placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64,
-                  wide: bool) -> SolveResult {
+                  wide: bool, limits: Limits) -> SolveResult {
     // The strip-scan buffers are stack-sized for win_length in 1..=MAX_WL; any
     // other config cannot be analyzed — report an honest give-up, never a bogus `No`.
     if !(1..=MAX_WL).contains(&(wl as usize)) {
@@ -1094,6 +1130,7 @@ fn solve_from_ex(board: &mut SolverBoard, attacker: Player, defender: Player,
         return SolveResult::No;
     }
     let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
+    s.limits = limits;
     for depth in 1..=depth_cap {
         let (won, cut) = atk_within(board, placements_remaining, depth, &mut s);
         if won { return SolveResult::Win { depth }; }
@@ -1109,7 +1146,20 @@ pub struct ForcingWin { pub depth: u8, pub first_move: Coord, pub pv: Vec<Coord>
 pub enum Outcome { Win(ForcingWin), No, BudgetExceeded }
 
 pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
-    solve_ex(game, depth_cap, node_budget, false)
+    solve_ex(game, depth_cap, node_budget, false, Limits::default())
+}
+
+/// `solve` with research-only cutoffs (the prover `idtt` driver + portfolio
+/// racing). `Limits::default()` is exactly `solve`. `pub(crate)`: no new public
+/// API surface.
+pub(crate) fn solve_limited(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+) -> Outcome {
+    solve_ex(game, depth_cap, node_budget, wide, limits)
 }
 
 /// EXPERIMENTAL: `solve` with the wide-partner-width knob (see `wide_partner_cells`)
@@ -1118,12 +1168,13 @@ pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
 /// and iterative-deepening) depth, and previously-No/BudgetExceeded positions may
 /// newly resolve to Win. Not used by any production caller; for diagnostics only.
 pub fn solve_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
-    solve_ex(game, depth_cap, node_budget, true)
+    solve_ex(game, depth_cap, node_budget, true, Limits::default())
 }
 
 /// See `solve`; `wide` gates the experimental wide-partner-width knob. false
-/// reproduces `solve` exactly.
-fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool) -> Outcome {
+/// reproduces `solve` exactly. `limits` are research-only cutoffs
+/// (`Limits::default()` for all production callers — identical behaviour).
+fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool, limits: Limits) -> Outcome {
     let attacker = match game.current_player() { Some(p) => p, None => return Outcome::No };
     let defender = attacker.opponent();
     let wl = game.config().win_length;
@@ -1168,7 +1219,7 @@ fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool) -> Ou
     // derived list (completions, hot cells, partners, moves) being sorted —
     // do not let stone/scan order leak into tie-breaking.
     for (&c, &p) in game.stones() { board.place(c, p); }
-    match solve_from_ex(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget, wide) {
+    match solve_from_ex(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget, wide, limits) {
         SolveResult::No => Outcome::No,
         SolveResult::BudgetExceeded => Outcome::BudgetExceeded,
         SolveResult::Win { depth } => {
@@ -1217,7 +1268,7 @@ fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Playe
 /// (a member of) the most completions, c2 the cell hitting the most completions NOT
 /// already hit by c1. Deterministic — ties broken by total-hit count then canonical
 /// cell order, never iteration order (see module determinism notes).
-fn futile_defender_pair(comps: &[CellSet2]) -> CellSet2 {
+pub(crate) fn futile_defender_pair(comps: &[CellSet2]) -> CellSet2 {
     let mut cells: Vec<Coord> = comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
     cells.sort_unstable();
     cells.dedup();
@@ -1844,7 +1895,7 @@ mod tests {
     fn wide_is_superset_same_depth_on_mate_in_two_fork() {
         let mut b = line(&[(0,0),(1,0),(2,0),(0,1),(0,2)], Player::P1);
         assert!(matches!(
-            solve_from_ex(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000, true),
+            solve_from_ex(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000, true, Limits::default()),
             SolveResult::Win { depth: 2 }
         ));
     }

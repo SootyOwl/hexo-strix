@@ -6,6 +6,7 @@ pub mod graph_tensors;
 pub mod inference;
 pub mod inference_subprocess;
 pub mod mcts;
+pub mod prover;
 #[cfg(feature = "python")]
 mod python;
 
