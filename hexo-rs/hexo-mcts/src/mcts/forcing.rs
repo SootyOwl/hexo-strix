@@ -755,7 +755,41 @@ fn any_four_gate(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> 
     found
 }
 
-/// Forcing attacker turns (B >= 2 after the move), best-first by B.
+/// EXPERIMENTAL (off by default): empty cells within `wl-1` steps along a WIN_AXES
+/// direction (either sign) of any attacker stone. A superset of the hot cells that
+/// also admits quiet build stones one step off an existing line — needed for "force
+/// with one stone, quietly build with the other" attacker turns (a fresh threat that
+/// only pays off a move or two later). Port of the Python prototype's
+/// `_wide_partners` (scripts/forcing_search_prototype.py:21-34). Respects the same
+/// radius-legality filtering as other generated cells (`scan_windows`'s `enforce`
+/// gate), so a wide cell the attacker could not legally play never reaches the
+/// partner set.
+fn wide_partner_cells(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> Vec<Coord> {
+    let l = wl as i32;
+    let enforce = radius < l - 1;
+    let mut cells: Vec<Coord> = Vec::new();
+    for &(s, owner) in &board.stones {
+        if owner != attacker {
+            continue;
+        }
+        for &(dq, dr) in WIN_AXES.iter() {
+            for k in 1..l {
+                for c in [(s.0 + k * dq, s.1 + k * dr), (s.0 - k * dq, s.1 - k * dr)] {
+                    if board.get(c).is_none() && (!enforce || board.within_radius(c, radius)) {
+                        cells.push(c);
+                    }
+                }
+            }
+        }
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    cells
+}
+
+/// Forcing attacker turns (B >= 2 after the move), best-first by B. `wide` gates the
+/// experimental wide-partner-width knob (see `wide_partner_cells`); false reproduces
+/// the tight (hot + defender-block partners) generator byte-for-byte.
 fn attacker_turns(
     board: &SolverBoard,
     attacker: Player,
@@ -763,9 +797,10 @@ fn attacker_turns(
     placements: u8,
     wl: u8,
     radius: i32,
+    wide: bool,
 ) -> Vec<CellSet2> {
     let dfn_comps = completions(board, defender, wl, radius);
-    attacker_turns_with(board, attacker, placements, wl, radius, &dfn_comps)
+    attacker_turns_with(board, attacker, placements, wl, radius, &dfn_comps, wide)
 }
 
 /// See `attacker_turns`; takes precomputed defender completions.
@@ -776,6 +811,7 @@ fn attacker_turns_with(
     wl: u8,
     radius: i32,
     dfn_comps: &[CellSet2],
+    wide: bool,
 ) -> Vec<CellSet2> {
     let enforce = radius < wl as i32 - 1;
     let index = threat_table(board, attacker, wl, radius);
@@ -831,6 +867,25 @@ fn attacker_turns_with(
             blocks.dedup();
             blocks.retain(|c| hot.binary_search(c).is_err());
             partners.extend(blocks.into_iter().map(|c| (c, false, 0, 0)));
+        }
+        // EXPERIMENTAL wide partners (off by default; zero cost when `wide` is
+        // false — the generator below never runs). Tagged is_hot=false with (0, 0)
+        // potential, exactly like block-only cells: a non-hot cell is never a key
+        // in `index` (every gap of a threat-table window is indexed, so if it were
+        // a shared gap of one of `h`'s entries it would already be `hot`), so its
+        // presence in a pair can never change `move_b_with`'s result — `filled`
+        // for each of `h`'s entries is always exactly 1 (from `h` itself). A pair
+        // (h, wide-cell) is therefore forcing iff `h` ALONE would be (h_strong >=
+        // 2), which is exactly what the existing prefilter bound
+        // `h_strong + a_strong + min(h_weak, a_weak) < 2` reduces to when
+        // a_strong = a_weak = 0 — the prefilter already admits wide pairs exactly,
+        // no gating or exemption needed.
+        if wide {
+            let mut existing: Vec<Coord> = partners.iter().map(|p| p.0).collect();
+            existing.sort_unstable();
+            let mut wide_cells = wide_partner_cells(board, attacker, wl, radius);
+            wide_cells.retain(|c| existing.binary_search(c).is_err());
+            partners.extend(wide_cells.into_iter().map(|c| (c, false, 0, 0)));
         }
         partners.sort_unstable();
         for (hi, &h) in hot.iter().enumerate() {
@@ -895,10 +950,14 @@ struct SearchState {
     radius: i32,
     atk: Player,
     dfn: Player,
+    /// EXPERIMENTAL wide-partner-width knob (see `wide_partner_cells`); fixed for
+    /// the lifetime of a single search, so the gencache/tt keys need no extra
+    /// dimension for it.
+    wide: bool,
 }
 
 impl SearchState {
-    fn new(wl: u8, radius: i32, atk: Player, dfn: Player, node_budget: u64) -> Self {
+    fn new(wl: u8, radius: i32, atk: Player, dfn: Player, node_budget: u64, wide: bool) -> Self {
         SearchState {
             tt: FxHashMap::default(),
             gencache: FxHashMap::default(),
@@ -910,6 +969,7 @@ impl SearchState {
             radius,
             atk,
             dfn,
+            wide,
         }
     }
 }
@@ -945,7 +1005,7 @@ fn attacker_turns_memo(
 ) -> Rc<Vec<CellSet2>> {
     let key = (board.hash, placements);
     if let Some(v) = s.gencache.get(&key) { return Rc::clone(v); }
-    let moves = Rc::new(attacker_turns_with(board, s.atk, placements, s.wl, s.radius, dfn_comps));
+    let moves = Rc::new(attacker_turns_with(board, s.atk, placements, s.wl, s.radius, dfn_comps, s.wide));
     s.gencache.insert(key, Rc::clone(&moves));
     moves
 }
@@ -1006,8 +1066,19 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
     result
 }
 
+/// Test-only convenience wrapper (production code calls `solve_from_ex` directly via
+/// `solve`/`solve_ex`, threading the wide knob through).
+#[cfg(test)]
 fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
                   placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64) -> SolveResult {
+    solve_from_ex(board, attacker, defender, placements_remaining, wl, radius, depth_cap, node_budget, false)
+}
+
+/// See `solve_from`; `wide` gates the experimental wide-partner-width knob (see
+/// `wide_partner_cells`) — false reproduces `solve_from` exactly.
+fn solve_from_ex(board: &mut SolverBoard, attacker: Player, defender: Player,
+                  placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64,
+                  wide: bool) -> SolveResult {
     // The strip-scan buffers are stack-sized for win_length in 1..=MAX_WL; any
     // other config cannot be analyzed — report an honest give-up, never a bogus `No`.
     if !(1..=MAX_WL).contains(&(wl as usize)) {
@@ -1021,7 +1092,7 @@ fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
     if !any_four_gate(board, attacker, wl, radius) && !has_completion(board, attacker, wl, placements_remaining, radius) {
         return SolveResult::No;
     }
-    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
+    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
     for depth in 1..=depth_cap {
         let (won, cut) = atk_within(board, placements_remaining, depth, &mut s);
         if won { return SolveResult::Win { depth }; }
@@ -1037,6 +1108,21 @@ pub struct ForcingWin { pub depth: u8, pub first_move: Coord, pub pv: Vec<Coord>
 pub enum Outcome { Win(ForcingWin), No, BudgetExceeded }
 
 pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
+    solve_ex(game, depth_cap, node_budget, false)
+}
+
+/// EXPERIMENTAL: `solve` with the wide-partner-width knob (see `wide_partner_cells`)
+/// turned on — a superset generator, so a `solve` win is never lost, only possibly
+/// found at the same or a different (never longer, since the search is best-first
+/// and iterative-deepening) depth, and previously-No/BudgetExceeded positions may
+/// newly resolve to Win. Not used by any production caller; for diagnostics only.
+pub fn solve_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
+    solve_ex(game, depth_cap, node_budget, true)
+}
+
+/// See `solve`; `wide` gates the experimental wide-partner-width knob. false
+/// reproduces `solve` exactly.
+fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool) -> Outcome {
     let attacker = match game.current_player() { Some(p) => p, None => return Outcome::No };
     let defender = attacker.opponent();
     let wl = game.config().win_length;
@@ -1081,15 +1167,15 @@ pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     // derived list (completions, hot cells, partners, moves) being sorted —
     // do not let stone/scan order leak into tie-breaking.
     for (&c, &p) in game.stones() { board.place(c, p); }
-    match solve_from(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget) {
+    match solve_from_ex(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget, wide) {
         SolveResult::No => Outcome::No,
         SolveResult::BudgetExceeded => Outcome::BudgetExceeded,
         SolveResult::Win { depth } => {
             // Compute on the pristine (post-solve_from, pre-extract_pv) board: extract_pv
             // permanently applies the winning line to `board`, so first_winning_move must
             // run first or it would be probing an already-won position.
-            let fm = first_winning_move(&mut board, attacker, defender, placements, wl, radius, depth, node_budget);
-            let pv = extract_pv(&mut board, attacker, defender, placements, wl, radius, depth, node_budget);
+            let fm = first_winning_move(&mut board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
+            let pv = extract_pv(&mut board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
             match fm.or_else(|| pv.first().copied()) {
                 Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
                 // Should be impossible for a proven win, but never panic: fall back to
@@ -1105,15 +1191,16 @@ pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
 /// `def_within(depth-1, ..)` (fresh full-budget state) holds. Never panics; `None` only
 /// if no such move exists (shouldn't happen for a proven win).
 fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Player,
-                       placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64) -> Option<Coord> {
+                       placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64,
+                       wide: bool) -> Option<Coord> {
     for c in completions(board, attacker, wl, radius) {
         if c.len() as u8 <= placements {
             return c.first();
         }
     }
-    for mv in attacker_turns(board, attacker, defender, placements, wl, radius) {
+    for mv in attacker_turns(board, attacker, defender, placements, wl, radius, wide) {
         for &c in mv.cells() { board.place(c, attacker); }
-        let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
+        let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
         let (w, _) = def_within(board, depth.saturating_sub(1), &mut s);
         for &c in mv.cells() { board.remove(c); }
         if w { return mv.first(); }
@@ -1124,7 +1211,8 @@ fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Playe
 /// Port of principal_variation: returns the flat placement sequence of one winning line
 /// (attacker turns interleaved with prolonging defender covers), ending in six-in-a-row.
 fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
-              mut placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64) -> Vec<Coord> {
+              mut placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64,
+              wide: bool) -> Vec<Coord> {
     let mut pv: Vec<Coord> = Vec::new();
     let mut remaining = depth;
     loop {
@@ -1139,9 +1227,9 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
         }
         // find a winning forcing move
         let mut chosen: Option<CellSet2> = None;
-        for mv in attacker_turns(board, attacker, defender, placements, wl, radius) {
+        for mv in attacker_turns(board, attacker, defender, placements, wl, radius, wide) {
             for &c in mv.cells() { board.place(c, attacker); }
-            let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
+            let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
             let (w, _) = def_within(board, remaining.saturating_sub(1), &mut s);
             for &c in mv.cells() { board.remove(c); }
             if w { chosen = Some(mv); break; }
@@ -1166,7 +1254,7 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
             for &c in cover.cells() { board.place(c, defender); }
             let mut sub: Option<u8> = None;
             for d in 1..remaining {
-                let mut s = SearchState::new(wl, radius, attacker, defender, node_budget);
+                let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
                 let (w, _) = atk_within(board, 2, d, &mut s);
                 if w { sub = Some(d); break; }
             }
@@ -1300,7 +1388,7 @@ mod tests {
     fn attacker_turns_orders_double_four_first() {
         let mut b = SolverBoard::new();
         for c in [(0,0),(1,0),(2,0),(0,1),(0,2)] { b.place(c, Player::P1); }
-        let moves = attacker_turns(&b, Player::P1, Player::P2, 2, 6, 8);
+        let moves = attacker_turns(&b, Player::P1, Player::P2, 2, 6, 8, false);
         assert!(!moves.is_empty());
         let idx = threat_table(&b, Player::P1, 6, 8);
         // the top move is a genuine double-four (B=4), not merely a triple threat
@@ -1352,6 +1440,20 @@ mod tests {
         // make/unmake must leave the board pristine (solve() relies on this to
         // probe first_winning_move on a clean position)
         assert_eq!((b.hash, b.stones.len()), (h0, n0), "solve_from must not leak stones");
+    }
+    /// EXPERIMENTAL wide-partner-width knob: it's a strict superset generator, so on
+    /// a position where the tight generator already finds the shortest forced win,
+    /// turning `wide` on must find the SAME win at the SAME depth (never longer —
+    /// the search is best-first/iterative-deepening over an admitted superset of
+    /// tight's moves, so it can only find an equal-or-shorter path, and this fork is
+    /// already the shortest possible: depth 2).
+    #[test]
+    fn wide_is_superset_same_depth_on_mate_in_two_fork() {
+        let mut b = line(&[(0,0),(1,0),(2,0),(0,1),(0,2)], Player::P1);
+        assert!(matches!(
+            solve_from_ex(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 5_000_000, true),
+            SolveResult::Win { depth: 2 }
+        ));
     }
     #[test]
     fn no_forcing_win() {
@@ -1817,6 +1919,79 @@ mod tests {
         }
     }
 
+    /// EXPERIMENTAL DIAGNOSTIC (not a correctness/regression test): does the wide
+    /// partner-width knob find a forced win on the live 0l4291i position — the
+    /// puzzle creator's FIXED replacement for the retracted 94gnnol mate-in-19
+    /// claim — that the tight generator hasn't? Known context: tight finds no win
+    /// at depth_cap=12/node_budget=250k (1.8s) and depth_cap=40/5M (54s); a deeper
+    /// depth_cap=40/100M tight run is in progress elsewhere. A Win here would be a
+    /// genuinely interesting result (wide seeing a force-and-build line tight's
+    /// generator can't reach); no-win is also a valid, consistent result. Escalates
+    /// the node budget (1M, then 10M) and stops there.
+    /// run manually (release; this is compute-heavy):
+    /// cargo test --release -p hexo-mcts forcing::tests::wide_0l4291i_experiment -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn wide_0l4291i_experiment() {
+        use hexo_engine::game::{GameState, GameConfig};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/forcing_puzzles/0l4291i_live.json"
+        );
+        let data = std::fs::read_to_string(path).expect("0l4291i_live.json fixture must be readable");
+        let v: serde_json::Value = serde_json::from_str(&data).expect("fixture must be valid JSON");
+        let parse_player = |s: &str| match s {
+            "P1" => Player::P1,
+            "P2" => Player::P2,
+            other => panic!("bad player {other}"),
+        };
+        let stones: Vec<(Coord, Player)> = v["stones"]
+            .as_array()
+            .expect("stones must be an array")
+            .iter()
+            .map(|s| {
+                let arr = s.as_array().expect("stone must be a [q, r, player] array");
+                let q = arr[0].as_i64().unwrap() as i32;
+                let r = arr[1].as_i64().unwrap() as i32;
+                ((q, r), parse_player(arr[2].as_str().unwrap()))
+            })
+            .collect();
+        let attacker = parse_player(v["attacker"].as_str().expect("attacker must be a string"));
+        let placements = v["placements_remaining"].as_u64().expect("placements_remaining must be an int") as u8;
+        eprintln!(
+            "0l4291i: {} stones, attacker={attacker:?}, placements_remaining={placements}",
+            stones.len()
+        );
+
+        let cfg = GameConfig { win_length: 6, placement_radius: 8, max_moves: 300 };
+        let game = GameState::from_state(&stones, attacker, placements, cfg);
+
+        for &budget in &[1_000_000u64, 10_000_000] {
+            let t = std::time::Instant::now();
+            let outcome = solve_wide(&game, 40, budget);
+            let elapsed = t.elapsed();
+            match outcome {
+                Outcome::Win(w) => {
+                    eprintln!("WIDE budget={budget} -> Win{{depth={}}}  ({elapsed:.2?})", w.depth);
+                    eprintln!("PV ({} cells): {:?}", w.pv.len(), w.pv);
+                    return;
+                }
+                Outcome::No => {
+                    eprintln!("WIDE budget={budget} -> No (whole forcing tree closed)  ({elapsed:.2?})");
+                    return;
+                }
+                Outcome::BudgetExceeded => {
+                    eprintln!("WIDE budget={budget} -> BudgetExceeded  ({elapsed:.2?})");
+                    if elapsed.as_secs() >= 300 {
+                        eprintln!("stopping escalation: this step alone took >= 5 min");
+                        return;
+                    }
+                }
+            }
+        }
+        eprintln!("WIDE: no win found through 10M nodes");
+    }
+
     // Component-level cost decomposition on real fixture boards, in both the wide
     // (radius 8, puzzles) and tight (radius 2, production self-play) regimes.
     // run manually:
@@ -1847,11 +2022,11 @@ mod tests {
                 let cd_us = t.elapsed().as_micros() as f64 / n as f64;
                 let t = std::time::Instant::now();
                 let n2 = 200;
-                for _ in 0..n2 { std::hint::black_box(attacker_turns(&b, atk, dfn, 2, 6, radius)); }
+                for _ in 0..n2 { std::hint::black_box(attacker_turns(&b, atk, dfn, 2, 6, radius, false)); }
                 let at_us = t.elapsed().as_micros() as f64 / n2 as f64;
                 let idx = threat_table(&b, atk, 6, radius);
                 let hot = idx.len();
-                let moves = attacker_turns(&b, atk, dfn, 2, 6, radius).len();
+                let moves = attacker_turns(&b, atk, dfn, 2, 6, radius, false).len();
                 let comps = completions(&b, atk, 6, radius);
                 let t = std::time::Instant::now();
                 for _ in 0..n { std::hint::black_box(min_covers2(&comps)); }

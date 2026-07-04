@@ -23,7 +23,7 @@ async function convertHds() {
       note += ` · recentered by (${body.offset_applied[0]}, ${body.offset_applied[1]})`;
     }
     if (body.colors_swapped) {
-      note += " · player 2 opened (shown as P1)";
+      console.log("HDS colors swapped to match P1/P2 convention");
     }
     statusEl.textContent = note;
     document.getElementById("hds-result").hidden = false;
@@ -763,6 +763,10 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
   if (boardResult.forcing && boardResult.forcing.pv && boardResult.forcing.pv.length) {
     const f = boardResult.forcing;
     const attackerColor = f.winner === "P2" ? "#3fb6d9" : "#f08a3c";
+    // Defender's forced blocks render in the DEFENDER's own stone colour
+    // (still dotted via .forcing-pv-defender), so the two sides of the line
+    // are immediately distinguishable instead of colour-matching the winner.
+    const defenderColor = f.winner === "P2" ? "#f08a3c" : "#3fb6d9";
     f.pv.forEach((mv, i) => {
       const p = axialToPixel(mv[0], mv[1]);
       const isAttacker = f.pv_owners ? f.pv_owners[i] === f.winner : true;
@@ -773,8 +777,8 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
         body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" fill="${attackerColor}"/>`;
         body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}">${i + 1}</text>`;
       } else {
-        body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" stroke="${attackerColor}"/>`;
-        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${attackerColor}">${i + 1}</text>`;
+        body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" stroke="${defenderColor}"/>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${defenderColor}">${i + 1}</text>`;
       }
     });
   }
@@ -934,10 +938,14 @@ function renderMissedWinCallout() {
   const mw = missedWinSelected;
   if (!mw) { panel.hidden = true; panel.innerHTML = ""; return; }
   panel.hidden = false;
+  // Defender chips take the defender's own stone colour (matches the board
+  // overlay's defender colouring); attacker chips keep the phosphor emphasis.
+  const mwDefColor = mw.by === "P2" ? "var(--p1)" : "var(--p2)";
   const chips = mw.pv.map((c, i) => {
     const isAttacker = mw.pv_owners ? mw.pv_owners[i] === mw.by : true;
     const cls = `pv-chip ${isAttacker ? "pv-chip-attacker" : "pv-chip-defender"}`;
-    return `<span class="${cls}">${i + 1}. [${c[0]},${c[1]}]</span>`;
+    const style = isAttacker ? "" : ` style="color:${mwDefColor}"`;
+    return `<span class="${cls}"${style}>${i + 1}. [${c[0]},${c[1]}]</span>`;
   }).join("");
   panel.innerHTML = `<div class="mwc-head">${mw.by} had a forced win in ${mw.pv_len}</div>`
                    + `<div class="mwc-pv">${chips}</div>`;
