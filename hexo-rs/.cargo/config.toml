@@ -4,5 +4,7 @@
 # NOTE: cargo config `rustflags` are IGNORED when a RUSTFLAGS env var is set (no merge),
 # and wasm-pack can inject its own — re-verify the cfg reached getrandom after the first
 # `wasm-pack build` (Phase 4); if it clobbered, export the combined RUSTFLAGS there.
+# +simd128: baseline in all evergreen browsers since 2021 (Chrome 91, Firefox 89,
+# Safari 16.4); older engines fail at module validation, not silently.
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"', '-C', 'target-feature=+simd128']

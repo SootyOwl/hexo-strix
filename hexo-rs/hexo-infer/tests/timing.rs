@@ -12,8 +12,9 @@ fn real_model_best_move_timing() {
     let Ok(path) = std::env::var("HEXO_REAL_WEIGHTS") else { return };
     let model = InferModel::from_safetensors(&std::fs::read(path).unwrap()).unwrap();
     let game = GameState::with_config(GameConfig { win_length: 6, placement_radius: 6, max_moves: 300 });
+    let sims: u32 = std::env::var("HEXO_TIMING_SIMS").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
     let config = MCTSConfig {
-        n_simulations: 64, m_actions: 16, c_visit: 50, c_scale: 1.0,
+        n_simulations: sims, m_actions: 16, c_visit: 50, c_scale: 1.0,
         disable_gumbel_noise: true, ..Default::default()
     };
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
@@ -21,5 +22,5 @@ fn real_model_best_move_timing() {
     let t0 = std::time::Instant::now();
     let result = gumbel_mcts(&game, &config, &mut rng, None, &mut eval).unwrap();
     let dt = t0.elapsed();
-    eprintln!("real model best_move @ sims=64 (radius 6, native release): {dt:?} -> {:?}", result.action);
+    eprintln!("real model best_move @ sims={sims} (radius 6, native release): {dt:?} -> {:?}", result.action);
 }

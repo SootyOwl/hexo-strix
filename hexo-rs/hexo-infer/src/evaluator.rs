@@ -11,29 +11,47 @@ use hexo_rs::hexo_engine::GameState;
 use rustc_hash::FxHashMap;
 
 impl InferModel {
-    /// Evaluate a batch of states one at a time (wasm is single-threaded; the
-    /// serial `gumbel_mcts` path sends small batches).
-    pub fn eval_states(&self, states: &[GameState]) -> (Vec<FxHashMap<Coord, f64>>, Vec<f64>) {
+    /// Evaluate one state: graph build -> forward -> coord->logit map + value.
+    pub fn eval_one(&self, state: &GameState) -> (FxHashMap<Coord, f64>, f64) {
         let cfg = self.config();
-        let mut logit_maps = Vec::with_capacity(states.len());
-        let mut values = Vec::with_capacity(states.len());
-        for state in states {
-            let g = game_to_axis_graph_raw_opts(
-                state,
-                cfg.prune_empty_edges,
-                cfg.threat_features,
-                cfg.relative_stones,
-            );
-            let (logits, value) = self.forward(&g);
-            let legal = state.legal_moves();
-            debug_assert_eq!(legal.len(), logits.len());
-            let mut map = FxHashMap::default();
-            for (coord, logit) in legal.iter().zip(logits.iter()) {
-                map.insert(*coord, *logit as f64);
-            }
-            logit_maps.push(map);
-            values.push(value as f64);
+        let g = game_to_axis_graph_raw_opts(
+            state,
+            cfg.prune_empty_edges,
+            cfg.threat_features,
+            cfg.relative_stones,
+        );
+        let (logits, value) = self.forward(&g);
+        let legal = state.legal_moves();
+        debug_assert_eq!(legal.len(), logits.len());
+        let mut map = FxHashMap::default();
+        for (coord, logit) in legal.iter().zip(logits.iter()) {
+            map.insert(*coord, *logit as f64);
         }
-        (logit_maps, values)
+        (map, value as f64)
+    }
+
+    /// Evaluate a batch of states. On native, states are chunked across OS
+    /// threads (states are independent, so results are bitwise identical to
+    /// the serial path and returned in order). On wasm the loop stays serial.
+    pub fn eval_states(&self, states: &[GameState]) -> (Vec<FxHashMap<Coord, f64>>, Vec<f64>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(states.len());
+            if threads > 1 {
+                let chunk = states.len().div_ceil(threads);
+                let per_chunk: Vec<Vec<(FxHashMap<Coord, f64>, f64)>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = states
+                        .chunks(chunk)
+                        .map(|c| s.spawn(move || c.iter().map(|st| self.eval_one(st)).collect()))
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                return per_chunk.into_iter().flatten().unzip();
+            }
+        }
+        states.iter().map(|st| self.eval_one(st)).unzip()
     }
 }

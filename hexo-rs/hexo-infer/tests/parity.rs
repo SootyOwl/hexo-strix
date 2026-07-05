@@ -105,6 +105,26 @@ fn legal_node_order_matches_legal_moves() {
     }
 }
 
+/// Threaded batch eval (native eval_states with len > 1) must be bitwise
+/// identical, in order, to per-state serial evals (len == 1 stays serial).
+#[test]
+fn threaded_batch_eval_matches_serial() {
+    let bytes = std::fs::read(fixtures_dir().join("tiny.safetensors")).unwrap();
+    let model = InferModel::from_safetensors(&bytes).unwrap();
+    let mut game = GameState::with_config(GameConfig { win_length: 6, placement_radius: 4, max_moves: 300 });
+    let mut states = vec![game.clone()];
+    for m in [(1, 0), (-1, 0), (0, 1), (0, -1), (2, 0), (1, 1), (0, 2)] {
+        game.apply_move(m).unwrap();
+        states.push(game.clone());
+    }
+    let (maps, values) = model.eval_states(&states);
+    for (i, st) in states.iter().enumerate() {
+        let (m1, v1) = model.eval_one(st);
+        assert_eq!(maps[i], m1, "state {i}: logit map mismatch");
+        assert_eq!(values[i], v1, "state {i}: value mismatch");
+    }
+}
+
 #[test]
 fn tiny_model_parity() {
     for (weights, prefix) in [("tiny.safetensors", "tiny"), ("tiny_nojk.safetensors", "tiny_nojk")] {
