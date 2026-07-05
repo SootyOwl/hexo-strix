@@ -666,6 +666,45 @@ def test_analyze_game_full_turn_ending_squandered_win_flagged(monkeypatch):
     }
 
 
+def test_analyze_game_full_budget_shy_alternative_win_not_flagged(monkeypatch):
+    # Field report (chao): players get flagged "Missed win!" for playing a
+    # DIFFERENT win when the alternative fails to re-prove at the tight
+    # TRAJECTORY_* per-prefix budget (the solver's own line move maximizes
+    # forcing pressure; an equally-winning human move can enter a wider tree).
+    # The walk must escalate the exemption check to the ANALYSIS_* budget
+    # before daring to flag. Stub: P1's win at prefix 2 proves at any budget;
+    # the kept win at prefix 3 (the scan's landing entry) proves ONLY when
+    # node_budget >= ANALYSIS_NODE_BUDGET — so the per-prefix pass records
+    # forcing=None there, and only the escalated re-solve can exempt.
+    import hexo_a0.serving.analysis as analysis_mod
+    prefix2_win = {"winner": "P1", "attacker_is_mover": True,
+                   "first_move": [10, 0], "pv": [[10, 0], [10, 1]],
+                   "pv_len": 2, "pv_owners": ["P1", "P1"]}
+    kept_win = {"winner": "P1", "attacker_is_mover": True,
+                "first_move": [9, 9], "pv": [[9, 9]],
+                "pv_len": 1, "pv_owners": ["P1"]}
+    escalated_calls = []
+
+    def _budget_shy_stub(state, depth_cap, node_budget):
+        current = frozenset(state.placed_stones())
+        if current == frozenset(_PREFIX2_STONES):
+            return dict(prefix2_win)
+        if current == frozenset(_PREFIX3_STONES):
+            if node_budget >= analysis_mod.ANALYSIS_NODE_BUDGET:
+                escalated_calls.append(node_budget)
+                return dict(kept_win)
+            return None
+        return None
+
+    monkeypatch.setattr(analysis_mod, "_solve_forcing", _budget_shy_stub)
+    mc = types.SimpleNamespace(graph_type="hex")
+    out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
+    assert escalated_calls, "walk must escalate to ANALYSIS budget before flagging"
+    assert "missed_win" not in out["trajectory"][3]
+    # The escalated proof is back-filled for display consistency.
+    assert out["trajectory"][3]["forcing"] == kept_win
+
+
 def test_analyze_game_full_warm_trajectory_never_carries_stale_missed_win(monkeypatch):
     # The walk recomputes over the FULL merged trajectory every call and must
     # never trust a `missed_win` carried in `warm_trajectory` — simulate one

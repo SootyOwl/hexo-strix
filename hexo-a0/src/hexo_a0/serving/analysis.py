@@ -958,12 +958,17 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     # request's forcing solve disagrees with an earlier one, and this walk is
     # cheap enough that recomputing it is free).
     #
-    # Accepted limitation: the ``forcing`` fields this walk reads were solved
-    # at the tight TRAJECTORY_* budgets (far below live play's), so (a) a win
-    # beyond that budget just never flags here (conservative, fine), and (b)
-    # rarely, an alternative winning move at a scan point may fail to
-    # re-prove within budget, so this walk reports a false-positive "missed"
-    # flag instead of recognizing the kept win (accepted).
+    # Budget note: the ``forcing`` fields this walk reads were solved at the
+    # tight TRAJECTORY_* budgets (far below live play's), so a win beyond
+    # that budget just never flags here (conservative, fine). The converse
+    # bit players in the field (chao, 2026-07-04): an ALTERNATIVE winning
+    # move can fail to re-prove at TRAJECTORY budget (the solver's own line
+    # move maximizes forcing pressure; an equally-winning human move may
+    # enter a wider tree), producing a false "Missed win!". So before
+    # flagging, the scan's landing entry is re-solved once at the full
+    # ANALYSIS_* budget — would-flag events are a handful per game at most,
+    # so the cost stays bounded — and a proven kept win both exempts and is
+    # back-filled into that entry's ``forcing`` for display consistency.
     for entry in trajectory:
         entry.pop("missed_win", None)
     for i in range(len(trajectory) - 1):
@@ -986,6 +991,20 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
                 nf = entry.get("forcing")
                 exempt = bool(nf and nf.get("attacker_is_mover")
                               and nf.get("winner") == mover)
+                if not exempt and j < len(prefix_states):
+                    # Escalated exemption check (see budget note above): the
+                    # per-prefix TRAJECTORY-budget solve may have missed an
+                    # alternative kept win — re-solve this one position at
+                    # the full ANALYSIS budget before daring to flag.
+                    escalated = _solve_forcing(
+                        prefix_states[j],
+                        depth_cap=ANALYSIS_DEPTH_CAP,
+                        node_budget=ANALYSIS_NODE_BUDGET,
+                    )
+                    if (escalated and escalated.get("attacker_is_mover")
+                            and escalated.get("winner") == mover):
+                        entry["forcing"] = escalated
+                        exempt = True
                 break
         if exempt is None or exempt:
             continue  # inconclusive, or X kept/reclaimed the win — not missed
