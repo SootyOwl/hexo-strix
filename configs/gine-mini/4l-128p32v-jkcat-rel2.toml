@@ -286,6 +286,8 @@ game_placement_radius = 6
 [[curriculum.stages]]
 name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
 run_log_dir = "runs/gine-mini/4l-128p32v-jkcat-rel2/s4-6-8"
+training_lr = 1e-04
+training_lr_min = 5e-6
 # (sprt_reject_patience stage override removed 2026-06-12 — reject-counting
 # stays off (9999 global); plateau detection = promo-velocity + pooled band
 # + corpus yardstick, all gated by confirm_advance)
