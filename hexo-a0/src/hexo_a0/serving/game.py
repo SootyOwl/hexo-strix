@@ -266,6 +266,21 @@ def make_bot_turn_fn(
         defensive forcing check, which restricts the choice to a specific set
         of legal killer cells.
         """
+        native = getattr(model, "_hexo_native", None)
+        if native is not None:
+            logit_map, _value = native.forward(state)
+            if not logit_map:
+                raise RuntimeError("no legal moves on a non-terminal state")
+            # Sorted for deterministic tie-breaking (the dict's key order is
+            # process-randomized); max() keeps the first, i.e. lowest, coord.
+            coords = sorted(logit_map)
+            if restrict_to is not None:
+                coords = [c for c in coords
+                          if (int(c[0]), int(c[1])) in restrict_to]
+                if not coords:
+                    raise RuntimeError("no legal moves within restrict_to")
+            q, r = max(coords, key=lambda c: logit_map[c])
+            return (int(q), int(r))
         data = graph_fn(state)
         with torch.no_grad():
             logits, _ = model(
@@ -303,6 +318,10 @@ def make_bot_turn_fn(
                 # move selection (reproducible + optimal play vs humans).
                 disable_gumbel_noise=True,
             )
+            native = getattr(model, "_hexo_native", None)
+            if native is not None:
+                # Full search in Rust: no Python re-entry per leaf batch.
+                return native.mcts_with_diagnostics(state, mcts_cfg)[0]
             action, _improved = hr.gumbel_mcts(state, _eval_fn, mcts_cfg)
             return action
         # Raw argmax fallback (mcts_sims == 0).

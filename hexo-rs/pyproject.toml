@@ -8,12 +8,12 @@ requires-python = ">=3.13"
 dynamic = ["version"]
 
 [tool.maturin]
-manifest-path = "hexo-mcts/Cargo.toml"
-features = ["python", "pyo3/extension-module"]
+manifest-path = "hexo-py/Cargo.toml"
+features = ["pyo3/extension-module"]
 module-name = "hexo_rs"
 
 [tool.uv]
-cache-keys = [{file = "hexo-mcts/Cargo.toml"}, {file = "hexo-engine/Cargo.toml"}, {file = "hexo-mcts/src/**/*.rs"}, {file = "hexo-engine/src/**/*.rs"}]
+cache-keys = [{file = "hexo-py/Cargo.toml"}, {file = "hexo-mcts/Cargo.toml"}, {file = "hexo-engine/Cargo.toml"}, {file = "hexo-infer/Cargo.toml"}, {file = "hexo-py/src/**/*.rs"}, {file = "hexo-mcts/src/**/*.rs"}, {file = "hexo-engine/src/**/*.rs"}, {file = "hexo-infer/src/**/*.rs"}]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

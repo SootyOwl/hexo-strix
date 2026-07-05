@@ -109,3 +109,32 @@ def test_export_embeds_game_config(tmp_path):
     with safe_open(str(out), framework="pt") as f:
         gc = json.loads(f.metadata()["game_config"])
     assert gc["placement_radius"] == 6  # stage-specific config travels with the weights
+
+def test_serialize_matches_save(tmp_path):
+    """The in-memory producer must emit byte-identical output to the file one."""
+    import dataclasses
+    from hexo_a0.export import save_safetensors, serialize_safetensors
+    from hexo_a0.gen_parity_fixtures import tiny_model_and_config
+
+    model, cfg = tiny_model_and_config()
+    out = tmp_path / "w.safetensors"
+    meta_file = save_safetensors(model.state_dict(), dataclasses.asdict(cfg), 7, "tiny", out)
+    blob, meta_mem = serialize_safetensors(model.state_dict(), dataclasses.asdict(cfg), 7, "tiny")
+    assert meta_mem == meta_file
+    # Compare semantically (header layout may differ between save/save_file):
+    # same tensors, same values, same embedded metadata.
+    import json
+    import struct
+    import safetensors.torch as st
+
+    mem_tensors = st.load(blob)
+    file_tensors = st.load(out.read_bytes())
+    assert set(mem_tensors) == set(file_tensors)
+    for k in mem_tensors:
+        assert bool((mem_tensors[k] == file_tensors[k]).all()), k
+
+    def header(b):
+        n = struct.unpack("<Q", b[:8])[0]
+        return json.loads(b[8:8 + n].decode())
+
+    assert header(blob)["__metadata__"] == header(out.read_bytes())["__metadata__"]

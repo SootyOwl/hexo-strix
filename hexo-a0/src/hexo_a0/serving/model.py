@@ -78,9 +78,46 @@ def load_model(checkpoint: str, device: str = "cpu", model_config_dict=None):
             checkpoint, len(result.missing_keys), len(result.unexpected_keys),
         )
     model.eval()
+    _attach_native(model, ckpt, checkpoint)
     out = (model, mc, ckpt)
     _MODEL_CACHE[key] = out
     return out
+
+
+def _attach_native(model, ckpt, checkpoint_path):
+    """Attach a hexo-infer native engine as ``model._hexo_native`` (best-effort).
+
+    The checkpoint is re-serialized to safetensors in memory (nothing written
+    next to the checkpoint, which may be a read-only mount) and loaded by the
+    pure-Rust engine. Hot paths (bot moves, ``_run_mcts``) use it when present;
+    on any failure — unsupported architecture (hexo-infer only loads
+    GINE/axis/pre-norm models), missing embedded model_config, or an older
+    ``hexo_rs`` build without ``InferModel`` — the attribute stays ``None`` and
+    serving falls back to the torch eval path unchanged.
+    """
+    import logging
+    import os
+
+    model._hexo_native = None
+    try:
+        from hexo_a0.export import serialize_safetensors
+
+        mc_dict = ckpt.get("model_config")
+        if not isinstance(mc_dict, dict):
+            raise ValueError("checkpoint has no embedded model_config dict")
+        if isinstance(ckpt.get("game_config"), dict):
+            mc_dict = {**mc_dict, "game_config": ckpt["game_config"]}
+        blob, _ = serialize_safetensors(
+            ckpt["model_state_dict"], mc_dict,
+            ckpt.get("train_steps", ckpt.get("iteration", "?")),
+            os.path.basename(str(checkpoint_path)),
+        )
+        model._hexo_native = _hexo_rs.InferModel(blob)
+        logging.getLogger(__name__).info(
+            "native hexo-infer engine attached for %s", checkpoint_path)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "native search engine unavailable (%s); torch eval path in use", e)
 
 
 def make_graph_fn(mc):

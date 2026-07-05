@@ -9,6 +9,6 @@ pub mod inference_subprocess;
 pub mod mcts;
 pub mod prover;
 #[cfg(feature = "python")]
-mod python;
+pub mod python;
 
 pub use hexo_engine;

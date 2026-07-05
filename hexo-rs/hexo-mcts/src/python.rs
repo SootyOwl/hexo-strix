@@ -81,8 +81,8 @@ impl PyGameConfig {
 }
 
 #[pyclass(name = "GameState", module = "hexo_rs")]
-struct PyGameState {
-    inner: GameState,
+pub struct PyGameState {
+    pub inner: GameState,
 }
 
 #[pymethods]
@@ -256,8 +256,8 @@ impl PyGameState {
 
 #[pyclass(name = "MCTSConfig", skip_from_py_object)]
 #[derive(Clone)]
-struct PyMCTSConfig {
-    inner: MCTSConfig,
+pub struct PyMCTSConfig {
+    pub inner: MCTSConfig,
 }
 
 #[pymethods]
@@ -1760,8 +1760,11 @@ fn py_snapshot_eval_cache(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(dict.into())
 }
 
-#[pymodule]
-fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Register every hexo_rs class/function on `m`. The #[pymodule] entry point
+/// lives in the hexo-py crate (which adds the hexo-infer-backed classes);
+/// keeping no #[pymodule] here avoids a duplicate PyInit_hexo_rs symbol in
+/// the final cdylib.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGameConfig>()?;
     m.add_class::<PyGameState>()?;
     m.add_class::<PyMCTSConfig>()?;

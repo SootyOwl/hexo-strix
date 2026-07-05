@@ -16,6 +16,20 @@ logger = logging.getLogger(__name__)
 FORMAT_TAG = "hexo-safetensors-v1"
 
 
+def _prepare_export(state_dict: dict, model_config: dict, train_steps, source_name: str):
+    """Shared body of the two producers: fp32 tensors + metadata dict."""
+    sd = {k.removeprefix("_orig_mod."): v.float().contiguous() for k, v in state_dict.items()}
+    metadata = {
+        "format": FORMAT_TAG,
+        "model_config": json.dumps(model_config),
+        "train_steps": str(train_steps),
+        "source_checkpoint": source_name,
+    }
+    if isinstance(model_config.get("game_config"), dict):
+        metadata["game_config"] = json.dumps(model_config["game_config"])
+    return sd, metadata
+
+
 def save_safetensors(
     state_dict: dict,
     model_config: dict,
@@ -36,20 +50,29 @@ def save_safetensors(
     """
     from safetensors.torch import save_file
 
-    sd = {k.removeprefix("_orig_mod."): v.float().contiguous() for k, v in state_dict.items()}
-    metadata = {
-        "format": FORMAT_TAG,
-        "model_config": json.dumps(model_config),
-        "train_steps": str(train_steps),
-        "source_checkpoint": source_name,
-    }
-    if isinstance(model_config.get("game_config"), dict):
-        metadata["game_config"] = json.dumps(model_config["game_config"])
+    sd, metadata = _prepare_export(state_dict, model_config, train_steps, source_name)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_file(sd, str(out_path), metadata=metadata)
     logger.info("Exported %d tensors to %s", len(sd), out_path)
     return metadata
+
+
+def serialize_safetensors(
+    state_dict: dict,
+    model_config: dict,
+    train_steps,
+    source_name: str,
+) -> tuple[bytes, dict]:
+    """In-memory twin of :func:`save_safetensors` (same format, no file).
+
+    Used by serving to hand a just-loaded checkpoint to the hexo-infer native
+    engine without writing next to the checkpoint (which may be read-only).
+    """
+    from safetensors.torch import save
+
+    sd, metadata = _prepare_export(state_dict, model_config, train_steps, source_name)
+    return save(sd, metadata=metadata), metadata
 
 
 def export_checkpoint(ckpt_path: Path, out_path: Path) -> dict:

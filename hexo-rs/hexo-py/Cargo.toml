@@ -1,0 +1,20 @@
+[package]
+name = "hexo-py"
+version = "0.1.0"
+edition = "2021"
+
+# The Python extension crate: re-registers the full hexo_rs module from
+# hexo-mcts and adds the hexo-infer-backed native inference classes
+# (hexo-infer depends on hexo-mcts, so the glue cannot live there).
+# maturin builds THIS crate (see hexo-rs/pyproject.toml module-name hexo_rs).
+
+[lib]
+name = "hexo_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+hexo-mcts = { path = "../hexo-mcts", features = ["python"] }
+hexo-infer = { path = "../hexo-infer" }
+pyo3 = { version = "0.28" }
+rand = "0.9"
+rand_chacha = "0.9"

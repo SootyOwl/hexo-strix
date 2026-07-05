@@ -176,7 +176,6 @@ def _run_mcts(model, model_config, state, mcts_sims: int, mcts_m_actions: int):
               per_child_q, candidate_indices)
     """
     import hexo_rs as hr
-    graph_fn = make_graph_fn(model_config)
     mcts_config = hr.MCTSConfig(
         n_simulations=mcts_sims,
         m_actions=mcts_m_actions,
@@ -184,6 +183,19 @@ def _run_mcts(model, model_config, state, mcts_sims: int, mcts_m_actions: int):
         c_scale=1.0,
         disable_gumbel_noise=True,
     )
+    native = getattr(model, "_hexo_native", None)
+    if native is not None:
+        # Search + root forward run fully in Rust (GIL released, leaf batches
+        # threaded). Same return contract as the torch path below.
+        (_action, improved_policy, visit_counts, per_child_q,
+         _per_child_prior, candidate_indices, _forced) = (
+            native.mcts_with_diagnostics(state, mcts_config)
+        )
+        _logit_map, root_value = native.forward(state)
+        return (list(improved_policy), float(root_value),
+                [list(c) for c in state.legal_moves()],
+                list(visit_counts), list(per_child_q), list(candidate_indices))
+    graph_fn = make_graph_fn(model_config)
     eval_fn = _eval_fn_for_model(model, graph_fn)
     (_action, improved_policy, visit_counts, per_child_q,
      _per_child_prior, candidate_indices, _forced) = (

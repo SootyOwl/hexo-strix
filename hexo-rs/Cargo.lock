@@ -788,6 +788,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexo-py"
+version = "0.1.0"
+dependencies = [
+ "hexo-infer",
+ "hexo-mcts",
+ "pyo3",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+]
+
+[[package]]
 name = "hexo-wasm"
 version = "0.1.0"
 dependencies = [
