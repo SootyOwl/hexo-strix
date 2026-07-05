@@ -1,3 +1,3 @@
 [workspace]
-members = ["hexo-engine", "hexo-mcts", "hexo-infer"]
+members = ["hexo-engine", "hexo-mcts", "hexo-infer", "hexo-wasm"]
 resolver = "3"

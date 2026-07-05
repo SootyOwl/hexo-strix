@@ -162,6 +162,23 @@ impl GameState {
         self.winner
     }
 
+    /// Recompute whether any winning line exists on the current board.
+    ///
+    /// Unlike [`winner`](Self::winner), this does not rely on the cached field —
+    /// [`from_state`](Self::from_state) runs no win check and hard-codes
+    /// `winner: None`, so reconstructed positions carrying a completed line
+    /// report `winner() == None`. Validation layers (e.g. the wasm API) use this
+    /// to reject already-won boards. O(stones × win-scan); fine off hot paths.
+    pub fn has_winner(&self) -> Option<Player> {
+        let win_length = self.config.win_length;
+        for (&coord, &player) in self.board.stones() {
+            if crate::win::check_win(&self.board, coord, player, win_length) {
+                return Some(player);
+            }
+        }
+        None
+    }
+
     /// Returns the player who should move next, or `None` if the game is over.
     pub fn current_player(&self) -> Option<Player> {
         self.turn.current_player()
@@ -448,4 +465,32 @@ mod tests {
         GameState::with_config(GameConfig { win_length: 6, placement_radius: 8, max_moves: 0 });
     }
 
+    #[test]
+    fn has_winner_recomputes_after_from_state() {
+        // from_state hard-codes winner: None — has_winner must find the line anyway.
+        let cfg = GameConfig { win_length: 4, placement_radius: 4, max_moves: 200 };
+        // P1 4-in-a-row along (1,0): includes the seeded origin.
+        let stones = [
+            ((0, 0), Player::P1), ((1, 0), Player::P1), ((2, 0), Player::P1), ((3, 0), Player::P1),
+            ((0, 1), Player::P2), ((0, 2), Player::P2),
+        ];
+        let game = GameState::from_state(&stones, Player::P2, 2, cfg);
+        assert_eq!(game.winner(), None, "from_state does not set the cached winner");
+        assert_eq!(game.has_winner(), Some(Player::P1), "has_winner recomputes the line");
+        // Win NOT through the last-listed stone: same board, different list order.
+        let reordered = [
+            ((0, 1), Player::P2), ((3, 0), Player::P1), ((2, 0), Player::P1),
+            ((0, 0), Player::P1), ((1, 0), Player::P1), ((0, 2), Player::P2),
+        ];
+        let game2 = GameState::from_state(&reordered, Player::P2, 2, cfg);
+        assert_eq!(game2.has_winner(), Some(Player::P1));
+    }
+
+    #[test]
+    fn has_winner_none_on_open_position() {
+        let cfg = GameConfig { win_length: 6, placement_radius: 4, max_moves: 200 };
+        let stones = [((0, 0), Player::P1), ((1, 0), Player::P2)];
+        let game = GameState::from_state(&stones, Player::P2, 1, cfg);
+        assert_eq!(game.has_winner(), None);
+    }
 }

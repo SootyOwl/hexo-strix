@@ -81,11 +81,24 @@ test-python:
 test-all:
     uv run --no-sync pytest hexo-a0/tests/ --tb=short -o "addopts="
 
-# Verify the engine + MCTS libs compile for the browser/WebWorker (wasm32) target.
+# Verify all wasm-facing libs compile for the browser/WebWorker (wasm32) target.
 # Self-contained CARGO_TARGET_DIR: just runs each recipe in a fresh shell, so the
 # separate build dir is set here (never the shared hexo-rs/target/ the live trainer uses).
 check-wasm:
-    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target cargo check --lib -p hexo-engine -p hexo-mcts -p hexo-infer --target wasm32-unknown-unknown
+    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target cargo check --lib -p hexo-engine -p hexo-mcts -p hexo-infer -p hexo-wasm --target wasm32-unknown-unknown
+
+# Build the browser (WebWorker) wasm package
+wasm-build:
+    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target wasm-pack build hexo-wasm --target web --out-dir pkg
+
+# Build the nodejs wasm package and run the smoke test (tiny fixtures; committed, runs anywhere)
+wasm-test:
+    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target wasm-pack build hexo-wasm --target nodejs --out-dir pkg-node --dev && node hexo-wasm/tests/node_smoke.mjs
+
+# Real-weights smoke: same test against the ACTUAL shipped weights (release build).
+# Hard-fails if exports/strixbot-rel2.safetensors is absent — that's the real-load gate.
+wasm-test-real:
+    cd hexo-rs && test -f ../exports/strixbot-rel2.safetensors && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target wasm-pack build hexo-wasm --target nodejs --out-dir pkg-node && WEIGHTS=../exports/strixbot-rel2.safetensors node hexo-wasm/tests/node_smoke.mjs
 
 # Run the axis curriculum
 train-axis:
