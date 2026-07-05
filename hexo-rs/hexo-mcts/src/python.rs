@@ -1652,6 +1652,68 @@ fn solve_forcing(
     )
 }
 
+/// Forcing win for the OPPONENT of the side to move, as if it were their
+/// turn (fresh 2 placements) — a THREAT the mover may still break, not a
+/// proven loss. Same return shape as `solve_forcing`.
+#[pyfunction]
+#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000))]
+fn solve_threat(
+    py: Python<'_>,
+    state: &PyGameState,
+    depth_cap: u8,
+    node_budget: u64,
+) -> Option<((i32, i32), Vec<(i32, i32)>)> {
+    // Clone + detach, same as solve_forcing.
+    let inner = state.inner.clone();
+    py.detach(
+        move || match crate::mcts::forcing::solve_threat(&inner, depth_cap, node_budget) {
+            crate::mcts::forcing::Outcome::Win(w) => Some((w.first_move, w.pv)),
+            crate::mcts::forcing::Outcome::No | crate::mcts::forcing::Outcome::BudgetExceeded => {
+                None
+            }
+        },
+    )
+}
+
+/// Pair-aware defensive solve for the side to move (see
+/// `forcing::solve_defense`): detects the opponent's flipped-perspective
+/// forcing win and reports which placements refute it.
+///
+/// Returns `None` when the opponent has no proven threat; otherwise
+/// `(killers, pair_anchors, best_delay, threat_pv)` where `killers` are
+/// single refuting placements, `pair_anchors` are `(first, second)` pairs
+/// that jointly refute (play `first`, re-check next placement), and
+/// `best_delay` is the max-delay fallback survivor. `time_limit_ms` bounds
+/// the whole analysis (partial results on expiry).
+#[pyfunction]
+#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, time_limit_ms=3_000))]
+#[allow(clippy::type_complexity)]
+fn solve_defense(
+    py: Python<'_>,
+    state: &PyGameState,
+    depth_cap: u8,
+    node_budget: u64,
+    time_limit_ms: u64,
+) -> Option<(
+    Vec<(i32, i32)>,
+    Vec<((i32, i32), (i32, i32))>,
+    Option<(i32, i32)>,
+    Vec<(i32, i32)>,
+)> {
+    // Clone + detach for the same reason as `solve_forcing`: the defensive
+    // analysis stacks many budget-bound sub-solves and must not hold the GIL.
+    let inner = state.inner.clone();
+    py.detach(move || {
+        crate::mcts::forcing::solve_defense(
+            &inner,
+            depth_cap,
+            node_budget,
+            std::time::Duration::from_millis(time_limit_ms),
+        )
+        .map(|a| (a.killers, a.pair_anchors, a.best_delay, a.threat_pv))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Phase 0 DAG-MCTS spike: thread-local instrumentation bindings.
 // Feature-gated; only present when built with `--features dedup_count`.
@@ -1718,6 +1780,8 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_augment_axis_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_batched_self_play, m)?)?;
     m.add_function(wrap_pyfunction!(solve_forcing, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_threat, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_defense, m)?)?;
     #[cfg(feature = "torch")]
     m.add_function(wrap_pyfunction!(py_native_self_play, m)?)?;
     #[cfg(feature = "dedup_count")]

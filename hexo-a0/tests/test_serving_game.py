@@ -719,36 +719,27 @@ def test_forcing_defensive_block_plays_the_only_killer():
     assert (11, 0) in new_moves
 
 
-def test_forcing_defensive_deadline_stops_verifying_further_candidates(monkeypatch):
-    # DEFENSE_DEADLINE_S backstop: a slow candidate re-solve must not block
-    # forever verifying the rest of the candidate list — once the deadline
-    # elapses, the loop stops and uses whatever killers/survivors it already
-    # found. `hexo_rs.solve_forcing` is stubbed by call order (own-win check,
-    # then the opponent's-win check, then one slow-but-real per-candidate
-    # re-solve) so the timing is deterministic rather than depending on a
-    # real solver's wall-clock, which would make this test flaky.
+def test_forcing_defensive_deadline_passed_to_solver(monkeypatch):
+    # The DEFENSE_DEADLINE_S backstop is enforced INSIDE hr.solve_defense
+    # (see forcing.rs's time-limit tests for the cutoff behaviour itself);
+    # what game.py owns is the plumbing — the deadline must reach the solver
+    # in milliseconds, and a returned killer must be played.
     monkeypatch.setattr(game_mod, "DEFENSE_DEADLINE_S", 0.01)
 
     cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
     cfg = hexo_rs.GameConfig(**cfg_kwargs)
     state = hexo_rs.GameState.from_state(
         [((0, 0), "P1"), ((1, 0), "P2")], "P1", 1, cfg)  # P1's last placement this turn
-    legal = [tuple(c) for c in state.legal_moves()]
-    assert len(legal) >= 3
-    pv_cells = legal[:3]  # fabricated opponent PV: 3 legal candidate cells
+    killer = tuple(state.legal_moves()[0])
 
-    calls = {"n": 0}
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+    seen = {}
 
-    def _stub(_state, _depth_cap, _node_budget):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return None  # 1: bot's own-win check -> no win, falls to defense
-        if calls["n"] == 2:
-            return (pv_cells[0], pv_cells)  # 2: opponent's win, PV = pv_cells
-        time.sleep(0.05)  # 3+: per-candidate re-solve, deliberately slow
-        return None  # every verified candidate looks like a killer
+    def _stub_defense(_state, depth_cap, node_budget, time_limit_ms):
+        seen["args"] = (depth_cap, node_budget, time_limit_ms)
+        return ([killer], [], None, [killer])
 
-    monkeypatch.setattr(hexo_rs, "solve_forcing", _stub)
+    monkeypatch.setattr(hexo_rs, "solve_defense", _stub_defense)
 
     now = datetime.now(timezone.utc)
     rec = GameRecord(
@@ -758,15 +749,16 @@ def test_forcing_defensive_deadline_stops_verifying_further_candidates(monkeypat
     )
     _bot_turn_fn(cfg_kwargs)(rec)
 
-    # Only the first candidate got re-solved (0.05s > the 0.01s deadline, so
-    # the loop broke before candidate 2) — 3 total solve_forcing calls, not 4.
-    assert calls["n"] == 3
-    assert rec.move_log[-1][:2] == pv_cells[0]  # played the one verified killer
+    depth_cap, node_budget, time_limit_ms = seen["args"]
+    assert time_limit_ms == 10  # 0.01 s deadline, in ms
+    assert node_budget == game_mod.DEF_NODE_BUDGET
+    assert depth_cap == game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["standard"]
+    assert rec.move_log[-1][:2] == killer  # the returned killer was played
 
 
 def test_forcing_depth_capped_per_difficulty_tier(monkeypatch):
     # Per-difficulty forcing DEPTH cap: a forced win that only a deep-enough
-    # search can prove must be executed by "strong" (depth=10) but NOT by
+    # search can prove must be executed by "strong" (depth=16) but NOT by
     # "casual" (depth=2) — casual falls through to the raw-argmax path
     # rather than executing a win it can't (at its tier's depth) see.
     # `hexo_rs.solve_forcing` is stubbed to "find" the win only when
@@ -804,7 +796,7 @@ def test_forcing_depth_capped_per_difficulty_tier(monkeypatch):
     assert depths and all(d == 2 for d in depths)  # casual's tier depth, every call
     assert rec.forcing_pv is None  # the win was never executed via forcing
 
-    # --- strong (depth=10): the same win threshold is now cleared. ---
+    # --- strong: the same win threshold is now cleared. ---
     state, rec = _rec("g-depth-strong", "strong")
     win_cell = tuple(state.legal_moves()[0])
     depths = []
@@ -816,8 +808,44 @@ def test_forcing_depth_capped_per_difficulty_tier(monkeypatch):
     monkeypatch.setattr(hexo_rs, "solve_forcing", _stub_strong)
     _bot_turn_fn(cfg_kwargs)(rec)
 
-    assert depths == [10]  # strong's tier depth; own-win solve found it immediately
+    # strong's tier depth; own-win solve found it immediately
+    assert depths == [game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]]
     assert rec.move_log[-1][:2] == win_cell  # the win WAS executed
+
+
+def test_forcing_defense_saves_strongloss_a_via_killer_pair():
+    # Regression for the 2026-07-04 live loss (strongloss_a_line.json,
+    # prefix 6): the human (P2) completed an 18-placement VCF; no SINGLE P1
+    # block refutes it, but killer PAIRS exist. The old Python max-delay
+    # survivor heuristic played (-3,3) — a non-anchor — and lost the game;
+    # hr.solve_defense's pair pass must anchor the turn so that after the
+    # bot's TWO placements the opponent's VCF is no longer provable.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    stones = [((0, 0), "P1"), ((1, 2), "P2"), ((2, 3), "P2"), ((3, -1), "P1"),
+              ((2, 1), "P1"), ((1, 4), "P2"), ((1, 3), "P2")]
+    state = hexo_rs.GameState.from_state(stones, "P1", 2, cfg)
+    depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
+
+    # Sanity: the threat is real and no single block kills it (else this
+    # fixture no longer tests the pair pass).
+    opp_state = hexo_rs.GameState.from_state(state.placed_stones(), "P2", 2, cfg)
+    assert hexo_rs.solve_forcing(opp_state, depth, game_mod.DEF_NODE_BUDGET) is not None
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-strongloss-a", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(q, r, side) for (q, r), side in stones],
+        difficulty="strong",
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    # After the bot's full turn, P2's forced win must be refuted.
+    after = hexo_rs.GameState.from_state(rec.state.placed_stones(), "P2", 2, cfg)
+    assert hexo_rs.solve_forcing(after, depth, game_mod.DEF_NODE_BUDGET) is None
+    # And the losing move the old heuristic chose must not be the anchor.
+    assert rec.move_log[len(stones)][:2] != (-3, 3)
 
 
 def test_forcing_kill_switch_never_calls_solver(monkeypatch):
@@ -839,6 +867,7 @@ def test_forcing_kill_switch_never_calls_solver(monkeypatch):
         return None
 
     monkeypatch.setattr(hexo_rs, "solve_forcing", _counting_solve)
+    monkeypatch.setattr(hexo_rs, "solve_defense", _counting_solve)
 
     now = datetime.now(timezone.utc)
     rec = GameRecord(
@@ -848,5 +877,5 @@ def test_forcing_kill_switch_never_calls_solver(monkeypatch):
     )
     _bot_turn_fn(cfg_kwargs, live_forcing=False)(rec)
 
-    assert calls["n"] == 0  # the solver was never consulted
+    assert calls["n"] == 0  # neither solver entry point was consulted
     assert rec.forcing_pv is None  # the PV cache was never populated either

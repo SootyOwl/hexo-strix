@@ -38,14 +38,21 @@ DEFAULT_DIFFICULTY = "standard"
 # tiers get the SAME honest forcing tactics (own-win execution + defense, see
 # `_play`), but a shallower depth cap means weaker tiers only catch shallow
 # mates and let deeper ones through, same as a human of that strength would.
-# "strong" gets the full measured budget (depth=10, p99 354ms/max 780ms at
-# r=8 — see the bench table below); "casual" only executes/blocks depth-2
-# (a single-move) mate.
+# "casual" only executes/blocks depth-2 (a single-move) mate.
+#
+# standard 6->8 / strong 10->16 raised 2026-07-05: at the FLAT 20k node
+# budget, depth is wall-clock-free (p99 352-392 ms and max <750 ms at every
+# depth in 10..18 over 640 real-game prefix solves, both sides — see
+# scripts/forcing_depth_sweep.py + docs/research/). The same sweep showed the
+# extra depth finds nothing EARLIER on the strongloss fixtures (threats built
+# from quiet moves aren't VCFs until complete), so this is headroom for rare
+# longer fully-forcing lines, not the fix for those losses — that was the
+# pair-aware `hr.solve_defense` (see `_defensive_move`).
 DEFAULT_DIFFICULTY_FORCING_DEPTH: dict[str, int] = {
     "casual":   2,
     "easy":     4,
-    "standard": 6,
-    "strong":  10,
+    "standard": 8,
+    "strong":  16,
 }
 
 # Live-play forcing (VCF) search NODE budgets, re-tuned 2026-07-04 from r=8
@@ -62,19 +69,22 @@ DEFAULT_DIFFICULTY_FORCING_DEPTH: dict[str, int] = {
 # both axes, for both the own-win solve and the defensive sweep. Node budget
 # stays FLAT across difficulty tiers (it's a search-efficiency cap, not a
 # strength lever); DEPTH is the per-tier lever (see
-# `DEFAULT_DIFFICULTY_FORCING_DEPTH` above and `_forcing_depth_for` below) —
-# `strong`'s depth (10) is exactly the depth this bench was measured at.
+# `DEFAULT_DIFFICULTY_FORCING_DEPTH` above and `_forcing_depth_for` below).
+# Re-confirmed 2026-07-05 by the depth x budget grid sweep
+# (scripts/forcing_depth_sweep.py): at 20k, p99 stays ~350-390 ms for every
+# depth 10..18, while 50k/100k/250k blow the tail out to p99 0.9-2.7 s
+# (max 13 s) with zero first-sighting gain.
 LIVE_NODE_BUDGET = 20_000
 DEF_NODE_BUDGET = 20_000
 # Fallback depth cap for a difficulty tier missing from the map (defensive;
 # should be unreachable given DEFAULT_DIFFICULTY_FORCING_DEPTH covers every
 # DIFFICULTY_ORDER entry) — the "strong"/full-measured-budget depth.
 FALLBACK_FORCING_DEPTH = DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
-# Wall-clock backstop for the defensive candidate-verification loop (see
-# `_defensive_move`): even at the tuned budget above, a pathological position
-# could stack enough candidate re-solves to blow past a live turn's latency
-# budget, so bail out after this many seconds and use whatever killers/
-# survivors were verified so far.
+# Wall-clock backstop for the defensive analysis (passed to
+# ``hr.solve_defense`` as its time limit): even at the tuned budget above, a
+# pathological position could stack enough candidate/pair re-solves to blow
+# past a live turn's latency budget, so the solver stops after this long and
+# returns whatever killers/anchors/survivors were verified so far.
 DEFENSE_DEADLINE_S = 3.0
 
 # Rate-limit for the "forcing check failed" exception log (see
@@ -304,75 +314,47 @@ def make_bot_turn_fn(
             forcing_depth_map.get(DEFAULT_DIFFICULTY, FALLBACK_FORCING_DEPTH),
         )
 
-    def _defensive_move(rec: GameRecord, legal: set, depth_cap: int):
+    def _defensive_move(rec: GameRecord, depth_cap: int):
         """Step 3: pre-emptive VCF defense, run only when the bot has no own
         forced win. Exploits monotonicity: the bot's stones only remove
         opponent threat cells, so "no VCF for the opponent right now
         (hypothetically to move)" implies "none at their next turn start"
         either — safe to fall through to normal MCTS in that case.
 
+        The search itself lives in the solver (``hr.solve_defense``,
+        forcing.rs): single killers first, then killer PAIRS when no single
+        block refutes — the case the old Python max-delay survivor loop lost
+        (strongloss_a, 2026-07-04: every killer pair was anchored on a cell
+        the delay metric ranked below a far-away non-anchor, and the bot
+        played the non-anchor). This wrapper only applies the NN policy
+        tie-break among the solver's proven-equivalent choices.
+
         ``depth_cap`` is the per-difficulty forcing depth (see
         ``_forcing_depth_for``), shared with the own-win solve in
         ``_forcing_move`` — the SAME tier sees the SAME depth on both sides.
         """
         state = rec.state
-        opp = "P1" if rec.bot_side == "P2" else "P2"
-        cfg = hr.GameConfig(**game_kwargs)
-        opp_state = hr.GameState.from_state(state.placed_stones(), opp, 2, cfg)
-        opp_win = hr.solve_forcing(opp_state, depth_cap, DEF_NODE_BUDGET)
-        if opp_win is None:
+        res = hr.solve_defense(state, depth_cap, DEF_NODE_BUDGET,
+                               int(DEFENSE_DEADLINE_S * 1000))
+        if res is None:
             return None
-
-        _opp_first, opp_pv = opp_win
-        seen: set = set()
-        candidates: list = []
-        for c in opp_pv:
-            c = tuple(c)
-            if c in legal and c not in seen:
-                seen.add(c)
-                candidates.append(c)
-        if not candidates:
-            return None
-
-        killers = []
-        survivors = []  # (cell, surviving PV length) — delay/disruption proxy
-        t0 = time.monotonic()
-        for c in candidates:
-            if time.monotonic() - t0 > DEFENSE_DEADLINE_S:
-                # Wall-clock backstop: stop verifying further candidates and
-                # use whatever killers/survivors were found so far (unverified
-                # candidates are simply not considered this placement).
-                break
-            trial = state.clone()
-            trial.apply_move(*c)
-            if trial.is_terminal():
-                # A terminal trial is either a bot win (the engine has no
-                # self-loss rule, so completing wl-in-a-row here is the only
-                # way the BOT ends the game by placing) or a max_moves draw —
-                # either way it's strictly better than letting the opponent's
-                # VCF stand (draw > loss, win > loss), so playing it outright
-                # is correct without needing the survivor/killer comparison
-                # below. Also keeps the from_state call below on its
-                # documented non-terminal-only contract.
-                return c
-            trial_opp = hr.GameState.from_state(trial.placed_stones(), opp, 2, cfg)
-            re_res = hr.solve_forcing(trial_opp, depth_cap, DEF_NODE_BUDGET)
-            if re_res is None:
-                killers.append(c)
-            else:
-                survivors.append((c, len(re_res[1])))
-
+        killers, pair_anchors, best_delay, _threat_pv = res
         if killers:
-            return _policy_argmax(state, restrict_to=set(killers))
-        if not survivors:
-            # Deadline hit before any candidate could be verified: fall
-            # through to MCTS, same as the no-candidate path above.
-            return None
-        # No killer this placement: play the survivor with the longest
-        # surviving PV (max delay). The next placement re-runs this whole
-        # check, giving the pair a second chance to kill the win.
-        best_cell, _pv_len = max(survivors, key=lambda t: t[1])
-        return best_cell
+            return _policy_argmax(state, restrict_to={tuple(c) for c in killers})
+        anchors = {tuple(c1) for (c1, _c2) in pair_anchors}
+        if anchors:
+            # Any anchor works: after playing it, the next placement's
+            # re-check finds its verified second cell as a single killer (or
+            # something better).
+            return _policy_argmax(state, restrict_to=anchors)
+        if best_delay is not None:
+            # No refutation found this placement: play the survivor with the
+            # longest surviving PV (max delay). The next placement re-runs
+            # this whole check against the updated threat.
+            return tuple(best_delay)
+        # No candidates at all (or deadline expired before any could be
+        # verified): fall through to MCTS.
+        return None
 
     def _forcing_move(rec: GameRecord):
         """Steps 1-3 of the live-play forcing check, run before `_pick_move`
@@ -411,7 +393,7 @@ def make_bot_turn_fn(
             )
 
         # 3. Defensive pre-emptive check (only when step 2 found nothing).
-        return _defensive_move(rec, legal, depth_cap)
+        return _defensive_move(rec, depth_cap)
 
     def _sims_for(rec: GameRecord) -> int:
         if difficulty_sims is None:

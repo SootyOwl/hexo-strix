@@ -74,7 +74,9 @@ class AnalysisResult:
     current_player: str | None = None  # side to move (for P1-perspective flip)
     # Both-side VCF solve for display: {"winner", "attacker_is_mover",
     # "first_move", "pv", "pv_len", "pv_owners"} or None (no forced win found
-    # either way, or the solver wasn't consulted for the opponent side).
+    # either way). attacker_is_mover=True is a PROVEN win for the side to
+    # move; False is a perspective-flipped THREAT (often defensible — the
+    # client renders those behind a default-off toggle).
     # "pv_owners" is a parallel array of "P1"/"P2" (or None if the replay that
     # derives it failed) — the PV's per-cell chunk lengths are NOT a fixed
     # pairs-of-2 cadence (the first chunk is however many placements the
@@ -254,31 +256,33 @@ def _scan_threats(data, legal_coords, probs, *, current_player, relative_stones)
     return threats
 
 
-def _solve_forcing(state, game_config, depth_cap=ANALYSIS_DEPTH_CAP,
+def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
                    node_budget=ANALYSIS_NODE_BUDGET):
     """Both-side VCF solve for the analysis display.
 
-    Solves for the side to move first; only if THAT side has no forced win do
-    we flip perspective and check the opponent's (``game_config`` required for
-    the flip — ``None`` skips the opponent-side check, e.g. for callers that
-    don't have game rules handy). Never raises: any solver failure or absence
-    of a forced win on either side is reported as ``None`` — analysis must
-    never crash because the display solve had trouble.
+    Solves for the side to move first; only if THAT side has no proven win is
+    the opponent's perspective-flipped THREAT checked (``hr.solve_threat`` —
+    the flip pretends the mover skips their turn, so a threat is often
+    defensible, NOT a proven loss; ``attacker_is_mover`` distinguishes the
+    two and the client renders threats behind a default-off toggle). Never
+    raises: any solver failure or absence of a forced win on either side is
+    reported as ``None`` — analysis must never crash because the display
+    solve had trouble.
     """
     try:
         import hexo_rs as hr
-        mover = state.current_player()
         res = hr.solve_forcing(state, depth_cap, node_budget)
-        winner, attacker_is_mover, solved_state = mover, True, state
+        attacker_is_mover = True
+        winner, solved_state = state.current_player(), state
         if res is None:
-            if game_config is None:
-                return None
-            opp = "P1" if mover == "P2" else "P2"
-            opp_state = hr.GameState.from_state(state.placed_stones(), opp, 2, game_config)
-            res = hr.solve_forcing(opp_state, depth_cap, node_budget)
+            res = hr.solve_threat(state, depth_cap, node_budget)
             if res is None:
                 return None
-            winner, attacker_is_mover, solved_state = opp, False, opp_state
+            attacker_is_mover = False
+            opp = "P1" if winner == "P2" else "P2"
+            winner = opp
+            solved_state = hr.GameState.from_state(
+                state.placed_stones(), opp, 2, state.config())
         first_move, pv = res
         pv = [[int(q), int(r)] for (q, r) in pv]
         # Per-cell ownership: the PV's chunk lengths are NOT a fixed pairs-of-2
@@ -309,7 +313,7 @@ def _solve_forcing(state, game_config, depth_cap=ANALYSIS_DEPTH_CAP,
 
 
 def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
-                     mcts_m_actions: int = 16, game_config=None,
+                     mcts_m_actions: int = 16,
                      forcing_depth_cap=ANALYSIS_DEPTH_CAP,
                      forcing_node_budget=ANALYSIS_NODE_BUDGET) -> AnalysisResult:
     """Evaluate a single position.
@@ -319,14 +323,14 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
     ``probs`` plus ``q_hat`` / ``improved_policy`` / ``candidate_set`` for the
     visited candidates.
 
-    ``game_config`` (an ``hr.GameConfig``), if given, additionally solves for a
-    forced win (VCF) on either side via ``hr.solve_forcing`` — never the
-    ``gumbel_mcts`` shortcut, whose one-hot ``improved_policy`` would flatten
-    this eval heatmap. See ``AnalysisResult.forcing``. ``forcing_depth_cap`` /
+    Additionally solves for a forced win (VCF) on either side via
+    ``hr.solve_forcing`` / ``hr.solve_threat`` — never the ``gumbel_mcts``
+    shortcut, whose one-hot ``improved_policy`` would flatten this eval
+    heatmap. See ``AnalysisResult.forcing``. ``forcing_depth_cap`` /
     ``forcing_node_budget`` default to the single-position ``ANALYSIS_*``
     budgets; ``analyze_game_full`` overrides them with the tighter
-    ``TRAJECTORY_*`` budgets since it solves twice per prefix across a whole
-    game.
+    ``TRAJECTORY_*`` budgets since it solves up to twice per prefix across a
+    whole game.
     """
     if state.is_terminal():
         return AnalysisResult(
@@ -401,7 +405,7 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
     threats = _scan_threats(data, legal_out, probs,
                             current_player=state.current_player(),
                             relative_stones=relative)
-    forcing = _solve_forcing(state, game_config, forcing_depth_cap, forcing_node_budget)
+    forcing = _solve_forcing(state, forcing_depth_cap, forcing_node_budget)
     return AnalysisResult(
         legal=[list(c) for c in legal_out],
         value=value,
@@ -742,12 +746,12 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
 
     if run_mcts_fn is None:
         def run_mcts_fn(st):
-            # Trajectory solves run twice per placement across the whole game,
-            # so they use the tighter TRAJECTORY_* budget, not ANALYSIS_*
-            # (the single-position /analyze default) — see the consts' bench.
+            # Trajectory solves run up to twice per placement across the
+            # whole game, so they use the tighter TRAJECTORY_* budget, not
+            # ANALYSIS_* (the single-position /analyze default) — see the
+            # consts' bench.
             return analyze_position(model, model_config, st,
                                     mcts_sims=mcts_sims, mcts_m_actions=mcts_m_actions,
-                                    game_config=cfg,
                                     forcing_depth_cap=TRAJECTORY_DEPTH_CAP,
                                     forcing_node_budget=TRAJECTORY_NODE_BUDGET)
 

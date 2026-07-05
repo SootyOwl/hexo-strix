@@ -385,8 +385,8 @@ function currentAnalysisIdx() {
   return analysisCurrent ? analysisCurrent.depth : 0;
 }
 
-// Re-draw the current node (used by the heatmap toggle so flipping it on/off
-// repaints the board immediately).
+// Re-draw the current node (used by the "Suggested moves" / "Forced wins" /
+// "Threats" toggles so flipping them on/off repaints the board immediately).
 function rerenderCurrentAnalysis() {
   renderNode(analysisCurrent);
 }
@@ -760,8 +760,18 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
   // game), so it can't be inferred from position alone. If the server's
   // replay failed (pv_owners null), fall back to styling every cell as
   // attacker rather than guessing a cadence that's often wrong.
-  if (boardResult.forcing && boardResult.forcing.pv && boardResult.forcing.pv.length) {
-    const f = boardResult.forcing;
+  // Two toggles gate the display: "Forced wins" (attacker_is_mover true — a
+  // PROVEN win for the side to move, default on) and "Threats"
+  // (attacker_is_mover false — a perspective-flipped solve that pretends the
+  // mover skips their turn, so it's often defensible; default OFF because
+  // routinely showing them muddies the analysis).
+  const isProven = boardResult.forcing && boardResult.forcing.attacker_is_mover === true;
+  const showThis = boardResult.forcing && (isProven
+    ? document.getElementById("analysis-forcing").checked
+    : document.getElementById("analysis-threats").checked);
+  const forcing = showThis ? boardResult.forcing : null;
+  if (forcing && forcing.pv && forcing.pv.length) {
+    const f = forcing;
     const attackerColor = f.winner === "P2" ? "#3fb6d9" : "#f08a3c";
     // Defender's forced blocks render in the DEFENDER's own stone colour
     // (still dotted via .forcing-pv-defender), so the two sides of the line
@@ -797,12 +807,13 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
   body += "</g>";
   svg.innerHTML = body;
   updateAnalysisTransform();
-  updateForcingBanner(boardResult.forcing);
+  updateForcingBanner(forcing);
 }
 
 // One-line banner above the board reporting the both-side VCF solve, if any
-// (result.forcing; see drawAnalysisBoard's PV overlay for the coordinate
-// rendering). Created on first use so no static markup needs to change.
+// (result.forcing, pre-filtered by drawAnalysisBoard's per-kind toggles; see
+// its PV overlay for the coordinate rendering). Created on first use so no
+// static markup needs to change.
 function updateForcingBanner(forcing) {
   const container = document.getElementById("analysis-board-container");
   if (!container) return;
@@ -823,9 +834,8 @@ function updateForcingBanner(forcing) {
   const defender = forcing.winner === "P1" ? "P2" : "P1";
   banner.textContent = forcing.attacker_is_mover
     ? `${forcing.winner} has a forced win (${forcing.pv_len}-move line)`
-    : `${forcing.winner} threatens a forced win — ${defender} must defend this turn`;
-  // "win"/"threat" classes carry the colour (observatory.css);
-  // attacker_is_mover means the win is proven, not merely threatened.
+    : `${forcing.winner} threatens a forced win — ${defender} must answer`;
+  // "win"/"threat" classes carry the colour (observatory.css).
   banner.classList.toggle("win", forcing.attacker_is_mover);
   banner.classList.toggle("threat", !forcing.attacker_is_mover);
 }

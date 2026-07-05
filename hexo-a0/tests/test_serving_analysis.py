@@ -399,7 +399,7 @@ def _forcing_fork_state_midturn():
 def test_analyze_position_reports_movers_forced_win():
     cfg, state = _forcing_fork_state("P1")
     mc = types.SimpleNamespace(graph_type="hex")
-    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    r = analyze_position(_ZeroLogitModel(), mc, state)
     assert r.forcing is not None
     assert r.forcing["winner"] == state.current_player() == "P1"
     assert r.forcing["attacker_is_mover"] is True
@@ -411,37 +411,27 @@ def test_analyze_position_reports_movers_forced_win():
     assert js["forcing"]["pv_len"] == len(pv)
 
 
-def test_analyze_position_reports_opponents_forced_win():
+def test_analyze_position_reports_opponents_threat():
     # Same stones, but P2 (with no stones of its own) is to move: P2 has no
-    # win, so the solve flips and finds P1's win on the other side.
+    # win of its own, so the solve falls back to the opponent's
+    # perspective-flipped THREAT (hr.solve_threat) — reported with
+    # attacker_is_mover=False so the client can gate it behind the
+    # default-off "Threats" toggle instead of overstating it as a win.
     cfg, state = _forcing_fork_state("P2")
     mc = types.SimpleNamespace(graph_type="hex")
-    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    r = analyze_position(_ZeroLogitModel(), mc, state)
     assert r.forcing is not None
     assert r.forcing["winner"] == "P1"
     assert r.forcing["attacker_is_mover"] is False
+    # pv_owners must reflect the FLIPPED replay (P1 moves first in the line).
+    assert r.forcing["pv_owners"][0] == "P1"
 
 
-def test_analyze_position_no_forcing_is_none_and_config_none_skips_opponent(monkeypatch):
-    import hexo_rs as hr
+def test_analyze_position_no_forcing_is_none():
     state = build_state([(0, 0), (1, 0), (2, 0)], 6, 8, 400)  # no forced win either side
     mc = types.SimpleNamespace(graph_type="hex")
-
-    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=None)
+    r = analyze_position(_ZeroLogitModel(), mc, state)
     assert r.forcing is None
-
-    calls = {"n": 0}
-
-    def _counting_solve(*a, **k):
-        calls["n"] += 1
-        return None
-
-    monkeypatch.setattr(hr, "solve_forcing", _counting_solve)
-    r2 = analyze_position(_ZeroLogitModel(), mc, state, game_config=None)
-    assert r2.forcing is None
-    # game_config=None must skip the opponent-side solve outright — only the
-    # mover-side call happens.
-    assert calls["n"] == 1
 
 
 def test_analyze_position_forcing_never_crashes_analysis(monkeypatch):
@@ -453,29 +443,9 @@ def test_analyze_position_forcing_never_crashes_analysis(monkeypatch):
         raise RuntimeError("solver exploded")
 
     monkeypatch.setattr(hr, "solve_forcing", _boom)
-    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    r = analyze_position(_ZeroLogitModel(), mc, state)
     assert r.forcing is None  # swallowed, not propagated
     assert r.legal  # the rest of the analysis still completed
-
-
-def test_analyze_game_full_default_run_mcts_fn_threads_game_config(monkeypatch):
-    # Step 7: analyze_game_full's own default run_mcts_fn (used whenever the
-    # caller doesn't override it, as app.py's SSE handler does) must pass
-    # game_config through to analyze_position too — not just app.py's own
-    # call sites — so per-prefix `forcing` is populated on that path as well.
-    import hexo_a0.serving.analysis as analysis_mod
-    model, mc, _ = load_model(CKPT, "cpu")
-    real_analyze_position = analysis_mod.analyze_position
-    seen = []
-
-    def spy(*a, **kw):
-        seen.append(kw.get("game_config"))
-        return real_analyze_position(*a, **kw)
-
-    monkeypatch.setattr(analysis_mod, "analyze_position", spy)
-    analyze_game_full(model, mc, _GAME, 6, 8, 400, mcts_sims=16)
-    assert seen  # run_mcts_fn was invoked at least once
-    assert all(c is not None for c in seen)
 
 
 def test_analyze_position_pv_owners_variable_length_first_chunk():
@@ -485,7 +455,7 @@ def test_analyze_position_pv_owners_variable_length_first_chunk():
     # mislabels everything after it. pv_owners must come from a real replay.
     cfg, state = _forcing_fork_state_midturn()
     mc = types.SimpleNamespace(graph_type="hex")
-    r = analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    r = analyze_position(_ZeroLogitModel(), mc, state)
     assert r.forcing is not None
     js = r.to_json()["forcing"]
     pv, owners = js["pv"], js["pv_owners"]
@@ -531,7 +501,7 @@ def test_analyze_position_defaults_to_analysis_budget(monkeypatch):
         return None
 
     monkeypatch.setattr(hr, "solve_forcing", _spy)
-    analyze_position(_ZeroLogitModel(), mc, state, game_config=cfg)
+    analyze_position(_ZeroLogitModel(), mc, state)
     assert seen and seen[0] == (ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET)
 
 
@@ -580,7 +550,7 @@ def _forcing_stub(*rules):
     return `forcing_dict` when called on a state whose exact placed-stone set
     matches `stones`; `None` for every other position."""
     targets = [(frozenset(stones), dict(forcing)) for stones, forcing in rules]
-    def _stub(state, game_config, depth_cap, node_budget):
+    def _stub(state, depth_cap, node_budget):
         current = frozenset(state.placed_stones())
         for stones, forcing in targets:
             if current == stones:

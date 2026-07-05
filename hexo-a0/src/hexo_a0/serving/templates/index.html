@@ -63,6 +63,8 @@
     <div class="row">
       <button onclick="loadAnalysis()">Load / Analyze</button>
       <label><input type="checkbox" id="analysis-heatmap" checked onchange="rerenderCurrentAnalysis()"> Suggested moves</label>
+      <label><input type="checkbox" id="analysis-forcing" checked onchange="rerenderCurrentAnalysis()"> Forced wins</label>
+      <label><input type="checkbox" id="analysis-threats" onchange="rerenderCurrentAnalysis()"> Threats</label>
     </div>
     <div id="analysis-progress">
       <div id="analysis-progress-track"><div id="analysis-progress-bar"></div></div>

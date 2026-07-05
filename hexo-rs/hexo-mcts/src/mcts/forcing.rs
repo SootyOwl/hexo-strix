@@ -20,6 +20,7 @@ use hexo_engine::hex::{hex_distance as hex_dist, hex_offsets};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
+use std::time::Instant;
 
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 /// Max supported win_length: strip-scan buffers are stack arrays of 2*MAX_WL-1.
@@ -1297,6 +1298,275 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
         remaining = sd;
     }
     pv
+}
+
+/// Defensive read-out for the side to move when the OPPONENT — hypothetically
+/// to move with a fresh 2-placement turn — has a proven forcing win.
+///
+/// Semantics match the live-play defense loop this replaces (game.py's
+/// `_defensive_move` heuristics, 2026-07-05): a candidate "kills" the threat
+/// when the flipped re-solve after it no longer proves the win, where
+/// `BudgetExceeded` counts as killed (parity with the old loop; an honest
+/// "couldn't re-prove" stands down to MCTS rather than panicking the defense).
+pub struct DefenseAnalysis {
+    /// The opponent's proven threat line (flipped fresh-turn solve).
+    pub threat_pv: Vec<Coord>,
+    /// Single placements after which the threat is no longer provable, or
+    /// which end the game outright (the engine has no self-loss rule, so a
+    /// terminal mover placement is a mover win or a draw — both strictly
+    /// better than the standing loss).
+    pub killers: Vec<Coord>,
+    /// (first, second) placement pairs that jointly refute the threat.
+    /// Searched only when the mover has 2 placements left and `killers` is
+    /// empty — this is the case the old max-delay survivor heuristic lost
+    /// (strongloss_a: every killer pair was anchored on a cell the delay
+    /// metric ranked below a far-away non-anchor). `first` alone does NOT
+    /// refute; the caller plays it and the next placement's re-check finds
+    /// `second` (or better).
+    pub pair_anchors: Vec<(Coord, Coord)>,
+    /// Max-delay fallback: the surviving candidate whose re-proven threat PV
+    /// is longest (first such in PV order on ties, matching the old loop).
+    /// `None` when the threat PV offers no legal candidate.
+    pub best_delay: Option<Coord>,
+}
+
+/// `game` with the same stones but `side` to move on a fresh 2-placement turn
+/// — the hypothetical the defense reasons about.
+fn flipped_fresh_turn(game: &GameState, side: Player) -> GameState {
+    let stones: Vec<(Coord, Player)> = game.stones().iter().map(|(&c, &p)| (c, p)).collect();
+    GameState::from_state(&stones, side, 2, *game.config())
+}
+
+/// Forcing win for the OPPONENT of the side to move, as if it were their
+/// turn (fresh 2 placements): a THREAT, not a proven loss — the actual mover
+/// places first and may break it (see `solve_defense` for exactly that
+/// question). Display/analysis convenience so callers don't have to rebuild
+/// a flipped `GameState` themselves.
+pub fn solve_threat(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
+    match game.current_player() {
+        Some(mover) => solve(&flipped_fresh_turn(game, mover.opponent()), depth_cap, node_budget),
+        None => Outcome::No,
+    }
+}
+
+/// Solve the mover's defensive problem: is the opponent's (flipped) forcing
+/// win refutable this turn, and by which placements?
+///
+/// Returns `None` when there is no proven opponent threat (nothing to defend;
+/// by threat monotonicity — the mover's stones only remove opponent threat
+/// cells — the caller can safely fall through to normal search). Candidates
+/// are the threat-PV cells the mover can legally take, in PV order; each
+/// killer/pair verification is one flipped re-`solve` at the same
+/// `depth_cap`/`node_budget` as the threat solve (the SAME tier sees the SAME
+/// depth on both sides). `time_limit` bounds the whole analysis: on expiry
+/// the partial result is returned (unverified candidates are simply not
+/// reported), so live turns stay bounded no matter how many candidates the
+/// threat line offers.
+pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
+                     time_limit: std::time::Duration) -> Option<DefenseAnalysis> {
+    let mover = game.current_player()?;
+    let opp = mover.opponent();
+    let t0 = Instant::now();
+    let threat = match solve(&flipped_fresh_turn(game, opp), depth_cap, node_budget) {
+        Outcome::Win(w) => w,
+        Outcome::No | Outcome::BudgetExceeded => return None,
+    };
+    let legal = game.legal_moves_set();
+    let mut candidates: Vec<Coord> = Vec::new();
+    for &c in &threat.pv {
+        if legal.contains(&c) && !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+
+    let mut killers: Vec<Coord> = Vec::new();
+    // Survivors keep the PV their re-solve proved: its length is the delay
+    // metric, its cells are the second-placement candidates in the pair pass.
+    let mut survivors: Vec<(Coord, Vec<Coord>)> = Vec::new();
+    for &c in &candidates {
+        if t0.elapsed() > time_limit { break; }
+        let mut trial = game.clone();
+        if trial.apply_move(c).is_err() { continue; }
+        if trial.is_terminal() {
+            killers.push(c);
+            continue;
+        }
+        match solve(&flipped_fresh_turn(&trial, opp), depth_cap, node_budget) {
+            Outcome::Win(w) => survivors.push((c, w.pv)),
+            Outcome::No | Outcome::BudgetExceeded => killers.push(c),
+        }
+    }
+
+    let mut pair_anchors: Vec<(Coord, Coord)> = Vec::new();
+    if killers.is_empty() && game.moves_remaining_this_turn() == 2 {
+        'anchors: for (c1, pv2) in &survivors {
+            if t0.elapsed() > time_limit { break; }
+            let mut trial = game.clone();
+            if trial.apply_move(*c1).is_err() { continue; }
+            let legal2 = trial.legal_moves_set().clone();
+            let mut seconds: Vec<Coord> = Vec::new();
+            for &c in pv2 {
+                if legal2.contains(&c) && !seconds.contains(&c) {
+                    seconds.push(c);
+                }
+            }
+            for c2 in seconds {
+                if t0.elapsed() > time_limit { break 'anchors; }
+                let mut trial2 = trial.clone();
+                if trial2.apply_move(c2).is_err() { continue; }
+                let refuted = trial2.is_terminal()
+                    || !matches!(
+                        solve(&flipped_fresh_turn(&trial2, opp), depth_cap, node_budget),
+                        Outcome::Win(_)
+                    );
+                if refuted {
+                    // One verified completion per anchor: the caller only
+                    // plays `first`; the next placement re-checks anyway.
+                    pair_anchors.push((*c1, c2));
+                    continue 'anchors;
+                }
+            }
+        }
+    }
+
+    // First-in-PV-order on ties, like the old loop's max().
+    let mut best_delay: Option<(Coord, usize)> = None;
+    for (c, pv) in &survivors {
+        if best_delay.as_ref().is_none_or(|(_, len)| pv.len() > *len) {
+            best_delay = Some((*c, pv.len()));
+        }
+    }
+
+    Some(DefenseAnalysis {
+        threat_pv: threat.pv,
+        killers,
+        pair_anchors,
+        best_delay: best_delay.map(|(c, _)| c),
+    })
+}
+
+#[cfg(test)]
+mod defense_tests {
+    use super::*;
+    use hexo_engine::game::{GameConfig, GameState};
+    use hexo_engine::types::Player;
+    use std::time::Duration;
+
+    // Live serve config (wl=6, r=8) and budgets ("strong" tier as of
+    // 2026-07-05: depth 10, 20k nodes — the config the fixture games were
+    // lost at).
+    const CFG: GameConfig = GameConfig { win_length: 6, placement_radius: 8, max_moves: 400 };
+    const DEPTH: u8 = 10;
+    const BUDGET: u64 = 20_000;
+    const NO_LIMIT: Duration = Duration::from_secs(600);
+
+    fn p(s: &str) -> Player { if s == "P1" { Player::P1 } else { Player::P2 } }
+
+    fn state(stones: &[(i32, i32, &str)], mover: &str, rem: u8) -> GameState {
+        let typed: Vec<(Coord, Player)> =
+            stones.iter().map(|&(q, r, pl)| ((q, r), p(pl))).collect();
+        GameState::from_state(&typed, p(mover), rem, CFG)
+    }
+
+    // strongloss_a_line.json prefix 6 (scripts/fixtures/forcing_puzzles/):
+    // the live game where the max-delay survivor heuristic lost — the human
+    // (P2) completed an 18-placement VCF; every single P1 block re-proves it,
+    // but killer PAIRS exist. The live bot played (-3,3), the max-delay pick,
+    // and lost; a pair anchor was the saving move.
+    const STRONGLOSS_A6: &[(i32, i32, &str)] = &[
+        (0, 0, "P1"), (1, 2, "P2"), (2, 3, "P2"), (3, -1, "P1"),
+        (2, 1, "P1"), (1, 4, "P2"), (1, 3, "P2"),
+    ];
+
+    // strongloss_b_line.json prefix 8: same failure shape, other colour
+    // (P1's VCF, P2 to defend), from the second lost live game.
+    const STRONGLOSS_B8: &[(i32, i32, &str)] = &[
+        (0, 0, "P1"), (1, 2, "P2"), (2, 3, "P2"), (2, 2, "P1"), (3, -2, "P1"),
+        (3, 4, "P2"), (3, -1, "P2"), (2, -2, "P1"), (1, -2, "P1"),
+    ];
+
+    /// Every reported pair must actually refute the threat: apply both
+    /// placements, flip, re-solve — no proven win may remain.
+    fn assert_anchors_refute(game: &GameState, analysis: &DefenseAnalysis) {
+        let opp = game.current_player().unwrap().opponent();
+        assert!(!analysis.pair_anchors.is_empty(), "expected killer pairs");
+        for &(c1, c2) in &analysis.pair_anchors {
+            let mut trial = game.clone();
+            trial.apply_move(c1).unwrap();
+            trial.apply_move(c2).unwrap();
+            assert!(
+                trial.is_terminal()
+                    || !matches!(
+                        solve(&flipped_fresh_turn(&trial, opp), DEPTH, BUDGET),
+                        Outcome::Win(_)
+                    ),
+                "anchor pair ({c1:?}, {c2:?}) does not refute the threat"
+            );
+        }
+    }
+
+    #[test]
+    fn defense_finds_killer_pairs_strongloss_a() {
+        let game = state(STRONGLOSS_A6, "P1", 2);
+        let a = solve_defense(&game, DEPTH, BUDGET, NO_LIMIT)
+            .expect("P2's VCF must be detected");
+        assert!(a.killers.is_empty(), "no single block survives here");
+        assert_anchors_refute(&game, &a);
+        assert!(a.best_delay.is_some());
+    }
+
+    #[test]
+    fn defense_finds_killer_pairs_strongloss_b() {
+        let game = state(STRONGLOSS_B8, "P2", 2);
+        let a = solve_defense(&game, DEPTH, BUDGET, NO_LIMIT)
+            .expect("P1's VCF must be detected");
+        assert!(a.killers.is_empty(), "no single block survives here");
+        assert_anchors_refute(&game, &a);
+    }
+
+    #[test]
+    fn defense_none_when_no_threat() {
+        // strongloss_a prefix 2: quiet opening, no VCF on either side.
+        let game = state(&STRONGLOSS_A6[..3], "P1", 2);
+        assert!(solve_defense(&game, DEPTH, BUDGET, NO_LIMIT).is_none());
+    }
+
+    #[test]
+    fn solve_threat_flips_to_the_opponent() {
+        // strongloss_a prefix 6: P1 to move, P2 (flipped) has the proven VCF.
+        let game = state(STRONGLOSS_A6, "P1", 2);
+        assert!(matches!(solve(&game, DEPTH, BUDGET), Outcome::No));
+        assert!(matches!(solve_threat(&game, DEPTH, BUDGET), Outcome::Win(_)));
+        // Quiet opening: no threat either way.
+        let quiet = state(&STRONGLOSS_A6[..3], "P1", 2);
+        assert!(matches!(solve_threat(&quiet, DEPTH, BUDGET), Outcome::No));
+    }
+
+    #[test]
+    fn defense_single_placement_skips_pair_search() {
+        // strongloss_a prefix 7: the real game's P1 already spent placement 1
+        // on (-3,3) (the max-delay pick); with rem=1 only single killers are
+        // meaningful — the pair pass must not run.
+        let mut stones = STRONGLOSS_A6.to_vec();
+        stones.push((-3, 3, "P1"));
+        let game = state(&stones, "P1", 1);
+        let a = solve_defense(&game, DEPTH, BUDGET, NO_LIMIT)
+            .expect("threat still stands after the wasted block");
+        assert!(a.pair_anchors.is_empty(), "no pair search at rem=1");
+        assert!(!a.killers.is_empty() || a.best_delay.is_some());
+    }
+
+    #[test]
+    fn defense_time_limit_returns_partial() {
+        // A zero time limit must still return (an empty-but-well-formed
+        // analysis with the threat PV), never hang or panic.
+        let game = state(STRONGLOSS_A6, "P1", 2);
+        let a = solve_defense(&game, DEPTH, BUDGET, Duration::ZERO)
+            .expect("threat solve itself is not limited");
+        assert!(!a.threat_pv.is_empty());
+        assert!(a.killers.is_empty() && a.pair_anchors.is_empty());
+        assert!(a.best_delay.is_none());
+    }
 }
 
 #[cfg(test)]
