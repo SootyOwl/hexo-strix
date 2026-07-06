@@ -749,6 +749,15 @@ def _run_curriculum(args):
 def _run_serve(args):
     from hexo_a0.serving.app import run
 
+    # Without a configured handler, Python's last-resort handler drops
+    # everything below WARNING — serving's INFO logs (e.g. the native
+    # hexo-infer attach confirmation) would never reach docker logs.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     config_path = Path(args.config)
     if not config_path.exists():
         print(f"Config not found: {config_path}")
