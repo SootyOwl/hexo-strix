@@ -200,6 +200,21 @@ def _validate_config(cfg: FullConfig) -> None:
                 "[model] use_jk=true and jk_mode='cat'; got "
                 f"use_jk={mc.use_jk}, jk_mode={mc.jk_mode!r}."
             )
+    # Distributional value head invariants.
+    vbins = getattr(mc, "value_bins", 0)
+    if vbins != 0 and vbins < 2:
+        raise ValueError(
+            f"[model] value_bins={vbins} is invalid: use 0 (scalar head) or "
+            f">=2 (distributional head)."
+        )
+    if vbins > 0 and getattr(mc, "value_bin_min", -1.0) >= getattr(
+        mc, "value_bin_max", 1.0
+    ):
+        raise ValueError(
+            f"[model] value_bin_min ({mc.value_bin_min}) must be < value_bin_max "
+            f"({mc.value_bin_max}) when value_bins>0."
+        )
+
     if getattr(tc, "graft_threat_features", False) and getattr(
         mc, "relative_stone_encoding", False
     ):

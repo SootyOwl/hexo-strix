@@ -28,6 +28,9 @@ class ModelConfig:
     # --- Output heads ---
     policy_hidden: int = _f(128, "Hidden size of the policy head MLP", group="Output heads")
     value_hidden: int = _f(128, "Hidden size of the value head MLP", group="Output heads")
+    value_bins: int = _f(0, "Distributional (categorical) value head: number of value bins spanning [value_bin_min, value_bin_max]. 0 = scalar tanh head (legacy, default). When >0 (>=2), the value head outputs a softmax over bins and the scalar is the softmax expectation (decode_binned_value); training uses a two-hot cross-entropy. An odd count puts a bin center exactly at the draw value. Suggested 65. FROM-SCRATCH ONLY (replaces the scalar head; no graft).", group="Output heads")
+    value_bin_min: float = _f(-1.0, "Lower end of the distributional value head's bin grid (only used when value_bins>0).", group="Output heads")
+    value_bin_max: float = _f(1.0, "Upper end of the distributional value head's bin grid (only used when value_bins>0).", group="Output heads")
     # --- Graph construction ---
     graph_type: str = _f("axis", "Graph topology: 'hex' (distance-1 adjacency, ~9 layers) or 'axis' (axis-window with edge features, ~3 layers)", group="Graph construction")
     prune_empty_edges: bool = _f(True, "Drop empty→empty edges in axis-window graphs (reduces graph size, only affects graph_type='axis')", group="Graph construction")
