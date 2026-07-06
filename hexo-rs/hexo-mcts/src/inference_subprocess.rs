@@ -73,6 +73,19 @@ pub fn spawn_command(
         Some(bin) => {
             let mut cmd = Command::new(bin);
             cmd.arg("--checkpoint").arg(checkpoint);
+            // These are set on self_play's own process to tame the
+            // Python/torch subprocess's internal thread pool (torch/MKL
+            // read OMP_NUM_THREADS at init). A native inference binary
+            // never uses torch/MKL, but if it happens to link an
+            // OpenMP-runtime library (e.g. libgomp, transitively), that
+            // runtime reacts to these vars itself — calling
+            // sched_setaffinity() to pin the whole process to a single
+            // core — even though our Rust code never calls into OpenMP.
+            // Scrub them from the child's env unconditionally so a native
+            // binary never silently inherits Python-subprocess tuning.
+            cmd.env_remove("OMP_NUM_THREADS");
+            cmd.env_remove("MKL_NUM_THREADS");
+            cmd.env_remove("OMP_PROC_BIND");
             cmd
         }
         None => {
@@ -591,5 +604,49 @@ mod spawn_command_tests {
         let args = args_of(&cmd);
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a == "hexo_a0.inference_server"));
+    }
+
+    /// `Command::get_envs()` yields `(key, None)` for a key explicitly
+    /// cleared via `env_remove`, distinct from a key never mentioned at all
+    /// (which simply doesn't appear in the iterator). This lets us assert
+    /// the *constructed* `Command`'s env overrides directly, without
+    /// actually spawning a child and inspecting its real environment.
+    fn is_env_removed(cmd: &Command, key: &str) -> bool {
+        cmd.get_envs()
+            .any(|(k, v)| k.to_string_lossy() == key && v.is_none())
+    }
+
+    #[test]
+    fn inference_bin_scrubs_openmp_env_vars() {
+        let checkpoint = Path::new("/tmp/model.pt");
+        let bin = Path::new("/usr/local/bin/hexo-infer-server");
+        let cmd = spawn_command("python3", Some(bin), checkpoint, &[]);
+
+        for key in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OMP_PROC_BIND"] {
+            assert!(
+                is_env_removed(&cmd, key),
+                "native inference_bin Command must env_remove {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_path_leaves_openmp_env_vars_untouched() {
+        let checkpoint = Path::new("/tmp/model.pt");
+        let cmd = spawn_command("python3", None, checkpoint, &[]);
+
+        // The Python branch must not add any env overrides at all — it
+        // relies on inheriting the parent's OMP/MKL tuning vars unchanged.
+        assert_eq!(
+            cmd.get_envs().count(),
+            0,
+            "python branch Command must have zero env overrides"
+        );
+        for key in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OMP_PROC_BIND"] {
+            assert!(
+                !is_env_removed(&cmd, key),
+                "python branch must not env_remove {key}"
+            );
+        }
     }
 }
