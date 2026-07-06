@@ -99,6 +99,14 @@ def _attach_native(model, ckpt, checkpoint_path):
     import os
 
     model._hexo_native = None
+    if os.environ.get("HEXO_NATIVE_INFER", "").lower() in ("0", "false", "off"):
+        # A/B lever: the pure-Rust kernel measured SLOWER than torch for
+        # serving MCTS on the x86 dev box (2026-07-06: 1.0s vs 0.67s @128
+        # sims, 4.3s vs 3.5s @512 on champion.pt) — its optimizations target
+        # the WASM build. Disable to compare on the deployment host.
+        logging.getLogger(__name__).info(
+            "native hexo-infer engine disabled via HEXO_NATIVE_INFER")
+        return
     try:
         from hexo_a0.export import serialize_safetensors
 

@@ -35,6 +35,15 @@ services:
       HEXO_DEFAULT_DIFFICULTY: "${HEXO_DEFAULT_DIFFICULTY:-}"
       # Required — the /admin token. `:?` makes compose refuse to start if unset.
       HEXO_ADMIN_TOKEN: "${HEXO_ADMIN_TOKEN:?set HEXO_ADMIN_TOKEN in .env}"
+      # Rotating server log (10 MB x 5) on the persistent /data volume, so
+      # logs survive container recreation (docker's own logs do not). The
+      # bot-placement timing lines land here. Set empty to disable.
+      HEXO_LOG_FILE: "${HEXO_LOG_FILE:-/data/logs/serve.log}"
+      # Pure-Rust inference engine for bot moves ("0"/"false"/"off" -> torch
+      # eval path). A/B lever: on the x86 dev box the Rust kernel measured
+      # ~1.3x SLOWER than torch for serving MCTS — compare on this host via
+      # the placement timing logs before trusting the default.
+      HEXO_NATIVE_INFER: "${HEXO_NATIVE_INFER:-1}"
 
     volumes:
       # Trained checkpoint, read-only. ",Z" relabels it for SELinux (Oracle Linux
@@ -45,6 +54,14 @@ services:
 
     security_opt:
       - no-new-privileges:true
+
+    # Bound docker's own stdout/stderr capture (unbounded by default). The
+    # durable copy is HEXO_LOG_FILE on the /data volume.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     # The image already defines a HEALTHCHECK (GET /), surfaced by `docker ps`.
 

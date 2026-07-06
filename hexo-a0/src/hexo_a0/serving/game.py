@@ -418,9 +418,9 @@ def make_bot_turn_fn(
             while remaining:
                 chosen = _policy_argmax(state, restrict_to=remaining)
                 if time.monotonic() >= verify_deadline:
-                    return chosen
+                    return chosen, "killer-unverified"
                 if _verified_defense(rec, depth_cap, (chosen,)):
-                    return chosen
+                    return chosen, "killer"
                 remaining.discard(chosen)
             # Every killer was a budget artifact: a pair may still hold.
         pairs = [(tuple(c1), tuple(c2)) for (c1, c2) in pair_anchors]
@@ -433,27 +433,28 @@ def make_bot_turn_fn(
             chosen = _policy_argmax(
                 state, restrict_to={c1 for (c1, _c2) in pairs})
             partner = next(c2 for (c1, c2) in pairs if c1 == chosen)
-            if (time.monotonic() >= verify_deadline
-                    or _verified_defense(rec, depth_cap, (chosen, partner))):
+            timed_out = time.monotonic() >= verify_deadline
+            if timed_out or _verified_defense(rec, depth_cap, (chosen, partner)):
                 rec.defense_partner = partner
                 # After the anchor is appended to move_log, its length is
                 # len+1 — the partner applies at exactly that placement.
                 rec.defense_partner_base = len(rec.move_log) + 1
-                return chosen
+                return chosen, ("pair-unverified" if timed_out else "pair")
             pairs = [p for p in pairs if p != (chosen, partner)]
         if best_delay is not None:
             # No refutation found this placement: play the survivor with the
             # longest surviving PV (max delay). The next placement re-runs
             # this whole check against the updated threat.
-            return tuple(best_delay)
+            return tuple(best_delay), "delay"
         # No candidates at all (or deadline expired before any could be
         # verified): fall through to MCTS.
         return None
 
     def _forcing_move(rec: GameRecord):
         """Steps 1-3 of the live-play forcing check, run before `_pick_move`
-        on every bot placement. Returns a move to play, or None to fall
-        through to the existing MCTS / raw-argmax path unchanged.
+        on every bot placement. Returns ``(move, src)`` — ``src`` names the
+        mechanism for the placement log line — or None to fall through to the
+        existing MCTS / raw-argmax path unchanged.
         """
         state = rec.state
         legal = {tuple(c) for c in state.legal_moves()}
@@ -478,7 +479,7 @@ def make_bot_turn_fn(
             if 0 <= k < len(rec.forcing_pv) and played == pv_prefix:
                 nxt = tuple(rec.forcing_pv[k])
                 if nxt in legal:
-                    return nxt
+                    return nxt, "pv"
             # Deviation (or an exhausted/stale cache): re-solve from scratch.
             rec.forcing_pv = None
 
@@ -490,7 +491,7 @@ def make_bot_turn_fn(
             if first_move in legal:
                 rec.forcing_pv = [tuple(m) for m in pv]
                 rec.forcing_base = len(rec.move_log)
-                return first_move
+                return first_move, "win"
             logger.error(
                 "solve_forcing returned illegal first_move %r for game %s",
                 first_move, rec.game_id,
@@ -499,7 +500,7 @@ def make_bot_turn_fn(
         # 2.5. Verified pair partner from this turn's anchor placement: a
         # proven killer, played without any re-solve.
         if partner is not None:
-            return partner
+            return partner, "partner"
 
         # 3. Defensive pre-emptive check (only when step 2 found nothing).
         return _defensive_move(rec, depth_cap)
@@ -521,22 +522,42 @@ def make_bot_turn_fn(
                     return
                 if rec.state.current_player() != rec.bot_side:
                     return
-                move = None
+                move = src = None
+                forcing_ms = 0.0
                 # All difficulty tiers get forcing (win execution + defense) —
                 # deliberately never OFF for weaker tiers: what varies is HOW
                 # DEEP each tier's forcing search reaches (`_forcing_depth_for`,
                 # graded like sim count) and how many sims back up MCTS, not
                 # whether a tier is allowed to notice a forced win at all.
                 if live_forcing:
+                    t0 = time.perf_counter()
                     try:
-                        move = _forcing_move(rec)
+                        res = _forcing_move(rec)
+                        if res is not None:
+                            move, src = res
                     except Exception as e:
                         # The solver must never take down live play.
                         _log_forcing_exception(rec.game_id, e)
                         move = None
-                q, r = move if move is not None else _pick_move(rec.state, sims)
+                    forcing_ms = (time.perf_counter() - t0) * 1000
+                mcts_ms = 0.0
+                if move is not None:
+                    q, r = move
+                else:
+                    src = "mcts" if sims > 0 else "argmax"
+                    t0 = time.perf_counter()
+                    q, r = _pick_move(rec.state, sims)
+                    mcts_ms = (time.perf_counter() - t0) * 1000
                 rec.state.apply_move(q, r)
                 rec.move_log.append((q, r, rec.bot_side))
+                # One line per placement: attribute slow turns to the solver
+                # stack vs MCTS straight from the (docker) log.
+                logger.info(
+                    "bot placement game=%s diff=%s src=%s move=(%d,%d) "
+                    "forcing_ms=%.0f mcts_ms=%.0f",
+                    rec.game_id, rec.difficulty, src, q, r,
+                    forcing_ms, mcts_ms,
+                )
 
         guard.run(_play)
 

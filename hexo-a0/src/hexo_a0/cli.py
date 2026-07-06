@@ -746,17 +746,40 @@ def _run_curriculum(args):
     return 0
 
 
+def _configure_serve_logging(log_file: str | None):
+    """Console INFO logging plus an optional rotating file handler.
+
+    Without a configured handler, Python's last-resort handler drops
+    everything below WARNING — serving's INFO logs (bot-placement timing,
+    the native hexo-infer attach confirmation) would never reach docker
+    logs. ``log_file`` (from ``HEXO_LOG_FILE``) additionally persists them
+    to disk: docker's own log buffer dies with the container, a file on the
+    /data volume survives redeploys for postmortems. Returns the file
+    handler (or None) so tests can detach it.
+    """
+    fmt = "%(asctime)s %(name)s %(levelname)s %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt)
+    # basicConfig no-ops (including its level=) when a handler already
+    # exists; pin the root level so INFO flows regardless of who configured
+    # logging first.
+    logging.getLogger().setLevel(logging.INFO)
+    if not log_file:
+        return None
+    from logging.handlers import RotatingFileHandler
+
+    path = Path(log_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(path, maxBytes=10_000_000, backupCount=5)
+    handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
 def _run_serve(args):
     from hexo_a0.serving.app import run
 
-    # Without a configured handler, Python's last-resort handler drops
-    # everything below WARNING — serving's INFO logs (e.g. the native
-    # hexo-infer attach confirmation) would never reach docker logs.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    _configure_serve_logging(os.environ.get("HEXO_LOG_FILE") or None)
 
     config_path = Path(args.config)
     if not config_path.exists():

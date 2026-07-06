@@ -4,6 +4,7 @@ Parity target: scripts/play_server.py:310-400 (make_bot_turn_fn) and 456-663
 (GameManager). Bot-turn GPU work is exercised only in the Task 1.8 manual
 play-through; here we inject a no-op bot to test the manager plumbing.
 """
+import logging
 import random
 import time
 import types
@@ -1100,6 +1101,82 @@ def test_forcing_defense_saves_chao_game_via_pair_cache(monkeypatch):
     after = hexo_rs.GameState.from_state(rec.state.placed_stones(), "P1", 2, cfg)
     assert hexo_rs.solve_forcing(after, depth, game_mod.VERIFY_NODE_BUDGET) is None
     assert calls["n"] == 1  # 2nd placement served from the pair cache
+
+
+def test_bot_turn_logs_placement_timing(monkeypatch, caplog):
+    # Deploy observability: every bot placement emits ONE INFO line with the
+    # move source and per-phase wall-clock (forcing/defense solver vs MCTS),
+    # so slow turns on the production box can be attributed from docker logs
+    # without a profiler.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 2, cfg)
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+    monkeypatch.setattr(hexo_rs, "solve_defense", lambda *a, **k: None)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-timing", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    with caplog.at_level(logging.INFO, logger="hexo_a0.serving.game"):
+        _bot_turn_fn(cfg_kwargs)(rec)
+
+    lines = [r.message for r in caplog.records if "bot placement" in r.message]
+    assert len(lines) == 2  # one per placement
+    for line in lines:
+        assert "src=argmax" in line  # mcts_sims=0 -> raw-argmax fallback
+        assert "forcing_ms=" in line and "mcts_ms=" in line
+        assert "game=g-timing" in line
+
+
+def test_bot_turn_logs_defense_source(monkeypatch, caplog):
+    # The source tag must name WHICH defense mechanism produced the move
+    # (killer / pair / partner / delay) — that's the field that would have
+    # shown the chao-loss deadline expiry ("delay" instead of "killer") at a
+    # glance in production logs.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 2, cfg)
+    legal = [tuple(c) for c in state.legal_moves()]
+    anchor, partner = legal[0], legal[1]
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+    monkeypatch.setattr(
+        hexo_rs, "solve_defense",
+        lambda *a, **k: ([], [(anchor, partner)], None, [anchor, partner]))
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-timing-src", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    with caplog.at_level(logging.INFO, logger="hexo_a0.serving.game"):
+        _bot_turn_fn(cfg_kwargs)(rec)
+
+    lines = [r.message for r in caplog.records if "bot placement" in r.message]
+    assert len(lines) == 2
+    assert "src=pair" in lines[0]
+    assert "src=partner" in lines[1]
+
+
+def test_serve_logging_writes_rotating_file(tmp_path):
+    # HEXO_LOG_FILE plumbing: the serve CLI attaches a rotating file handler
+    # so logs survive container recreation (docker logs don't).
+    from hexo_a0 import cli
+    logf = tmp_path / "logs" / "serve.log"
+    handler = cli._configure_serve_logging(str(logf))
+    try:
+        logging.getLogger("hexo_a0.serving.smoke").info("hello file")
+        handler.flush()
+        assert "hello file" in logf.read_text()
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
 
 
 def test_forcing_kill_switch_never_calls_solver(monkeypatch):

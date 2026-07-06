@@ -34,6 +34,18 @@ def _fresh_load(tiny_checkpoint):
     return load_model(tiny_checkpoint, "cpu")
 
 
+def test_native_attach_kill_switch(tiny_checkpoint, tmp_path, monkeypatch):
+    # HEXO_NATIVE_INFER=0 must skip the native attach so serving runs the
+    # torch eval path — the A/B lever for deployments where the pure-Rust
+    # kernel measures slower than torch (2026-07-06: it does, on x86 dev box).
+    import shutil
+    fresh = tmp_path / "tiny_kill_switch.pt"  # load_model caches by path
+    shutil.copy(tiny_checkpoint, fresh)
+    monkeypatch.setenv("HEXO_NATIVE_INFER", "0")
+    model, _, _ = load_model(str(fresh), "cpu")
+    assert model._hexo_native is None
+
+
 def test_native_engine_attaches(tiny_checkpoint):
     model, mc, ckpt = _fresh_load(tiny_checkpoint)
     assert getattr(model, "_hexo_native", None) is not None
