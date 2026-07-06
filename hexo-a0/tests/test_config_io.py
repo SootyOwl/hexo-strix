@@ -123,6 +123,14 @@ max_file_mb = 512
         assert cfg.self_play.rust.max_batch == 128
         assert cfg.self_play.rust.max_file_mb == 512
         assert cfg.self_play.rust.batch_timeout_ms == 5  # default
+        assert cfg.self_play.rust.inference_bin is None  # default
+
+    def test_self_play_rust_inference_bin(self):
+        cfg = load_config(_write_tmp("""
+[self_play.rust]
+inference_bin = "/path/to/hx04_infer_server"
+"""))
+        assert cfg.self_play.rust.inference_bin == "/path/to/hx04_infer_server"
 
     def test_self_play_python_nested(self):
         cfg = load_config(_write_tmp("""

@@ -229,6 +229,7 @@ class RustSelfPlayConfig:
     # --- Batching ---
     max_batch: int = _f(128, "Maximum number of game positions batched into a single inference forward pass (graph-count cap; with max_batch_edges>0 this becomes a safety ceiling — set it high, e.g. 512)", group="Batching")
     max_batch_edges: int = _f(0, "Edge-targeted batching: accumulate requests until total graph edges reach this budget (~44-46k = the GPU wave-fill knee) instead of a fixed graph count, so batches stay efficient as graph size varies. 0 = off (graph-count only). Purely changes request coalescing — search/targets are byte-identical. See docs/research/2026-06-16-edge-targeted-batching.md", group="Batching")
+    inference_bin: str | None = _f(None, "Path to a standalone Rust HX04 inference-server binary. When set, the native self-play binary spawns this process for batched GNN inference instead of the built-in TorchScript/Python paths. None = disabled (existing behaviour).", group="Inference")
     batch_timeout_ms: int = _f(5, "Milliseconds to wait for a full batch before running a partial one", group="Batching")
     # --- Inference ---
     padded_inference: bool = _f(True, "Use bucket-padded GNN inference (forward_graphs_padded) to stabilise the HIP/CUDA caching allocator under variable input shapes.", group="Inference")

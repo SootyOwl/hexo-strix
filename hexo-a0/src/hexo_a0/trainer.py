@@ -1822,6 +1822,10 @@ class Trainer:
         # use it produce a byte-identical command line.
         if getattr(rust_cfg, "max_batch_edges", 0) > 0:
             cmd.extend(["--max-batch-edges", str(rust_cfg.max_batch_edges)])
+        # Rust HX04 inference-server binary: only emit when configured, so
+        # existing runs without it produce a byte-identical command line.
+        if getattr(rust_cfg, "inference_bin", None):
+            cmd.extend(["--inference-bin", rust_cfg.inference_bin])
         cmd.extend(["--batch-timeout-ms", str(rust_cfg.batch_timeout_ms)])
         cmd.extend(["--max-file-mb", str(rust_cfg.max_file_mb)])
         cmd.extend(["--output-filename", rust_cfg.output_filename])

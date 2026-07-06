@@ -112,6 +112,7 @@ class TestSelfPlayConfig:
         assert c.rust.playout_cap_divisor == 4
         assert c.rust.max_file_mb == 2048
         assert c.rust.output_filename == "games"
+        assert c.rust.inference_bin is None
         assert c.python.games_per_write == 50
         assert c.python.playout_cap_fraction == 0.75
         assert c.python.playout_cap_divisor == 4

@@ -2418,6 +2418,60 @@ class TestPoolSubprocessArgs:
         assert "--pool-fraction" in src
 
 
+# ---------------------------------------------------------------------------
+# Rust HX04 inference-server binary knob: [self_play.rust] inference_bin
+# ---------------------------------------------------------------------------
+
+class TestInferenceBinConfigPlumbing:
+    def test_defaults(self):
+        from hexo_a0.config import RustSelfPlayConfig
+
+        cfg = RustSelfPlayConfig()
+        assert cfg.inference_bin is None
+
+    def test_toml_round_trip(self, tmp_path):
+        from hexo_a0.config import FullConfig
+        from hexo_a0.config_io import load_config, save_config
+
+        cfg = FullConfig()
+        cfg.self_play.rust.inference_bin = "/opt/bin/hx04_infer_server"
+        path = tmp_path / "cfg.toml"
+        save_config(path, cfg)
+        loaded = load_config(path)
+        assert loaded.self_play.rust.inference_bin == "/opt/bin/hx04_infer_server"
+
+
+class TestInferenceBinSubprocessArgs:
+    def _build_cmd(self, inference_bin: str | None) -> list[str]:
+        """Reproduce the trainer's cmd-construction logic in isolation,
+        mirroring TestPoolSubprocessArgs / max_batch_edges."""
+        from hexo_a0.config import RustSelfPlayConfig
+        rust_cfg = RustSelfPlayConfig(inference_bin=inference_bin)
+        cmd: list[str] = ["self_play", "--model", "/tmp/m.pt"]
+        cmd.extend(["--max-batch", str(rust_cfg.max_batch)])
+        if getattr(rust_cfg, "inference_bin", None):
+            cmd.extend(["--inference-bin", rust_cfg.inference_bin])
+        return cmd
+
+    def test_inference_bin_flag_present_when_set(self):
+        cmd = self._build_cmd(inference_bin="/opt/bin/hx04_infer_server")
+        assert "--inference-bin" in cmd
+        idx = cmd.index("--inference-bin")
+        assert cmd[idx + 1] == "/opt/bin/hx04_infer_server"
+
+    def test_inference_bin_flag_absent_when_none(self):
+        cmd = self._build_cmd(inference_bin=None)
+        assert "--inference-bin" not in cmd
+
+    def test_trainer_source_emits_inference_bin_flag(self):
+        import inspect
+        from hexo_a0 import trainer
+
+        src = inspect.getsource(trainer.Trainer._rust_self_play_worker_inner)
+        assert "rust_cfg.inference_bin" in src
+        assert "--inference-bin" in src
+
+
 # ===================================================================
 # File watcher seek behavior (regression for new-file data loss bug)
 # ===================================================================
