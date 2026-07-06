@@ -73,6 +73,31 @@ def tiny_full_config():
 
 
 @pytest.fixture
+def tiny_trainer():
+    """Factory for a tiny Trainer rooted at a caller-supplied checkpoint dir.
+
+    Usage: ``trainer = tiny_trainer(tmp_path)``. Distinct from the
+    no-arg ``tiny_trainer`` fixture in ``test_trainer.py`` (which shadows
+    this one for that module only, per pytest fixture-resolution rules).
+    """
+    import torch
+    from hexo_a0.model import HeXONet
+    from hexo_a0.trainer import Trainer
+
+    def _make(ckpt_dir):
+        model = HeXONet(_TINY_MODEL_CONFIG)
+        return Trainer(
+            model=model,
+            config=_TINY_FULL_CONFIG,
+            game_config=_TINY_GAME_CONFIG,
+            device=torch.device("cpu"),
+            ckpt_dir=str(ckpt_dir),
+        )
+
+    return _make
+
+
+@pytest.fixture
 def initial_game():
     """Default GameState: P1 stone at origin, P2 to move, 2 moves remaining."""
     return hexo_rs.GameState()

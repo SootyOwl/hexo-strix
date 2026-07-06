@@ -25,6 +25,7 @@ from torch_geometric.data import Batch, Data
 import shutil
 import subprocess
 
+from hexo_a0.export import save_safetensors
 from hexo_a0.loss import kl_policy_loss, path_consistency_loss
 from hexo_a0.model import (
     graft_heads_for_jk_cat,
@@ -519,7 +520,36 @@ def _log_perplexity_by_move_scalars(
         writer.add_scalars(f"{prefix}_p10", p10_d, step)
 
 
-def _rotate_pool_snapshots(pool_dir: Path, source_path: Path, max_size: int) -> Path | None:
+def _export_safetensors_twin(
+    pt_path: Path, state_dict: dict, model_config: dict, train_steps, source_name: str,
+) -> None:
+    """Best-effort ``.safetensors`` twin next to ``pt_path`` for Rust evaluators.
+
+    Rust inference backends (hexo-infer / a future hexo-infer-server) follow
+    the same mtime-swap contract as the ``.pt`` file but load safetensors
+    directly (no libtorch). Written atomically (tmp + ``os.replace``).
+
+    Export failures must NEVER break promotion or pool snapshotting — e.g. an
+    unsupported arch has no Rust-side consumer yet and should just log a
+    warning and be skipped, not crash training.
+    """
+    import os
+
+    try:
+        st_path = pt_path.with_suffix(".safetensors")
+        tmp_st = pt_path.with_suffix(".safetensors.tmp")
+        save_safetensors(state_dict, model_config, train_steps, source_name, tmp_st)
+        os.replace(tmp_st, st_path)
+    except Exception:
+        logger.warning(
+            "safetensors export failed for %s; hexo-infer backends will not "
+            "see this swap", pt_path, exc_info=True,
+        )
+
+
+def _rotate_pool_snapshots(
+    pool_dir: Path, source_path: Path, max_size: int, twin_ctx: tuple | None = None,
+) -> Path | None:
     """Copy ``source_path`` into ``pool_dir`` and prune oldest snapshots
     until at most ``max_size`` ``*.pt`` files remain.
 
@@ -527,6 +557,13 @@ def _rotate_pool_snapshots(pool_dir: Path, source_path: Path, max_size: int) -> 
     deletion of the source checkpoint. The copied filename is the source
     file's basename plus a unique suffix derived from the source mtime to
     avoid collisions when the same export is rotated repeatedly.
+
+    ``twin_ctx``, if given, is ``(state_dict, model_config, train_steps,
+    source_name)``: a best-effort ``.safetensors`` twin is written at the new
+    pool snapshot's destination path *before* the ``.pt`` copy that creates it,
+    so the same "twin exists before .pt mtime bump" reload contract holds for
+    pool snapshots too (the destination path is known up front, even though
+    the ``.pt`` file itself doesn't exist until ``shutil.copy2`` below runs).
 
     Returns the path of the new snapshot, or ``None`` if ``source_path``
     does not exist or ``max_size <= 0`` (pool effectively disabled).
@@ -542,6 +579,9 @@ def _rotate_pool_snapshots(pool_dir: Path, source_path: Path, max_size: int) -> 
     suffix = source_path.suffix or ".pt"
     dest = pool_dir / f"{stem}_{stat.st_mtime_ns}{suffix}"
     if not dest.exists():
+        if twin_ctx is not None:
+            sd, model_config, train_steps, source_name = twin_ctx
+            _export_safetensors_twin(dest, sd, model_config, train_steps, source_name)
         shutil.copy2(source_path, dest)
     # Prune oldest *.pt files (sort by mtime ascending, drop excess)
     snaps = sorted(pool_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
@@ -551,6 +591,7 @@ def _rotate_pool_snapshots(pool_dir: Path, source_path: Path, max_size: int) -> 
             old.unlink()
         except OSError:
             pass
+        old.with_suffix(".safetensors").unlink(missing_ok=True)
     return dest
 
 
@@ -1300,12 +1341,18 @@ class Trainer:
                 return str(p)
         return shutil.which("self_play")
 
-    def _snapshot_to_pool(self, source_path: str) -> None:
+    def _snapshot_to_pool(self, source_path: str, export_ctx: tuple | None = None) -> None:
         """Copy the just-exported self-play model into the past-self pool dir,
         then prune oldest snapshots beyond pool_size.
 
         Pool is disabled when pool_fraction == 0; we still skip the copy in
         that case to keep existing runs byte-identical.
+
+        ``export_ctx``, if given, is ``(state_dict, model_config, train_steps)``
+        from the caller's in-memory export — used to write a best-effort
+        ``.safetensors`` twin next to the new pool snapshot so Rust evaluators
+        sampling from the pool can follow the same mtime contract as the
+        self-play model file.
         """
         rust_cfg = self.self_play_config.rust
         if rust_cfg.pool_fraction <= 0.0 or self._ckpt_dir is None:
@@ -1316,7 +1363,11 @@ class Trainer:
             return
         pool_dir = Path(self._ckpt_dir) / "self_play" / "pool"
         try:
-            _rotate_pool_snapshots(pool_dir, Path(source_path), rust_cfg.pool_size)
+            twin_ctx = None
+            if export_ctx is not None:
+                sd, model_config, train_steps = export_ctx
+                twin_ctx = (sd, model_config, train_steps, Path(source_path).name)
+            _rotate_pool_snapshots(pool_dir, Path(source_path), rust_cfg.pool_size, twin_ctx=twin_ctx)
         except Exception as e:
             logger.warning("Failed to rotate pool snapshot: %s", e)
 
@@ -1360,6 +1411,17 @@ class Trainer:
             f.name: getattr(self.model_config, f.name)
             for f in self.model_config.__dataclass_fields__.values()
         }
+        # game_config travels alongside model_config in the safetensors metadata
+        # only (kept out of the .pt formats above to avoid touching their
+        # established schema) so hexo-infer backends can cross-check position config.
+        st_model_config = {
+            **mc_dict,
+            "game_config": {
+                "win_length": self.game_config.win_length,
+                "placement_radius": self.game_config.placement_radius,
+                "max_moves": self.game_config.max_moves,
+            },
+        }
         torch.save({"model_state_dict": sd, "model_config": mc_dict,
                     "train_steps": export_steps}, tmp)
         os.replace(tmp, champion_path)
@@ -1372,9 +1434,18 @@ class Trainer:
             fd2, tmp2 = tempfile.mkstemp(dir=str(sp_dir), suffix=".pt.tmp")
             os.close(fd2)
             torch.save({"model_state_dict": sd, "model_config": mc_dict}, tmp2)
+            # Twin MUST land before the .pt's own mtime bump: the Rust reloader
+            # polls the .pt mtime then reads the .safetensors sibling, so
+            # ".pt changed" must always imply "fresh twin already exists".
+            _export_safetensors_twin(Path(sp_model_path), sd, st_model_config,
+                                      export_steps, Path(sp_model_path).name)
             os.replace(tmp2, sp_model_path)
-            self._snapshot_to_pool(sp_model_path)
+            self._snapshot_to_pool(sp_model_path, export_ctx=(sd, st_model_config, export_steps))
         else:
+            # Twin before the .pt write for the same reload-contract reason as
+            # the python_inference branch above.
+            _export_safetensors_twin(Path(sp_model_path), sd, st_model_config,
+                                      export_steps, Path(sp_model_path).name)
             self._export_torchscript(sp_model_path, state_dict_override=sd)
             precision = self.self_play_config.precision
             if precision == "fp16":
@@ -1383,7 +1454,7 @@ class Trainer:
                 pool_src = sp_model_path.replace(".pt", "_fp32.pt")
             else:
                 pool_src = sp_model_path
-            self._snapshot_to_pool(pool_src)
+            self._snapshot_to_pool(pool_src, export_ctx=(sd, st_model_config, export_steps))
 
         # Mirror the fresh self-play model to the remote actor so its periodic
         # reload picks up the new champion (no-op when no actor is configured).
