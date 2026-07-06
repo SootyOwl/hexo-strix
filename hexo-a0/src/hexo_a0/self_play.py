@@ -348,6 +348,10 @@ class TrainingExample:
     game_state: object | None = None  # hexo_rs.GameState, preserved for reanalyze
     trajectory_id: int | None = None
     sample_weight: float = 1.0
+    # Short-horizon value targets (Stage 2), one float per model.value_horizons
+    # entry, in that column order; None when horizon heads are disabled. Built
+    # at ingest time (within-trajectory order is not persisted downstream).
+    horizon_targets: list[float] | None = None
 
     def __post_init__(self):
         if self.data is None and self.game_state is None:

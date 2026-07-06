@@ -1,7 +1,7 @@
 """Model + trainer-loss tests for the distributional (binned) value head.
 
 Covers: scalar-head backward compatibility (value_bins=0 path unchanged),
-binned forward shape + decode, the return_value_logits training contract,
+binned forward shape + decode, the return_train_extras training contract,
 checkpoint config round-trip, and the trainer value-loss (two-hot CE) path.
 """
 
@@ -85,12 +85,13 @@ class TestBinnedHead:
         assert values.shape == (2,)
         assert (values >= -1.0).all() and (values <= 1.0).all()
 
-    def test_binned_core_return_value_logits_four_tuple(self):
+    def test_binned_core_return_train_extras_four_tuple(self):
         net = HeXONet(_cfg(65))
         batch = Batch.from_data_list([_data(), _data(8, 3)])
-        out = net._forward_batch_core(batch, return_value_logits=True)
+        out = net._forward_batch_core(batch, return_train_extras=True)
         assert len(out) == 4
-        _, _, values, bin_logits = out
+        _, _, values, extras = out
+        bin_logits = extras["value_logits"]
         assert bin_logits.shape == (2, 65)
         # decoded scalar must match the softmax expectation of the returned logits
         assert torch.allclose(
@@ -105,8 +106,8 @@ class TestBinnedHead:
     def test_binned_gradients_flow(self):
         net = HeXONet(_cfg(9))
         batch = Batch.from_data_list([_data()])
-        _, _, values, bin_logits = net._forward_batch_core(batch, return_value_logits=True)
-        bin_logits.sum().backward()
+        _, _, values, extras = net._forward_batch_core(batch, return_train_extras=True)
+        extras["value_logits"].sum().backward()
         for name, p in net.value_head.named_parameters():
             assert p.grad is not None, f"no grad for {name}"
 

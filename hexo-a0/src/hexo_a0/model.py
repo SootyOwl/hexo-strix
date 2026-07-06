@@ -541,6 +541,8 @@ class HeXONet(nn.Module):
         # representation property keeps cat-mode head sizing in one place.
         head_in_dim = self.representation.output_dim
         self.value_bins = int(getattr(config, "value_bins", 0) or 0)
+        # Short-horizon value heads (train-only): one binned head per horizon.
+        self.value_horizons = list(getattr(config, "value_horizons", []) or [])
         self.policy_head = PolicyHead(head_in_dim, config.policy_hidden)
         self.value_head = ValueHead(head_in_dim, config.value_hidden, value_bins=self.value_bins)
         if self.value_bins > 0:
@@ -556,6 +558,18 @@ class HeXONet(nn.Module):
                 ),
                 persistent=False,
             )
+        if self.value_horizons:
+            if self.value_bins <= 0:
+                raise ValueError(
+                    "value_horizons requires value_bins>0 (horizon heads share "
+                    "the distributional value head's bin grid)."
+                )
+            # Train-only heads — NOT part of ScriptableHeXONet, so they add zero
+            # self-play/inference cost and never touch the wire protocol.
+            self.horizon_value_heads = nn.ModuleList([
+                ValueHead(head_in_dim, config.value_hidden, value_bins=self.value_bins)
+                for _ in self.value_horizons
+            ])
 
     def forward(
         self,
@@ -614,7 +628,7 @@ class HeXONet(nn.Module):
         legal_idx: Tensor | None = None,
         stone_idx: Tensor | None = None,
         stone_batch: Tensor | None = None,
-        return_value_logits: bool = False,
+        return_train_extras: bool = False,
     ) -> tuple[Tensor, ...]:
         """Core batched forward: returns flat logits + counts + values (all GPU).
 
@@ -627,17 +641,21 @@ class HeXONet(nn.Module):
         distributional head (``value_bins>0``). Existing 3-tuple callers are
         unchanged.
 
-        When ``return_value_logits=True`` (the training loss path, and only when
-        ``value_bins>0``) a 4th element carries the raw ``(num_graphs, value_bins)``
-        bin logits for the two-hot cross-entropy; the scalar decode still rides
-        in ``values_tensor`` for reporting. Under torch.compile this constant
-        keyword selects a distinct graph, so the default 3-tuple path stays
-        graph-break-free and byte-identical.
+        When ``return_train_extras=True`` (the training loss path only) a 4th
+        element is an ``extras`` dict of train-only head outputs, keyed:
+          - ``"value_logits"``: ``(num_graphs, value_bins)`` distributional
+            value bin logits (present only when ``value_bins>0``).
+          - ``"horizon_logits"``: ``(num_graphs, n_horizons, value_bins)``
+            short-horizon head logits (present only when ``value_horizons``).
+        The scalar decode still rides in ``values_tensor`` for reporting. Under
+        torch.compile this constant keyword selects a distinct graph, so the
+        default 3-tuple path stays graph-break-free and byte-identical; train-only
+        heads never enter the inference/eval graph.
 
         Returns:
             ``(all_logits, legal_counts, values_tensor)`` or, when
-            ``return_value_logits`` is set, ``(all_logits, legal_counts,
-            values_tensor, value_bin_logits)``.
+            ``return_train_extras`` is set, ``(all_logits, legal_counts,
+            values_tensor, extras)``.
         """
         if self.representation.axis_relational:
             # Edges never cross subgraph boundaries and PyG applies node-index
@@ -691,10 +709,20 @@ class HeXONet(nn.Module):
             values_tensor = decode_binned_value(
                 value_bin_logits, self.value_bin_centers
             )                                                        # (G,)
-            if return_value_logits:
-                return all_logits, legal_counts, values_tensor, value_bin_logits
         else:
             values_tensor = self.value_head.mlp(pooled).squeeze(-1)
+
+        if return_train_extras:
+            extras: dict[str, Tensor] = {}
+            if self.value_bins > 0:
+                extras["value_logits"] = value_bin_logits
+            if self.value_horizons:
+                # (G, n_horizons, bins) — one binned head per horizon, all fed
+                # the same stone-pooled embedding.
+                extras["horizon_logits"] = torch.stack(
+                    [h.mlp(pooled) for h in self.horizon_value_heads], dim=1
+                )
+            return all_logits, legal_counts, values_tensor, extras
 
         return all_logits, legal_counts, values_tensor
 

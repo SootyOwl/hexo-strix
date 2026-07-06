@@ -215,6 +215,25 @@ def _validate_config(cfg: FullConfig) -> None:
             f"({mc.value_bin_max}) when value_bins>0."
         )
 
+    # Short-horizon value heads (train-only).
+    horizons = getattr(mc, "value_horizons", []) or []
+    if horizons:
+        if vbins <= 0:
+            raise ValueError(
+                "[model] value_horizons requires value_bins>0 (the horizon heads "
+                "share the distributional value head's bin grid)."
+            )
+        if any((not isinstance(k, int)) or k < 1 for k in horizons):
+            raise ValueError(
+                f"[model] value_horizons must be positive integers (placements); "
+                f"got {horizons}."
+            )
+    if getattr(tc, "horizon_loss_weight", 0.0) > 0.0 and not horizons:
+        raise ValueError(
+            "[training] horizon_loss_weight>0 requires a non-empty "
+            "[model] value_horizons."
+        )
+
     if getattr(tc, "graft_threat_features", False) and getattr(
         mc, "relative_stone_encoding", False
     ):

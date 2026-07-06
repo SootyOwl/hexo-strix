@@ -735,6 +735,7 @@ def _prefetch_worker(
                 getattr(ex, "trajectory_id", None),
                 getattr(ex, "_age", None),
                 float(getattr(ex, "sample_weight", 1.0)),
+                getattr(ex, "horizon_targets", None),
             ))
 
         # Block on put with timeout so the worker can notice stop_event.
@@ -788,6 +789,35 @@ def _collate_ns_batch(ns_list, device):
     return batch, legal_idx, stone_idx, stone_batch
 
 
+def _compute_horizon_targets(
+    values: list[float], horizons: list[int]
+) -> list[list[float]]:
+    """Short-horizon value targets for one game's positions, in play order.
+
+    For the position at index ``i`` in a game of ``n`` recorded positions,
+    ``plies_to_end = n - 1 - i`` is its distance (in placements) to the final
+    recorded position. The horizon-``k`` target is the position's OWN
+    side-to-move outcome ``values[i]`` when the game resolves within the
+    horizon (``plies_to_end <= k``), else ``0.0`` (neutral — not yet decided
+    within ``k``). This is the dense "about to resolve, and how" signal the
+    single full-game label lacks. Each row is aligned to ``horizons`` column
+    order. Returns one ``[]`` row per position when ``horizons`` is empty.
+
+    NOTE: index distance equals ply distance only when every placement is
+    recorded (playout_cap_fraction=0, as in the from-scratch runs this targets);
+    with playout-cap skipping it is a mild approximation, which is acceptable
+    for an auxiliary signal.
+    """
+    n = len(values)
+    if not horizons:
+        return [[] for _ in range(n)]
+    out: list[list[float]] = []
+    for i in range(n):
+        plies_to_end = n - 1 - i
+        out.append([values[i] if plies_to_end <= k else 0.0 for k in horizons])
+    return out
+
+
 def _forward_and_loss(
     model: nn.Module,
     examples: list[tuple],
@@ -795,6 +825,7 @@ def _forward_and_loss(
     use_fp16: bool = False,
     loss_scale: float = 1.0,
     pc_loss_weight: float = 0.0,
+    horizon_loss_weight: float = 0.0,
 ) -> dict[str, "torch.Tensor | float"]:
     """Forward pass + loss computation + backward (no optimizer step).
 
@@ -813,15 +844,19 @@ def _forward_and_loss(
         the NaN/Inf guard. ``pc_loss`` is a tensor when PC loss is active,
         otherwise the float ``0.0`` sentinel.
     """
-    # Unpack — examples may have 3, 4, 5, or 6 elements:
+    # Unpack — examples may have 3, 4, 5, 6, or 7 elements:
     #   3-tuple: (data, policy, value)
     #   4-tuple: + trajectory_id
     #   5-tuple: + age (buffer position at sample time, [0, 1], 0=newest)
     #   6-tuple: + sample_weight (in (0, 1]; <1 for PCR fast-cap examples)
+    #   7-tuple: + horizon_targets (list[float] per example, or None; Stage 2)
     ages: tuple | None = None
     sample_weights: tuple | None = None
+    horizon_targets_tup: tuple | None = None
     arity = len(examples[0])
-    if arity == 6:
+    if arity == 7:
+        data_list, policy_targets, value_targets, traj_ids, ages, sample_weights, horizon_targets_tup = zip(*examples)
+    elif arity == 6:
         data_list, policy_targets, value_targets, traj_ids, ages, sample_weights = zip(*examples)
     elif arity == 5:
         data_list, policy_targets, value_targets, traj_ids, ages = zip(*examples)
@@ -864,17 +899,21 @@ def _forward_and_loss(
 
     use_amp = use_fp16 and device.type == "cuda"
 
-    # Distributional value head (value_bins>0): the core additionally returns
-    # the raw bin logits so the value loss is a two-hot cross-entropy; the
-    # scalar decode still rides in ``values`` for the diagnostic MSE. Scalar
-    # heads keep the byte-identical 3-tuple path.
+    # Distributional value head (value_bins>0) and/or short-horizon heads
+    # (value_horizons): the core additionally returns a train-only ``extras``
+    # dict of bin logits so the value loss is a two-hot cross-entropy and the
+    # horizon heads can be supervised; the scalar decode still rides in
+    # ``values`` for the diagnostic MSE. Scalar heads with no horizons keep the
+    # byte-identical 3-tuple path.
     value_bins = int(getattr(model, "value_bins", 0) or 0)
+    horizons = list(getattr(model, "value_horizons", []) or [])
+    need_extras = value_bins > 0 or bool(horizons)
 
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-        if value_bins > 0:
-            all_logits, legal_counts, values, value_bin_logits = model._forward_batch_core(
+        if need_extras:
+            all_logits, legal_counts, values, extras = model._forward_batch_core(
                 batch, legal_idx=legal_idx, stone_idx=stone_idx,
-                stone_batch=stone_batch, return_value_logits=True,
+                stone_batch=stone_batch, return_train_extras=True,
             )
         else:
             all_logits, legal_counts, values = model._forward_batch_core(
@@ -917,7 +956,7 @@ def _forward_and_loss(
         if value_bins > 0:
             # Distributional head: optimize the two-hot cross-entropy over bins.
             ce_per_ex = binned_value_ce(
-                value_bin_logits.float(), v_targets, model.value_bin_centers
+                extras["value_logits"].float(), v_targets, model.value_bin_centers
             )
             mean_value = (ce_per_ex * sw).sum() / sw_sum
         else:
@@ -981,6 +1020,34 @@ def _forward_and_loss(
 
         total_loss = mean_policy + mean_value
 
+    # Short-horizon value heads (train-only): mean two-hot CE across horizons,
+    # each weighted by the same per-example sample weights. Skipped unless the
+    # heads exist, the weight is on, and targets were built at ingest.
+    horizon_loss_val: "torch.Tensor | float" = 0.0
+    if (
+        horizon_loss_weight > 0.0
+        and horizons
+        and horizon_targets_tup is not None
+        and "horizon_logits" in extras
+    ):
+        n_h = len(horizons)
+        # Fall back to a neutral row for any example missing horizon targets
+        # (e.g. a mixed buffer with pre-Stage-2 examples), so the batch trains.
+        ht_rows = [
+            list(r) if r is not None else [0.0] * n_h
+            for r in horizon_targets_tup
+        ]
+        ht = torch.tensor(ht_rows, dtype=torch.float32, device=device)  # (N, n_h)
+        hz_logits = extras["horizon_logits"].float()                    # (N, n_h, bins)
+        centers = model.value_bin_centers
+        hz_loss = torch.zeros((), device=device)
+        for j in range(n_h):
+            ce_j = binned_value_ce(hz_logits[:, j, :], ht[:, j], centers)  # (N,)
+            hz_loss = hz_loss + (ce_j * sw).sum() / sw_sum
+        hz_loss = hz_loss / n_h
+        total_loss = total_loss + horizon_loss_weight * hz_loss
+        horizon_loss_val = hz_loss.detach()
+
     # Path consistency loss (PCZero)
     pc_loss_val: "torch.Tensor | float" = 0.0
     if pc_loss_weight > 0 and traj_ids is not None and traj_ids[0] is not None:
@@ -1034,6 +1101,7 @@ def _forward_and_loss(
         "policy_loss": mean_policy.detach(),
         "value_loss": mean_value.detach(),
         "value_mse": value_mse.detach(),
+        "horizon_loss": horizon_loss_val,
         "pc_loss": pc_loss_val,
         "cross_entropy": mean_cross_entropy.detach(),
         "target_entropy": mean_target_entropy.detach(),
@@ -2397,8 +2465,20 @@ class Trainer:
         """
         import hexo_rs
 
+        # Short-horizon value targets (train-only) are computed over the full
+        # game's per-position outcomes, in play order, at ingest time — the
+        # within-trajectory order needed to build them is not persisted past
+        # this point. Column order matches model.value_horizons.
+        horizons = list(getattr(self.model_config, "value_horizons", []) or [])
+        horizon_rows = (
+            _compute_horizon_targets(
+                [float(e["value"]) for e in game_data["examples"]], horizons
+            )
+            if horizons else None
+        )
+
         examples, skipped = [], 0
-        for ex in game_data["examples"]:
+        for i, ex in enumerate(game_data["examples"]):
             gs = hexo_rs.GameState.from_state(
                 ex["stones"], ex["current_player"], ex["moves_remaining"],
                 self.game_config,
@@ -2415,6 +2495,7 @@ class Trainer:
                 value_target=float(ex["value"]),
                 game_state=gs,
                 sample_weight=float(ex.get("sample_weight", 1.0)),
+                horizon_targets=horizon_rows[i] if horizon_rows is not None else None,
             ))
         total = len(examples) + skipped
         if total:
@@ -2442,8 +2523,17 @@ class Trainer:
         graph_type = self.model_config.graph_type
         raw_to_data = _raw_to_axis_data if graph_type == "axis" else _raw_to_data
 
+        # Short-horizon value targets over the full game (see _parse_state_examples).
+        horizons = list(getattr(self.model_config, "value_horizons", []) or [])
+        horizon_rows = (
+            _compute_horizon_targets(
+                [float(e["value"]) for e in game_data["examples"]], horizons
+            )
+            if horizons else None
+        )
+
         examples, skipped = [], 0
-        for ex in game_data["examples"]:
+        for i, ex in enumerate(game_data["examples"]):
             data = raw_to_data(ex)
             policy = torch.tensor(ex["policy"], dtype=torch.float32)
             n_legal_mask = int(data.legal_mask.sum().item())
@@ -2462,6 +2552,7 @@ class Trainer:
                 value_target=float(ex["value"]),
                 game_state=game_state,
                 sample_weight=float(ex.get("sample_weight", 1.0)),
+                horizon_targets=horizon_rows[i] if horizon_rows is not None else None,
             ))
         total = len(examples) + skipped
         if total:
@@ -2767,6 +2858,7 @@ class Trainer:
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "value_mse": 0.0,
+            "horizon_loss": 0.0,
             "pc_loss": 0.0,
             "cross_entropy": 0.0,
             "target_entropy": 0.0,
@@ -2824,6 +2916,9 @@ class Trainer:
             # a comparable diagnostic for the distributional head (which
             # optimizes the two-hot CE in value_loss instead).
             running_value_mse_t = torch.zeros((), device=self.device)
+            # Short-horizon value-head aggregate CE (train-only; 0 unless
+            # value_horizons + horizon_loss_weight are set).
+            running_horizon_t = torch.zeros((), device=self.device)
             running_pc_t = torch.zeros((), device=self.device)
             running_cross_entropy_t = torch.zeros((), device=self.device)
             running_target_entropy_t = torch.zeros((), device=self.device)
@@ -2901,6 +2996,7 @@ class Trainer:
 
                 _t0 = time.time()
                 pc_weight = tc.pc_loss_weight
+                horizon_weight = getattr(tc, "horizon_loss_weight", 0.0)
 
                 if use_prefetch:
                     # Background thread already sampled + augmented + pinned.
@@ -2959,6 +3055,7 @@ class Trainer:
                             getattr(ex, 'trajectory_id', None),
                             getattr(ex, '_age', None),
                             float(getattr(ex, 'sample_weight', 1.0)),
+                            getattr(ex, 'horizon_targets', None),
                         ))
 
                 # ----- Forward / backward (sync-free; returns GPU tensors) -----
@@ -2988,6 +3085,7 @@ class Trainer:
                         step_policy_t = torch.zeros((), device=self.device)
                         step_value_t = torch.zeros((), device=self.device)
                         step_value_mse_t = torch.zeros((), device=self.device)
+                        step_horizon_t = torch.zeros((), device=self.device)
                         step_pc_t = torch.zeros((), device=self.device)
                         step_cross_entropy_t = torch.zeros((), device=self.device)
                         step_target_entropy_t = torch.zeros((), device=self.device)
@@ -2996,6 +3094,7 @@ class Trainer:
                                 self.model, mb, self.device, use_fp16,
                                 loss_scale=1.0 / n_micro,
                                 pc_loss_weight=pc_weight,
+                                horizon_loss_weight=horizon_weight,
                             )
                             step_total_t = step_total_t + mb_losses["total_loss"] / n_micro
                             step_policy_t = step_policy_t + mb_losses["policy_loss"] / n_micro
@@ -3003,6 +3102,8 @@ class Trainer:
                             step_value_mse_t = step_value_mse_t + mb_losses["value_mse"] / n_micro
                             step_cross_entropy_t = step_cross_entropy_t + mb_losses["cross_entropy"] / n_micro
                             step_target_entropy_t = step_target_entropy_t + mb_losses["target_entropy"] / n_micro
+                            if torch.is_tensor(mb_losses["horizon_loss"]):
+                                step_horizon_t = step_horizon_t + mb_losses["horizon_loss"] / n_micro
                             if torch.is_tensor(mb_losses["pc_loss"]):
                                 step_pc_t = step_pc_t + mb_losses["pc_loss"] / n_micro
                             if mb_losses.get("staleness_kl_q_sum") is not None:
@@ -3013,6 +3114,7 @@ class Trainer:
                         mb_losses = _forward_and_loss(
                             self.model, all_examples, self.device, use_fp16,
                             pc_loss_weight=pc_weight,
+                            horizon_loss_weight=horizon_weight,
                         )
                         step_total_t = mb_losses["total_loss"]
                         step_policy_t = mb_losses["policy_loss"]
@@ -3020,6 +3122,11 @@ class Trainer:
                         step_value_mse_t = mb_losses["value_mse"]
                         step_cross_entropy_t = mb_losses["cross_entropy"]
                         step_target_entropy_t = mb_losses["target_entropy"]
+                        step_horizon_t = (
+                            mb_losses["horizon_loss"]
+                            if torch.is_tensor(mb_losses["horizon_loss"])
+                            else torch.zeros((), device=self.device)
+                        )
                         step_pc_t = (
                             mb_losses["pc_loss"]
                             if torch.is_tensor(mb_losses["pc_loss"])
@@ -3032,6 +3139,7 @@ class Trainer:
                     mb_losses = _forward_and_loss(
                         self.model, all_examples, self.device, use_fp16,
                         pc_loss_weight=pc_weight,
+                        horizon_loss_weight=horizon_weight,
                     )
                     step_total_t = mb_losses["total_loss"]
                     step_policy_t = mb_losses["policy_loss"]
@@ -3039,6 +3147,11 @@ class Trainer:
                     step_value_mse_t = mb_losses["value_mse"]
                     step_cross_entropy_t = mb_losses["cross_entropy"]
                     step_target_entropy_t = mb_losses["target_entropy"]
+                    step_horizon_t = (
+                        mb_losses["horizon_loss"]
+                        if torch.is_tensor(mb_losses["horizon_loss"])
+                        else torch.zeros((), device=self.device)
+                    )
                     step_pc_t = (
                         mb_losses["pc_loss"]
                         if torch.is_tensor(mb_losses["pc_loss"])
@@ -3080,6 +3193,7 @@ class Trainer:
                 running_policy_t = running_policy_t + step_policy_t
                 running_value_t = running_value_t + step_value_t
                 running_value_mse_t = running_value_mse_t + step_value_mse_t
+                running_horizon_t = running_horizon_t + step_horizon_t
                 running_pc_t = running_pc_t + step_pc_t
                 running_cross_entropy_t = running_cross_entropy_t + step_cross_entropy_t
                 running_target_entropy_t = running_target_entropy_t + step_target_entropy_t
@@ -3110,6 +3224,7 @@ class Trainer:
                 losses["policy_loss"] = (running_policy_t / actual_steps).item()
                 losses["value_loss"] = (running_value_t / actual_steps).item()
                 losses["value_mse"] = (running_value_mse_t / actual_steps).item()
+                losses["horizon_loss"] = (running_horizon_t / actual_steps).item()
                 losses["pc_loss"] = (running_pc_t / actual_steps).item()
                 losses["cross_entropy"] = (running_cross_entropy_t / actual_steps).item()
                 losses["target_entropy"] = (running_target_entropy_t / actual_steps).item()
@@ -3286,6 +3401,18 @@ class Trainer:
                     "eventual game outcome. Equals loss/value for scalar heads; for "
                     "distributional heads it is the outcome-comparable diagnostic while "
                     "loss/value shows the optimized cross-entropy."
+                ),
+            )
+            self.writer.add_scalar(
+                "loss/horizon",
+                metrics["horizon_loss"],
+                step,
+                description=(
+                    "Mean two-hot cross-entropy across the short-horizon value heads "
+                    "(train-only; model.value_horizons). Each head predicts the "
+                    "position's outcome if the game resolves within its horizon (in "
+                    "placements), else neutral. 0 when horizon heads are disabled. A "
+                    "denser value signal in long games; not part of self-play inference."
                 ),
             )
             # Staleness instrumentation: per-quartile mean policy KL by sample
