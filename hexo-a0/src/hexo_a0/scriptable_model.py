@@ -410,6 +410,9 @@ class ScriptableHeXONet(nn.Module):
         compact_stone_onehot: bool = False,
         node_coords: bool = True,
         moves_scope: str = "node",
+        value_bins: int = 0,
+        value_bin_min: float = -1.0,
+        value_bin_max: float = 1.0,
     ):
         super().__init__()
         # ScriptableHeXONet supports sum/cat/max. lstm is intentionally out of
@@ -433,6 +436,11 @@ class ScriptableHeXONet(nn.Module):
         self.axis_relational = axis_relational
         self.axis_window = axis_window
         self.axis_num_axes = 3
+        # Distributional (binned) value head toggle. 0 = scalar tanh head
+        # (legacy), >0 = C51-style categorical head decoded to a scalar via the
+        # softmax expectation over ``value_bin_centers``. A plain int attribute
+        # (TorchScript infers the type) usable in the scripted-forward branch.
+        self.value_bins = value_bins
         # Head input dim: L*H for cat mode, H otherwise.
         head_in_dim = num_layers * hidden_dim if (use_jk and jk_mode == "cat") else hidden_dim
         self.head_in_dim = head_in_dim
@@ -520,12 +528,35 @@ class ScriptableHeXONet(nn.Module):
             nn.Linear(policy_hidden, 1),
         )
 
-        # Value head MLP
-        self.value_mlp = nn.Sequential(
-            nn.Linear(head_in_dim, value_hidden),
-            nn.ReLU(),
-            nn.Linear(value_hidden, 1),
-            nn.Tanh(),
+        # Value head MLP. Scalar head: ...Linear(value_hidden,1)+Tanh, value in
+        # [-1,1]. Distributional head (value_bins>0): ...Linear(value_hidden,
+        # value_bins) with NO Tanh; the scalar is decoded in forward() as the
+        # softmax expectation over ``value_bin_centers`` (matches HeXONet).
+        if value_bins > 0:
+            self.value_mlp = nn.Sequential(
+                nn.Linear(head_in_dim, value_hidden),
+                nn.ReLU(),
+                nn.Linear(value_hidden, value_bins),
+            )
+        else:
+            self.value_mlp = nn.Sequential(
+                nn.Linear(head_in_dim, value_hidden),
+                nn.ReLU(),
+                nn.Linear(value_hidden, 1),
+                nn.Tanh(),
+            )
+
+        # Value-bin centers grid. ALWAYS registered (a stably-typed attribute is
+        # needed for the scripted-forward decode branch, and for TorchScript
+        # shape stability); size max(value_bins,1) so the scalar path allocates
+        # a harmless 1-element buffer. Non-persistent: derived from config, not
+        # learned, so it never enters/needs the loaded state dict.
+        self.register_buffer(
+            "value_bin_centers",
+            torch.linspace(value_bin_min, value_bin_max, value_bins)
+            if value_bins > 0
+            else torch.zeros(1),
+            persistent=False,
         )
 
     def forward(
@@ -693,7 +724,16 @@ class ScriptableHeXONet(nn.Module):
         stone_counts = stone_counts.clamp(min=1)
         pooled = pooled / stone_counts
 
-        values = self.value_mlp(pooled).squeeze(-1)
+        # Value decode. Distributional head: softmax expectation over bin
+        # centers (matches loss.decode_binned_value); scalar head: tanh output.
+        # Both branches yield a (num_graphs,) tensor so torch.jit.script can
+        # compile the branch (same shape/type on both paths). The wire protocol
+        # stays policy+counts+scalar-values — bin logits are NOT returned.
+        if self.value_bins > 0:
+            value_logits = self.value_mlp(pooled)
+            values = (torch.softmax(value_logits, dim=-1) * self.value_bin_centers).sum(dim=-1)
+        else:
+            values = self.value_mlp(pooled).squeeze(-1)
 
         return all_logits, legal_counts, values
 
@@ -760,6 +800,7 @@ def load_from_hexonet(scriptable: ScriptableHeXONet, hexonet_state_dict: dict) -
         and "final_norm" not in k
         and "layer_scales" not in k
         and "jk_weights" not in k
+        and "value_bin_centers" not in k
     ]
     if real_missing:
         raise RuntimeError(
@@ -810,6 +851,9 @@ def export_torchscript(
         compact_stone_onehot=getattr(config, "compact_stone_onehot", False),
         node_coords=getattr(config, "node_coords", True),
         moves_scope=getattr(config, "moves_scope", "node"),
+        value_bins=getattr(config, "value_bins", 0),
+        value_bin_min=getattr(config, "value_bin_min", -1.0),
+        value_bin_max=getattr(config, "value_bin_max", 1.0),
     )
     load_from_hexonet(model, hexonet_state_dict)
     model.eval()

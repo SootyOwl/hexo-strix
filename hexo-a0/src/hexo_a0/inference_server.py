@@ -162,7 +162,8 @@ def _load_model(args) -> torch.nn.Module:
     if isinstance(emb, dict):
         for _k in ("axis_relational", "axis_window", "compact_stone_onehot",
                    "node_coords", "moves_scope", "relative_stone_encoding",
-                   "threat_features"):
+                   "threat_features", "value_bins", "value_bin_min",
+                   "value_bin_max"):
             if _k in emb:
                 setattr(args, _k, emb[_k])
 
@@ -200,6 +201,9 @@ def _load_model(args) -> torch.nn.Module:
         compact_stone_onehot=getattr(args, "compact_stone_onehot", False),
         node_coords=getattr(args, "node_coords", True),
         moves_scope=getattr(args, "moves_scope", "node"),
+        value_bins=getattr(args, "value_bins", 0),
+        value_bin_min=getattr(args, "value_bin_min", -1.0),
+        value_bin_max=getattr(args, "value_bin_max", 1.0),
     )
 
     state_dict = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
@@ -727,6 +731,21 @@ def main() -> None:
     parser.add_argument(
         "--moves-scope", default="node", choices=["node", "graph"],
         help="moves-remaining scope in the lean node schema.",
+    )
+    # --- Distributional (binned) value head (must match the checkpoint) ---
+    parser.add_argument(
+        "--value-bins", type=int, default=0,
+        help="Number of value bins for the distributional (C51-style) value "
+             "head. 0 = scalar tanh head (legacy). Normally auto-configured "
+             "from the checkpoint's embedded model_config.",
+    )
+    parser.add_argument(
+        "--value-bin-min", type=float, default=-1.0,
+        help="Lower edge of the value-bin center grid (only with --value-bins).",
+    )
+    parser.add_argument(
+        "--value-bin-max", type=float, default=1.0,
+        help="Upper edge of the value-bin center grid (only with --value-bins).",
     )
     parser.add_argument(
         "--dynamic-compile", action="store_true",

@@ -12,6 +12,7 @@ from torch_geometric.nn.models.jumping_knowledge import JumpingKnowledge
 
 from hexo_a0.axis_conv import AxisRelationalConv
 from hexo_a0.config import ModelConfig, node_feature_dim, legacy_lean_columns
+from hexo_a0.loss import decode_binned_value, value_bin_centers
 
 logger = logging.getLogger(__name__)
 
@@ -477,14 +478,25 @@ class ValueHead(nn.Module):
         value_hidden: Hidden size of the intermediate MLP layer.
     """
 
-    def __init__(self, hidden_dim: int, value_hidden: int) -> None:
+    def __init__(self, hidden_dim: int, value_hidden: int, value_bins: int = 0) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, value_hidden),
-            nn.ReLU(),
-            nn.Linear(value_hidden, 1),
-            nn.Tanh(),
-        )
+        self.value_bins = value_bins
+        if value_bins > 0:
+            # Distributional head: one logit per value bin, no Tanh. The scalar
+            # is the softmax expectation over bin centers (decode_binned_value),
+            # computed by the caller (_forward_batch_core / ScriptableHeXONet).
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_dim, value_hidden),
+                nn.ReLU(),
+                nn.Linear(value_hidden, value_bins),
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_dim, value_hidden),
+                nn.ReLU(),
+                nn.Linear(value_hidden, 1),
+                nn.Tanh(),
+            )
 
     def forward(self, embeddings: Tensor, stone_mask: Tensor | None = None) -> Tensor:
         """Compute a scalar value estimate via mean pooling over stones.
@@ -528,8 +540,22 @@ class HeXONet(nn.Module):
         # for jk_mode="cat" and ``hidden_dim`` otherwise. Centralising via the
         # representation property keeps cat-mode head sizing in one place.
         head_in_dim = self.representation.output_dim
+        self.value_bins = int(getattr(config, "value_bins", 0) or 0)
         self.policy_head = PolicyHead(head_in_dim, config.policy_hidden)
-        self.value_head = ValueHead(head_in_dim, config.value_hidden)
+        self.value_head = ValueHead(head_in_dim, config.value_hidden, value_bins=self.value_bins)
+        if self.value_bins > 0:
+            # Fixed bin-center grid for the distributional value head. Registered
+            # as a non-persistent buffer so it follows .to(device)/dtype but
+            # never enters a checkpoint (it is derived from config, not learned).
+            self.register_buffer(
+                "value_bin_centers",
+                value_bin_centers(
+                    self.value_bins,
+                    float(getattr(config, "value_bin_min", -1.0)),
+                    float(getattr(config, "value_bin_max", 1.0)),
+                ),
+                persistent=False,
+            )
 
     def forward(
         self,
@@ -588,17 +614,30 @@ class HeXONet(nn.Module):
         legal_idx: Tensor | None = None,
         stone_idx: Tensor | None = None,
         stone_batch: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        return_value_logits: bool = False,
+    ) -> tuple[Tensor, ...]:
         """Core batched forward: returns flat logits + counts + values (all GPU).
 
         When ``legal_idx``, ``stone_idx``, and ``stone_batch`` are provided,
         skips the GPU→CPU-sync ``nonzero()`` calls — required for
         torch.compile graph-break-free tracing.
 
+        ``values_tensor`` is always the scalar value per graph: the tanh output
+        for a scalar head, or the softmax expectation over bin centers for a
+        distributional head (``value_bins>0``). Existing 3-tuple callers are
+        unchanged.
+
+        When ``return_value_logits=True`` (the training loss path, and only when
+        ``value_bins>0``) a 4th element carries the raw ``(num_graphs, value_bins)``
+        bin logits for the two-hot cross-entropy; the scalar decode still rides
+        in ``values_tensor`` for reporting. Under torch.compile this constant
+        keyword selects a distinct graph, so the default 3-tuple path stays
+        graph-break-free and byte-identical.
+
         Returns:
-            (all_logits, legal_counts, values_tensor) where all_logits is
-            flat (total_legal,), legal_counts is (num_graphs,) long, and
-            values_tensor is (num_graphs,).
+            ``(all_logits, legal_counts, values_tensor)`` or, when
+            ``return_value_logits`` is set, ``(all_logits, legal_counts,
+            values_tensor, value_bin_logits)``.
         """
         if self.representation.axis_relational:
             # Edges never cross subgraph boundaries and PyG applies node-index
@@ -647,7 +686,15 @@ class HeXONet(nn.Module):
         stone_counts = stone_counts.clamp(min=1)
         pooled = pooled / stone_counts
 
-        values_tensor = self.value_head.mlp(pooled).squeeze(-1)
+        if self.value_bins > 0:
+            value_bin_logits = self.value_head.mlp(pooled)          # (G, bins)
+            values_tensor = decode_binned_value(
+                value_bin_logits, self.value_bin_centers
+            )                                                        # (G,)
+            if return_value_logits:
+                return all_logits, legal_counts, values_tensor, value_bin_logits
+        else:
+            values_tensor = self.value_head.mlp(pooled).squeeze(-1)
 
         return all_logits, legal_counts, values_tensor
 

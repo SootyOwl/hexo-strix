@@ -4,6 +4,98 @@ import torch
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Distributional (binned) value helpers
+# ---------------------------------------------------------------------------
+# A binned/categorical value head predicts a probability distribution over a
+# fixed grid of scalar "bin centers" spanning [vmin, vmax], and the scalar
+# value is recovered as the softmax expectation over the grid (C51-style).
+# Training uses a cross-entropy against the *two-hot* projection of the scalar
+# target: the two adjacent bins bracketing the target, weighted so the
+# distribution's expectation reconstructs the target exactly (no binning bias).
+# These are pure tensor functions so they are unit-testable in isolation and
+# safe to call from the eager loss path (the decode also runs inside the
+# torch.compile'd forward — softmax + matmul only, no data-dependent ops).
+
+
+def value_bin_centers(
+    num_bins: int, vmin: float = -1.0, vmax: float = 1.0
+) -> torch.Tensor:
+    """Return the ``num_bins`` uniformly-spaced bin centers spanning [vmin, vmax].
+
+    An odd ``num_bins`` places a center exactly at the midpoint (0.0 for the
+    default value range), which is the natural draw target.
+    """
+    if num_bins < 2:
+        raise ValueError(f"value_bin_centers needs num_bins >= 2, got {num_bins}")
+    return torch.linspace(vmin, vmax, num_bins)
+
+
+def project_to_two_hot(target: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+    """Project scalar targets onto a two-hot distribution over ``centers``.
+
+    For each target value, mass is split linearly across the two adjacent bin
+    centers that bracket it, so ``(project(t) * centers).sum(-1) == t`` exactly
+    for ``t`` within range (out-of-range targets are clamped to the end bins).
+
+    Args:
+        target:  (\\*,) scalar targets.
+        centers: (B,) uniformly-spaced ascending bin centers.
+
+    Returns:
+        (\\*, B) non-negative distribution summing to 1 along the last dim.
+    """
+    num_bins = centers.numel()
+    vmin = centers[0]
+    vmax = centers[-1]
+    step = (vmax - vmin) / (num_bins - 1)
+
+    t = target.clamp(vmin, vmax)
+    pos = (t - vmin) / step                                # float bin position
+    lower = pos.floor().clamp(0, num_bins - 2).long()      # lower bin index
+    upper = lower + 1
+    w_upper = (pos - lower.to(pos.dtype)).clamp(0.0, 1.0)   # mass on upper bin
+    w_lower = 1.0 - w_upper
+
+    dist = torch.zeros(
+        *target.shape, num_bins, dtype=centers.dtype, device=target.device
+    )
+    dist.scatter_(-1, lower.unsqueeze(-1), w_lower.to(centers.dtype).unsqueeze(-1))
+    dist.scatter_(-1, upper.unsqueeze(-1), w_upper.to(centers.dtype).unsqueeze(-1))
+    return dist
+
+
+def decode_binned_value(logits: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+    """Decode bin logits to a scalar via the softmax expectation over ``centers``.
+
+    Args:
+        logits:  (\\*, B) unnormalised bin logits.
+        centers: (B,) bin centers.
+
+    Returns:
+        (\\*,) scalar values in [centers[0], centers[-1]].
+    """
+    return (torch.softmax(logits, dim=-1) * centers).sum(dim=-1)
+
+
+def binned_value_ce(
+    logits: torch.Tensor, target: torch.Tensor, centers: torch.Tensor
+) -> torch.Tensor:
+    """Per-example cross-entropy between the two-hot target and bin logits.
+
+    Args:
+        logits:  (N, B) unnormalised bin logits.
+        target:  (N,) scalar value targets.
+        centers: (B,) bin centers.
+
+    Returns:
+        (N,) non-negative per-example cross-entropy (caller reduces/weights).
+    """
+    dist = project_to_two_hot(target, centers)
+    log_probs = F.log_softmax(logits, dim=-1)
+    return -(dist * log_probs).sum(dim=-1)
+
+
 def kl_policy_loss(
     policy_logits: torch.Tensor,  # (num_legal,) raw logits
     policy_target: torch.Tensor,  # (num_legal,) probability distribution

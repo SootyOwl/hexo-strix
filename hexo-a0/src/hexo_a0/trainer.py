@@ -26,7 +26,7 @@ import shutil
 import subprocess
 
 from hexo_a0.export import save_safetensors
-from hexo_a0.loss import kl_policy_loss, path_consistency_loss
+from hexo_a0.loss import kl_policy_loss, path_consistency_loss, binned_value_ce
 from hexo_a0.model import (
     graft_heads_for_jk_cat,
     graft_input_proj_for_threat_features,
@@ -864,10 +864,22 @@ def _forward_and_loss(
 
     use_amp = use_fp16 and device.type == "cuda"
 
+    # Distributional value head (value_bins>0): the core additionally returns
+    # the raw bin logits so the value loss is a two-hot cross-entropy; the
+    # scalar decode still rides in ``values`` for the diagnostic MSE. Scalar
+    # heads keep the byte-identical 3-tuple path.
+    value_bins = int(getattr(model, "value_bins", 0) or 0)
+
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-        all_logits, legal_counts, values = model._forward_batch_core(
-            batch, legal_idx=legal_idx, stone_idx=stone_idx, stone_batch=stone_batch,
-        )
+        if value_bins > 0:
+            all_logits, legal_counts, values, value_bin_logits = model._forward_batch_core(
+                batch, legal_idx=legal_idx, stone_idx=stone_idx,
+                stone_batch=stone_batch, return_value_logits=True,
+            )
+        else:
+            all_logits, legal_counts, values = model._forward_batch_core(
+                batch, legal_idx=legal_idx, stone_idx=stone_idx, stone_batch=stone_batch,
+            )
 
         # Stack on CPU first, then a single non-blocking H2D copy. Avoids
         # 2*batch_size separate small-tensor copies (ROCm is sensitive to
@@ -898,8 +910,18 @@ def _forward_and_loss(
         # finite if it ever does.
         sw_sum = sw.sum().clamp_min(1e-8)
 
-        v_diff_sq = (values - v_targets).pow(2)
-        mean_value = (v_diff_sq * sw).sum() / sw_sum
+        # Decoded-scalar MSE — the optimized term for scalar heads, and a
+        # comparable diagnostic for distributional heads.
+        v_diff_sq = (values.float() - v_targets).pow(2)
+        value_mse = (v_diff_sq * sw).sum() / sw_sum
+        if value_bins > 0:
+            # Distributional head: optimize the two-hot cross-entropy over bins.
+            ce_per_ex = binned_value_ce(
+                value_bin_logits.float(), v_targets, model.value_bin_centers
+            )
+            mean_value = (ce_per_ex * sw).sum() / sw_sum
+        else:
+            mean_value = value_mse
 
         all_targets_cpu = torch.cat(list(policy_targets))
         if all_targets_cpu.shape[0] != all_logits.shape[0]:
@@ -1011,6 +1033,7 @@ def _forward_and_loss(
         "total_loss": total_loss.detach(),
         "policy_loss": mean_policy.detach(),
         "value_loss": mean_value.detach(),
+        "value_mse": value_mse.detach(),
         "pc_loss": pc_loss_val,
         "cross_entropy": mean_cross_entropy.detach(),
         "target_entropy": mean_target_entropy.detach(),
@@ -1081,6 +1104,9 @@ def train_step(
     # Single sync per call: convert tensors to floats here. _forward_and_loss
     # returns detached GPU tensors (sync-free); the NaN guard lives at the
     # caller boundary so the hot training loop only pays one .item() per step.
+    # (value_mse is intentionally NOT surfaced here — train_step's dict contract
+    # is total/policy/value/pc; the distributional-head value_mse diagnostic is
+    # logged from Trainer.train()'s accumulator, the production TB path.)
     losses: dict[str, float] = {
         "total_loss": float(tensor_losses["total_loss"].item()),
         "policy_loss": float(tensor_losses["policy_loss"].item()),
@@ -2740,6 +2766,7 @@ class Trainer:
             "total_loss": 0.0,
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "value_mse": 0.0,
             "pc_loss": 0.0,
             "cross_entropy": 0.0,
             "target_entropy": 0.0,
@@ -2793,6 +2820,10 @@ class Trainer:
             running_total_t = torch.zeros((), device=self.device)
             running_policy_t = torch.zeros((), device=self.device)
             running_value_t = torch.zeros((), device=self.device)
+            # Decoded-scalar value MSE — same as value_loss for scalar heads,
+            # a comparable diagnostic for the distributional head (which
+            # optimizes the two-hot CE in value_loss instead).
+            running_value_mse_t = torch.zeros((), device=self.device)
             running_pc_t = torch.zeros((), device=self.device)
             running_cross_entropy_t = torch.zeros((), device=self.device)
             running_target_entropy_t = torch.zeros((), device=self.device)
@@ -2956,6 +2987,7 @@ class Trainer:
                         step_total_t = torch.zeros((), device=self.device)
                         step_policy_t = torch.zeros((), device=self.device)
                         step_value_t = torch.zeros((), device=self.device)
+                        step_value_mse_t = torch.zeros((), device=self.device)
                         step_pc_t = torch.zeros((), device=self.device)
                         step_cross_entropy_t = torch.zeros((), device=self.device)
                         step_target_entropy_t = torch.zeros((), device=self.device)
@@ -2968,6 +3000,7 @@ class Trainer:
                             step_total_t = step_total_t + mb_losses["total_loss"] / n_micro
                             step_policy_t = step_policy_t + mb_losses["policy_loss"] / n_micro
                             step_value_t = step_value_t + mb_losses["value_loss"] / n_micro
+                            step_value_mse_t = step_value_mse_t + mb_losses["value_mse"] / n_micro
                             step_cross_entropy_t = step_cross_entropy_t + mb_losses["cross_entropy"] / n_micro
                             step_target_entropy_t = step_target_entropy_t + mb_losses["target_entropy"] / n_micro
                             if torch.is_tensor(mb_losses["pc_loss"]):
@@ -2984,6 +3017,7 @@ class Trainer:
                         step_total_t = mb_losses["total_loss"]
                         step_policy_t = mb_losses["policy_loss"]
                         step_value_t = mb_losses["value_loss"]
+                        step_value_mse_t = mb_losses["value_mse"]
                         step_cross_entropy_t = mb_losses["cross_entropy"]
                         step_target_entropy_t = mb_losses["target_entropy"]
                         step_pc_t = (
@@ -3002,6 +3036,7 @@ class Trainer:
                     step_total_t = mb_losses["total_loss"]
                     step_policy_t = mb_losses["policy_loss"]
                     step_value_t = mb_losses["value_loss"]
+                    step_value_mse_t = mb_losses["value_mse"]
                     step_cross_entropy_t = mb_losses["cross_entropy"]
                     step_target_entropy_t = mb_losses["target_entropy"]
                     step_pc_t = (
@@ -3044,6 +3079,7 @@ class Trainer:
                 running_total_t = running_total_t + step_total_t
                 running_policy_t = running_policy_t + step_policy_t
                 running_value_t = running_value_t + step_value_t
+                running_value_mse_t = running_value_mse_t + step_value_mse_t
                 running_pc_t = running_pc_t + step_pc_t
                 running_cross_entropy_t = running_cross_entropy_t + step_cross_entropy_t
                 running_target_entropy_t = running_target_entropy_t + step_target_entropy_t
@@ -3073,6 +3109,7 @@ class Trainer:
                 losses["total_loss"] = (running_total_t / actual_steps).item()
                 losses["policy_loss"] = (running_policy_t / actual_steps).item()
                 losses["value_loss"] = (running_value_t / actual_steps).item()
+                losses["value_mse"] = (running_value_mse_t / actual_steps).item()
                 losses["pc_loss"] = (running_pc_t / actual_steps).item()
                 losses["cross_entropy"] = (running_cross_entropy_t / actual_steps).item()
                 losses["target_entropy"] = (running_target_entropy_t / actual_steps).item()
@@ -3232,9 +3269,23 @@ class Trainer:
                 metrics["value_loss"],
                 step,
                 description=(
-                    "MSE between the network's value head and the eventual game outcome "
-                    "(+1 / -1 / 0). Lower is better. Stages can floor at ~0.5 due to inherent "
-                    "early-game ambiguity."
+                    "The optimized value-head loss. For a scalar head this is the MSE "
+                    "against the eventual game outcome (+1 / -1 / 0). For a distributional "
+                    "head (value_bins>0) this is the two-hot cross-entropy over value bins; "
+                    "read loss/value_mse for the comparable decoded-scalar MSE. Stages can "
+                    "floor at ~0.5 (MSE) due to inherent early-game ambiguity."
+                ),
+            )
+            self.writer.add_scalar(
+                "loss/value_mse",
+                metrics["value_mse"],
+                step,
+                description=(
+                    "MSE between the value head's decoded SCALAR (tanh output, or the "
+                    "softmax expectation over bins for a distributional head) and the "
+                    "eventual game outcome. Equals loss/value for scalar heads; for "
+                    "distributional heads it is the outcome-comparable diagnostic while "
+                    "loss/value shows the optimized cross-entropy."
                 ),
             )
             # Staleness instrumentation: per-quartile mean policy KL by sample
