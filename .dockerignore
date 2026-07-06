@@ -6,6 +6,7 @@
 
 # Rust build output (can be gigabytes) — rebuilt inside the image
 **/target/
+**/target-*/
 
 # Python envs / caches — rebuilt inside the image
 .venv

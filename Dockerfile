@@ -75,10 +75,21 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # workspace members into .venv so the runtime stage needs no source.
 COPY hexo-rs/ hexo-rs/
 COPY hexo-a0/ hexo-a0/
+# Tune the Rust build for the actual deploy CPUs instead of the baseline ISA:
+# Oracle Ampere A1 is Neoverse N1; x86-64-v3 = AVX2+FMA (any post-2015 x86
+# host). rustc does no FP contraction by default, so results are unchanged.
+# (RUSTFLAGS would clobber .cargo/config.toml rustflags, but that config is
+# wasm-target-only and no wasm is built here.)
+ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/root/cargo-target \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        export RUSTFLAGS="-C target-cpu=neoverse-n1"; \
+    else \
+        export RUSTFLAGS="-C target-cpu=x86-64-v3"; \
+    fi; \
     GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP"; \
     uv sync --frozen --no-dev --no-editable $GRP
 
