@@ -261,7 +261,7 @@ class RepresentationNetwork(nn.Module):
                 nn.Linear(hidden, hidden), nn.ReLU(),
                 nn.Linear(hidden, hidden),
             )
-            return GINEConv(mlp, edge_dim=edge_dim)
+            return DedupGINEConv(mlp, edge_dim=edge_dim)
 
         raise ValueError(f"Unknown conv_type: {conv_type!r}")
 
@@ -322,13 +322,41 @@ class RepresentationNetwork(nn.Module):
             # Defensive clamp into the per-hop embedding table's valid range.
             edge_dist = edge_dist.long().clamp(1, self.axis_window)
         else:
+            gine_unique = gine_inverse = None
             if hasattr(self, "edge_proj"):
                 if edge_attr is None:
                     raise ValueError(
                         "Axis-graph model requires edge_attr but received None. "
                         "Ensure the graph builder matches the model's graph_type."
                     )
-                projected_edge_attr = self.edge_proj(edge_attr)  # (E, hidden_dim)
+                # `torch.unique(..., dim=0)` is a Dynamo graph break (its
+                # output shape depends on input data: aten.unique_dim.default)
+                # and the production training step compiles
+                # `_forward_batch_core` as a SINGLE graph — the trainer
+                # precomputes legal_idx/stone_idx/stone_batch precisely to
+                # avoid breaks like this one. So under tracing, skip the
+                # dedupe path entirely and fall back to the plain per-edge
+                # `edge_proj(edge_attr)` (the exact pre-dedupe code): dedupe
+                # is an eager-only optimization until the unique/inverse
+                # tensors can be precomputed outside the compiled region
+                # (e.g. at collate time, like legal_idx). This branch
+                # resolves to a compile-time constant in both modes (False
+                # in eager, True under tracing), so it costs nothing either
+                # way and never itself graph-breaks.
+                #
+                # The dedupe path is also only worth taking when the convs
+                # are DedupGINEConv — they're the only layer that consumes
+                # the unique/inverse kwargs. GATv2 convs never look at them,
+                # so paying for `torch.unique`'s sort (and, on CUDA, its
+                # likely device->host sync) there is pure waste.
+                if torch.compiler.is_dynamo_compiling() or not isinstance(
+                        self.convs[0], DedupGINEConv):
+                    projected_edge_attr = self.edge_proj(edge_attr)
+                else:
+                    unique_raw, gine_inverse = torch.unique(
+                        edge_attr, dim=0, return_inverse=True)
+                    gine_unique = self.edge_proj(unique_raw)            # (U, H)
+                    projected_edge_attr = gine_unique.index_select(0, gine_inverse)
             elif edge_attr is not None:
                 raise ValueError(
                     "Hex-graph model received unexpected edge_attr. "
@@ -342,6 +370,11 @@ class RepresentationNetwork(nn.Module):
                 x = norm(x)
                 if self.axis_relational:
                     x = conv(x, edge_index, edge_type, edge_dist, global_edge_index)
+                elif isinstance(conv, DedupGINEConv) and gine_unique is not None \
+                        and not getattr(conv, "_dedup_force_stock", False):
+                    x = conv(x, edge_index, edge_attr=projected_edge_attr,
+                             edge_attr_unique=gine_unique,
+                             edge_inverse=gine_inverse)
                 else:
                     x = conv(x, edge_index, edge_attr=projected_edge_attr)
                 if self.use_layer_scale:
@@ -352,6 +385,11 @@ class RepresentationNetwork(nn.Module):
             else:
                 if self.axis_relational:
                     x = conv(x, edge_index, edge_type, edge_dist, global_edge_index)
+                elif isinstance(conv, DedupGINEConv) and gine_unique is not None \
+                        and not getattr(conv, "_dedup_force_stock", False):
+                    x = conv(x, edge_index, edge_attr=projected_edge_attr,
+                             edge_attr_unique=gine_unique,
+                             edge_inverse=gine_inverse)
                 else:
                     x = conv(x, edge_index, edge_attr=projected_edge_attr)
                 if self.use_layer_scale:
