@@ -621,9 +621,18 @@ class TestE4InjectPlumbing:
         monkeypatch.setattr(eval_mod.hexo_rs if hasattr(eval_mod, "hexo_rs") else hexo_rs,
                             "gumbel_mcts_with_diagnostics", wrap)
 
+        # The model plays the first mover (P2 is first in this engine) so the
+        # capture we assert on happens at its opening mr=2 root. Capture at a
+        # mr=2 root is short-circuited whenever gumbel_mcts finds a forcing win
+        # there (it returns early with empty `chosen_action_forced_candidates` --
+        # a proven win needs no p₂ inject). In this offense-dominant config the
+        # solver finds a forced win at essentially every mr=2 root that already
+        # has board structure, so the *second* mover's roots never capture. The
+        # opening move (empty board) has no forcing win, guaranteeing a capture
+        # to observe regardless of the untrained model's weights.
         play_eval_game(
             model, FAST_GAME_CONFIG, DEVICE,
-            opponent=model, model_side="P1",
+            opponent=model, model_side="P2",
             mcts_sims=4, mcts_m_actions=6,
             model_config=TINY_MODEL_CONFIG, opponent_config=TINY_MODEL_CONFIG,
             mcts_forced_candidate_capture_k=3,
