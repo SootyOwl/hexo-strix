@@ -44,6 +44,36 @@ _JK_VALID_MODES = ("sum",) + _JK_PYG_MODES
 _CONV_INDEX_RE = re.compile(r"representation\.convs\.(\d+)\.")
 
 
+class DedupGINEConv(GINEConv):
+    """GINEConv whose per-layer edge linear runs on UNIQUE edge_attr rows.
+
+    Axis-graph edge features are structural (axis one-hot x signed distance x
+    window feature): ~13k edges carry only ~91 distinct rows on a real r=8
+    board, and `self.lin` (H->H, per layer, per edge) dominates edge-side
+    FLOPs. Pass `edge_attr_unique` + `edge_inverse` (from torch.unique on the
+    RAW 5-dim attrs, computed once per forward) to project the unique table
+    and gather; omit them to get stock GINEConv behavior. State-dict keys are
+    unchanged (`lin.*`, `nn.*`) so checkpoints/export stay compatible.
+    Equivalent to stock up to GEMM tiling (allclose, not bitwise).
+    """
+
+    def forward(self, x, edge_index, edge_attr=None, size=None,
+                *, edge_attr_unique=None, edge_inverse=None):
+        if edge_attr_unique is None:
+            return super().forward(x, edge_index, edge_attr=edge_attr, size=size)
+        pre = self.lin(edge_attr_unique).index_select(0, edge_inverse)
+        self._dedup_pre_lined = True
+        try:
+            return super().forward(x, edge_index, edge_attr=pre, size=size)
+        finally:
+            self._dedup_pre_lined = False
+
+    def message(self, x_j, edge_attr):
+        if edge_attr is not None and getattr(self, "_dedup_pre_lined", False):
+            return (x_j + edge_attr).relu()
+        return super().message(x_j, edge_attr)
+
+
 class RepresentationNetwork(nn.Module):
     """GATv2Conv-based representation network.
 
