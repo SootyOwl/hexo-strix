@@ -76,6 +76,17 @@ DEFAULT_DIFFICULTY_FORCING_DEPTH: dict[str, int] = {
 # (max 13 s) with zero first-sighting gain.
 LIVE_NODE_BUDGET = 20_000
 DEF_NODE_BUDGET = 20_000
+# Escalated budget for CONFIRMING the one defense candidate about to be
+# played (`_verified_defense`). solve_defense's internal candidate re-solves
+# run at the flat DEF budget where BudgetExceeded counts as refuted — sound
+# enough for triage, not for trusting: on the 2026-07-06 chao position 4 of
+# the 5 "verified" pairs were losing, their refutations budget artifacts that
+# 30k-75k nodes expose. 250k is the ANALYSIS-grade budget with margin (the
+# knee sweeps measured threat SIGHTING, a different axis from refutation
+# soundness). Cheap where it counts: a GENUINE refutation has a small forcing
+# tree that exhausts in ~100 ms at any budget; only rejecting a false
+# candidate pays ~0.4-2 s, once, and saves the game.
+VERIFY_NODE_BUDGET = 250_000
 # Fallback depth cap for a difficulty tier missing from the map (defensive;
 # should be unreachable given DEFAULT_DIFFICULTY_FORCING_DEPTH covers every
 # DIFFICULTY_ORDER entry) — the "strong"/full-measured-budget depth.
@@ -86,6 +97,18 @@ FALLBACK_FORCING_DEPTH = DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
 # past a live turn's latency budget, so the solver stops after this long and
 # returns whatever killers/anchors/survivors were verified so far.
 DEFENSE_DEADLINE_S = 3.0
+# Per-tier override of the defense deadline (tiers not listed use the flat
+# DEFENSE_DEADLINE_S). Raised for "strong" after the 2026-07-06 chao loss:
+# on the production host (Oracle Ampere, ~2-3x slower single-core than the
+# dev box) the 3 s deadline expired mid-verification, solve_defense returned
+# a partial result with no verified killers, and the bot played the max-delay
+# survivor into a proven loss. The full pair sweep on that position takes
+# ~5 s even on the dev box, so strong gets 10 s — at most twice per bot turn,
+# still well inside the 60 s request timeout, and the pair-partner cache
+# (see `_forcing_move`) makes the 2nd-placement solve usually unnecessary.
+DIFFICULTY_DEFENSE_DEADLINE_S: dict[str, float] = {
+    "strong": 10.0,
+}
 
 # Rate-limit for the "forcing check failed" exception log (see
 # `_log_forcing_exception`): a systematic bug would otherwise flood the log
@@ -155,6 +178,17 @@ class GameRecord:
     # re-invoking the solver. In-memory only — a restart just re-solves.
     forcing_pv: list[tuple[int, int]] | None = None
     forcing_base: int = 0  # len(move_log) at the time forcing_pv was solved
+    # Cached second cell of a verified defensive killer PAIR (solve_defense):
+    # after the bot plays the pair's anchor, the partner is a proven killer at
+    # the SAME turn's next placement — only the bot's own anchor stone was
+    # added since the joint verification — so it is played directly instead of
+    # re-derived by a fresh, deadline-vulnerable solve (the 2026-07-06 chao
+    # loss: the re-solve expired on the slow production host and the bot
+    # played the max-delay survivor instead of the already-proven partner).
+    # In-memory only, single-shot, valid only when len(move_log) still equals
+    # defense_partner_base when consumed.
+    defense_partner: tuple[int, int] | None = None
+    defense_partner_base: int = 0
     # Phase 5: optional self-reported opponent Elo. Added now so the record is
     # forward-compatible; defaults are anonymous.
     opp_elo: float | None = None
@@ -333,6 +367,20 @@ def make_bot_turn_fn(
             forcing_depth_map.get(DEFAULT_DIFFICULTY, FALLBACK_FORCING_DEPTH),
         )
 
+    def _verified_defense(rec: GameRecord, depth_cap: int, cells) -> bool:
+        """Escalated confirmation of one defense candidate: place `cells` as
+        bot stones on a hypothetical board, then re-solve the opponent's
+        threat (their perspective, fresh turn) at VERIFY_NODE_BUDGET. True
+        means the threat is no longer provable past this defense at the
+        escalated budget — see VERIFY_NODE_BUDGET for why the flat-budget
+        verification inside solve_defense is not enough to trust.
+        """
+        stones = list(rec.state.placed_stones())
+        stones += [(tuple(c), rec.bot_side) for c in cells]
+        flip = hr.GameState.from_state(
+            stones, rec.human_side, 2, hr.GameConfig(**game_kwargs))
+        return hr.solve_forcing(flip, depth_cap, VERIFY_NODE_BUDGET) is None
+
     def _defensive_move(rec: GameRecord, depth_cap: int):
         """Step 3: pre-emptive VCF defense, run only when the bot has no own
         forced win. Exploits monotonicity: the bot's stones only remove
@@ -353,19 +401,46 @@ def make_bot_turn_fn(
         ``_forcing_move`` — the SAME tier sees the SAME depth on both sides.
         """
         state = rec.state
+        deadline_s = DIFFICULTY_DEFENSE_DEADLINE_S.get(
+            rec.difficulty, DEFENSE_DEADLINE_S)
         res = hr.solve_defense(state, depth_cap, DEF_NODE_BUDGET,
-                               int(DEFENSE_DEADLINE_S * 1000))
+                               int(deadline_s * 1000))
         if res is None:
             return None
         killers, pair_anchors, best_delay, _threat_pv = res
+        # Escalated confirmation of the candidates below: one more deadline
+        # window, checked before each (rare) rejection re-solve. On expiry the
+        # policy-best remaining candidate is played UNVERIFIED — exactly the
+        # pre-escalation behavior, never worse.
+        verify_deadline = time.monotonic() + deadline_s
         if killers:
-            return _policy_argmax(state, restrict_to={tuple(c) for c in killers})
-        anchors = {tuple(c1) for (c1, _c2) in pair_anchors}
-        if anchors:
-            # Any anchor works: after playing it, the next placement's
-            # re-check finds its verified second cell as a single killer (or
-            # something better).
-            return _policy_argmax(state, restrict_to=anchors)
+            remaining = {tuple(c) for c in killers}
+            while remaining:
+                chosen = _policy_argmax(state, restrict_to=remaining)
+                if time.monotonic() >= verify_deadline:
+                    return chosen
+                if _verified_defense(rec, depth_cap, (chosen,)):
+                    return chosen
+                remaining.discard(chosen)
+            # Every killer was a budget artifact: a pair may still hold.
+        pairs = [(tuple(c1), tuple(c2)) for (c1, c2) in pair_anchors]
+        while pairs:
+            # Any confirmed pair works: it was verified JOINTLY, so after
+            # playing the anchor its partner is a proven killer at this same
+            # turn's next placement. Cache it on the record — `_forcing_move`
+            # plays it directly instead of re-deriving it with a fresh solve
+            # that could hit the deadline (the 2026-07-06 chao loss).
+            chosen = _policy_argmax(
+                state, restrict_to={c1 for (c1, _c2) in pairs})
+            partner = next(c2 for (c1, c2) in pairs if c1 == chosen)
+            if (time.monotonic() >= verify_deadline
+                    or _verified_defense(rec, depth_cap, (chosen, partner))):
+                rec.defense_partner = partner
+                # After the anchor is appended to move_log, its length is
+                # len+1 — the partner applies at exactly that placement.
+                rec.defense_partner_base = len(rec.move_log) + 1
+                return chosen
+            pairs = [p for p in pairs if p != (chosen, partner)]
         if best_delay is not None:
             # No refutation found this placement: play the survivor with the
             # longest surviving PV (max delay). The next placement re-runs
@@ -383,6 +458,16 @@ def make_bot_turn_fn(
         state = rec.state
         legal = {tuple(c) for c in state.legal_moves()}
         depth_cap = _forcing_depth_for(rec)
+
+        # Pop the pair-partner cache (single-shot): it is only valid at the
+        # placement immediately after its anchor, in the same bot turn. It is
+        # consumed below AFTER the own-win solve — a proven own win preempts
+        # defending, same priority order as the rest of this function.
+        partner, rec.defense_partner = rec.defense_partner, None
+        if (partner is not None
+                and (len(rec.move_log) != rec.defense_partner_base
+                     or partner not in legal)):
+            partner = None
 
         # 1. PV-cache replay: if the opponent has followed the cached forced
         # line so far, play the next PV move without calling the solver.
@@ -410,6 +495,11 @@ def make_bot_turn_fn(
                 "solve_forcing returned illegal first_move %r for game %s",
                 first_move, rec.game_id,
             )
+
+        # 2.5. Verified pair partner from this turn's anchor placement: a
+        # proven killer, played without any re-solve.
+        if partner is not None:
+            return partner
 
         # 3. Defensive pre-emptive check (only when step 2 found nothing).
         return _defensive_move(rec, depth_cap)

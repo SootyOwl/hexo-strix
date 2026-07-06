@@ -848,6 +848,260 @@ def test_forcing_defense_saves_strongloss_a_via_killer_pair():
     assert rec.move_log[len(stones)][:2] != (-3, 3)
 
 
+def test_forcing_defense_pair_partner_cached_within_turn(monkeypatch):
+    # Regression for the 2026-07-06 chao loss: after playing a verified pair's
+    # ANCHOR, the same turn's 2nd placement must play the pair's PARTNER
+    # directly from the GameRecord cache — the pair was verified jointly, and
+    # only the bot's own anchor stone was added since. Re-deriving the partner
+    # via a fresh solve_defense is deadline-vulnerable: on the slow production
+    # host the re-solve expired mid-verification, returned killers=[] with only
+    # a best_delay survivor, and the bot played the survivor and lost. The 2nd
+    # stubbed call below returns exactly that deadline-expired shape; it must
+    # never be consulted.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 2, cfg)  # bot's full turn ahead
+    legal = [tuple(c) for c in state.legal_moves()]
+    anchor, partner, survivor = legal[0], legal[1], legal[2]
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def _stub_defense(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ([], [(anchor, partner)], None, [anchor, partner])
+        return ([], [], survivor, [])  # deadline-expired partial result
+
+    monkeypatch.setattr(hexo_rs, "solve_defense", _stub_defense)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-pair-cache", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert [m[:2] for m in rec.move_log[-2:]] == [anchor, partner]
+    assert calls["n"] == 1  # 2nd placement came from the cache, not a re-solve
+
+
+def test_forcing_defense_partner_cache_not_reused_across_turns(monkeypatch):
+    # The partner cache is only sound for the immediately-following placement
+    # of the SAME bot turn (nothing but the bot's own anchor stone has been
+    # added). Once the opponent has moved, a cached partner is stale and the
+    # defense must be re-derived from scratch.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2"), ((2, 0), "P2")], "P1", 1, cfg)
+    legal = [tuple(c) for c in state.legal_moves()]
+    anchor, stale_partner, killer2 = legal[0], legal[1], legal[2]
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def _stub_defense(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ([], [(anchor, stale_partner)], None, [anchor, stale_partner])
+        return ([killer2], [], None, [killer2])
+
+    monkeypatch.setattr(hexo_rs, "solve_defense", _stub_defense)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-pair-stale", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2"), (2, 0, "P2")],
+    )
+    turn_fn = _bot_turn_fn(cfg_kwargs)
+    turn_fn(rec)  # bot's LAST placement this turn: plays the anchor
+    assert rec.move_log[-1][:2] == anchor
+
+    # Human replies (two placements), then the bot's next turn begins.
+    for cell in rec.state.legal_moves()[:2]:
+        q, r = cell
+        rec.state.apply_move(q, r)
+        rec.move_log.append((q, r, "P2"))
+    turn_fn(rec)
+
+    new_moves = [m[:2] for m in rec.move_log[-2:]]
+    assert stale_partner not in new_moves  # stale cache must not fire
+    assert killer2 in new_moves            # defense was re-derived instead
+    assert calls["n"] >= 2
+
+
+def test_forcing_defense_deadline_strong_tier(monkeypatch):
+    # Per-tier defense deadline: "strong" gets a longer solve_defense time
+    # limit than the flat 3 s backstop (the chao loss was a deadline expiry on
+    # the slow production host — see DIFFICULTY_DEFENSE_DEADLINE_S).
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 1, cfg)
+    killer = tuple(state.legal_moves()[0])
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+    seen = {}
+
+    def _stub_defense(_state, depth_cap, node_budget, time_limit_ms):
+        seen["ms"] = time_limit_ms
+        return ([killer], [], None, [killer])
+
+    monkeypatch.setattr(hexo_rs, "solve_defense", _stub_defense)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-deadline-strong", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")], difficulty="strong",
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    expected = int(game_mod.DIFFICULTY_DEFENSE_DEADLINE_S["strong"] * 1000)
+    assert seen["ms"] == expected
+    assert expected > int(game_mod.DEFENSE_DEADLINE_S * 1000)
+
+
+def test_forcing_defense_rejects_killer_refuted_at_escalated_budget(monkeypatch):
+    # Escalated verification: solve_defense's internal candidate re-solves run
+    # at the flat DEF budget where BudgetExceeded counts as refuted, so a
+    # "verified" killer can actually lose (the 2026-07-06 chao position: 4 of
+    # 5 verified pairs lost, exposed only at 30k-75k nodes). Before playing a
+    # candidate, _defensive_move must re-check it at the escalated budget via
+    # a flip-perspective solve on the trial position and skip candidates whose
+    # refutation was a budget artifact. The stub "finds" the opponent win
+    # whenever the bad killer is on the trial board.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 1, cfg)  # bot's last placement
+    k_bad, k_good = (2, 0), (3, 0)  # policy argmax (all-zero logits) tries lowest first
+
+    def _fake_solve_forcing(st, depth_cap, node_budget):
+        if any(tuple(c) == k_bad for c, _p in st.placed_stones()):
+            return ((9, 9), [(9, 9)])  # opponent win still provable past k_bad
+        return None
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _fake_solve_forcing)
+    monkeypatch.setattr(
+        hexo_rs, "solve_defense",
+        lambda *a, **k: ([k_bad, k_good], [], None, [k_bad, k_good]))
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-verify-killer", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert rec.move_log[-1][:2] == k_good
+
+
+def test_forcing_defense_rejects_pair_refuted_at_escalated_budget(monkeypatch):
+    # Same as above for killer PAIRS — the actual chao failure shape: the
+    # policy-preferred pair is a budget artifact and must be discarded; the
+    # next pair verifies clean, its anchor is played and its partner comes
+    # from the cache at the 2nd placement (still exactly one defense solve).
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 2, cfg)  # bot's full turn
+    bad = ((2, 0), (2, 1))
+    good = ((3, 0), (3, 1))
+
+    def _fake_solve_forcing(st, depth_cap, node_budget):
+        if any(tuple(c) == bad[0] for c, _p in st.placed_stones()):
+            return ((9, 9), [(9, 9)])
+        return None
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _fake_solve_forcing)
+    calls = {"n": 0}
+
+    def _stub_defense(*a, **k):
+        calls["n"] += 1
+        return ([], [bad, good], None, [bad[0], bad[1]])
+
+    monkeypatch.setattr(hexo_rs, "solve_defense", _stub_defense)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-verify-pair", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert [m[:2] for m in rec.move_log[-2:]] == [good[0], good[1]]
+    assert calls["n"] == 1
+
+
+def test_forcing_defense_saves_chao_game_via_pair_cache(monkeypatch):
+    # End-to-end regression for the 2026-07-06 chao (P1) win over strix strong
+    # (P2), decoded from the shared analysis URL. At the bot's turn after
+    # chao's (4,-7),(2,-7), no single block refutes the VCF but the pair
+    # ((-1,0),(2,-5)) does. Live, the bot played the anchor and then LOST the
+    # partner to a defense-deadline expiry on the 2nd placement, playing the
+    # max-delay survivor (0,-5) instead — after which chao's win is proven.
+    # With the partner cache, the 2nd placement must come without a re-solve
+    # and the full turn must refute the threat.
+    chao_prefix = [
+        (1, 2), (2, 3), (2, 2), (2, -3), (2, -2), (-1, 5), (3, -5), (1, 4),
+        (3, -4), (-2, 4), (-1, -4), (-1, -2), (-1, -3), (-1, 3), (0, 3),
+        (-3, 5), (6, -6), (0, 1), (-3, -2), (-3, 0), (-4, -1), (-2, -1),
+        (-5, -1), (-2, 0), (-3, 1), (-2, -4), (4, -7), (2, -7),
+    ]
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState(cfg)
+    move_log = [(0, 0, "P1")]
+    for q, r in chao_prefix:
+        move_log.append((q, r, state.current_player()))
+        state.apply_move(q, r)
+    assert state.current_player() == "P2"  # strix to move, 2 placements
+
+    depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
+    # Sanity: chao's threat is real at the bot's turn start.
+    flip = hexo_rs.GameState.from_state(state.placed_stones(), "P1", 2, cfg)
+    assert hexo_rs.solve_forcing(flip, depth, game_mod.DEF_NODE_BUDGET) is not None
+
+    # Counting passthrough: on a fast dev box the deadline-vulnerable re-solve
+    # happens to succeed, so the LIVE failure (deadline expiry on the slow
+    # production host) can't reproduce here. What is host-independent is that
+    # the 2nd placement must come from the pair cache — ONE defense solve for
+    # the whole turn.
+    real_solve_defense = hexo_rs.solve_defense
+    calls = {"n": 0}
+
+    def _counting_defense(*a, **k):
+        calls["n"] += 1
+        return real_solve_defense(*a, **k)
+
+    monkeypatch.setattr(hexo_rs, "solve_defense", _counting_defense)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-chao", created_at=now, last_active_at=now, state=state,
+        human_side="P1", bot_side="P2", human_name="chao",
+        move_log=move_log, difficulty="strong",
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    # After the bot's full turn, chao's forced win must be refuted AT THE
+    # ESCALATED BUDGET, not just the flat DEF budget: of the five pairs
+    # solve_defense "verifies" here at 20k, four are losing — their
+    # refutations are budget artifacts exposed at 30k-75k nodes. Only
+    # ((-1,0),(2,-5)) survives (proven empty to 20M). Asserting at
+    # VERIFY_NODE_BUDGET pins that the bot escalation-checked its choice.
+    after = hexo_rs.GameState.from_state(rec.state.placed_stones(), "P1", 2, cfg)
+    assert hexo_rs.solve_forcing(after, depth, game_mod.VERIFY_NODE_BUDGET) is None
+    assert calls["n"] == 1  # 2nd placement served from the pair cache
+
+
 def test_forcing_kill_switch_never_calls_solver(monkeypatch):
     # live_forcing=False must make `_forcing_move` (and therefore
     # `hexo_rs.solve_forcing`) entirely unreachable, even on a position with a
