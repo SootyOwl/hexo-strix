@@ -13,6 +13,7 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -601,6 +602,7 @@ fn pool_inference_server_subprocess(
     running: &AtomicBool,
     pool_path_rx: mpsc::Receiver<String>,
     python_bin: &str,
+    inference_bin: Option<&Path>,
     model_args: &[String],
 ) {
     // Wait for the first checkpoint path from the loader.
@@ -609,7 +611,7 @@ fn pool_inference_server_subprocess(
         Err(_) => return, // loader exited before producing a path
     };
 
-    let mut model = match SubprocessModel::spawn_labeled(python_bin, &first_path, model_args, "python pool") {
+    let mut model = match SubprocessModel::spawn_labeled(python_bin, inference_bin, &first_path, model_args, "python pool") {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Pool subprocess failed to spawn: {e}");
@@ -1720,6 +1722,12 @@ fn main() {
     // Only honored when --python-inference is set; the in-process torch
     // path is always single-worker.
     let mut python_inference_workers: usize = 1;
+    // Path to a native `hexo-infer-server` binary (HX04 protocol drop-in for
+    // `python -m hexo_a0.inference_server`). When set, every SubprocessModel
+    // spawn (main batchers + pool loader) execs this binary directly instead
+    // of python; implies --python-inference. Axis-only (hexo-infer has no hex
+    // graph-builder), enforced once graph_type is known below.
+    let mut inference_bin: Option<PathBuf> = None;
     // How requests reach the N inference batchers. Default Shared (MPMC pull
     // queue): idle workers pull the next batch, robust to any service-time
     // asymmetry. Validated neutral vs round-robin on this APU (both workers
@@ -1848,6 +1856,7 @@ fn main() {
             }
             "--inference-double-buffer" => { inference_double_buffer = true; i += 1; }
             "--python-bin" => { python_bin = args[i + 1].clone(); i += 2; }
+            "--inference-bin" => { inference_bin = Some(PathBuf::from(args[i + 1].clone())); i += 2; }
             "--checkpoint" => { checkpoint_path = Some(args[i + 1].clone()); i += 2; }
             "--model-hidden-dim" => { model_hidden_dim = args[i + 1].parse().unwrap(); i += 2; }
             "--model-num-layers" => { model_num_layers = args[i + 1].parse().unwrap(); i += 2; }
@@ -1905,6 +1914,16 @@ fn main() {
             python_inference_workers,
         );
         python_inference_workers = 1;
+    }
+
+    // --inference-bin implies --python-inference: it's a drop-in for the
+    // Python subprocess, spawned through the same SubprocessModel path.
+    if inference_bin.is_some() && !python_inference {
+        eprintln!(
+            "--inference-bin set: implying --python-inference (spawning native \
+             HX04 server instead of python)."
+        );
+        python_inference = true;
     }
 
     // Double-buffering is wired only into the subprocess inference path.
@@ -1967,6 +1986,14 @@ fn main() {
         "axis" => GraphType::Axis,
         _ => GraphType::Hex,
     };
+
+    if inference_bin.is_some() && graph_type == GraphType::Hex {
+        eprintln!(
+            "--inference-bin requires --graph-type axis: hexo-infer-server only \
+             implements the axis-window graph builder, got --graph-type {graph_type_str:?}"
+        );
+        std::process::exit(1);
+    }
 
     PROFILE_PLAY_ENABLED.store(profile_play, Ordering::Relaxed);
 
@@ -2066,7 +2093,7 @@ fn main() {
             if inference_double_buffer {
                 eprintln!("Double-buffered inference enabled (gather/compute split).");
             }
-            let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
+            let mut model = SubprocessModel::spawn(&python_bin, inference_bin.as_deref(), ckpt, &model_args)
                 .unwrap_or_else(|e| { eprintln!("Failed to spawn Python: {e}"); std::process::exit(1); });
 
             std::thread::scope(|s| {
@@ -2249,7 +2276,7 @@ fn main() {
                 // so concurrent workers are distinguishable in the log. At N=1
                 // this is still `[python w0]`; harmless and explicit.
                 let label = format!("python w{wid}");
-                match SubprocessModel::spawn_labeled(&python_bin, ckpt, &model_args, &label) {
+                match SubprocessModel::spawn_labeled(&python_bin, inference_bin.as_deref(), ckpt, &model_args, &label) {
                     Ok(m) => models.push(m),
                     Err(e) => {
                         eprintln!("Failed to spawn Python inference worker {wid}: {e}");
@@ -2290,12 +2317,13 @@ fn main() {
                     let (pool_path_tx, pool_path_rx) = mpsc::sync_channel::<String>(1);
 
                     let python_bin_clone = python_bin.clone();
+                    let inference_bin_clone = inference_bin.clone();
                     let model_args_clone = model_args.clone();
                     s.spawn(move || {
                         pool_inference_server_subprocess(
                             prx, max_batch, batch_timeout,
                             running_ref, pool_path_rx,
-                            &python_bin_clone, &model_args_clone,
+                            &python_bin_clone, inference_bin_clone.as_deref(), &model_args_clone,
                         );
                     });
 

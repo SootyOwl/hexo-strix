@@ -4,6 +4,7 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write as _};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
@@ -52,13 +53,51 @@ pub struct SubprocessModel {
     stderr_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Build the `Command` used to spawn the inference subprocess, without
+/// touching stdio/env — those are attached by the caller.
+///
+/// - `inference_bin = None`: spawns `python_bin -m hexo_a0.inference_server
+///   --checkpoint <checkpoint> <extra_args...>` (the historical Python
+///   server).
+/// - `inference_bin = Some(bin)`: spawns `<bin> --checkpoint <checkpoint>
+///   <extra_args...>` (no `-m`) — the native `hexo-infer-server` drop-in.
+///   The extra args are forwarded unchanged; the Rust server ignores
+///   whatever it doesn't need.
+pub fn spawn_command(
+    python_bin: &str,
+    inference_bin: Option<&Path>,
+    checkpoint: &Path,
+    extra_args: &[String],
+) -> Command {
+    let mut cmd = match inference_bin {
+        Some(bin) => {
+            let mut cmd = Command::new(bin);
+            cmd.arg("--checkpoint").arg(checkpoint);
+            cmd
+        }
+        None => {
+            let mut cmd = Command::new(python_bin);
+            cmd.args(["-m", "hexo_a0.inference_server", "--checkpoint"])
+                .arg(checkpoint);
+            cmd
+        }
+    };
+    cmd.args(extra_args);
+    cmd
+}
+
 impl SubprocessModel {
-    /// Spawn the Python inference subprocess (stderr tagged `[python]`).
+    /// Spawn the inference subprocess (stderr tagged `[python]`).
     ///
     /// Waits up to 600 seconds for the "READY" signal on stderr (torch.compile
     /// can take minutes on first run).
-    pub fn spawn(python_bin: &str, model_path: &str, model_args: &[String]) -> Result<Self, String> {
-        Self::spawn_labeled(python_bin, model_path, model_args, "python")
+    pub fn spawn(
+        python_bin: &str,
+        inference_bin: Option<&Path>,
+        model_path: &str,
+        model_args: &[String],
+    ) -> Result<Self, String> {
+        Self::spawn_labeled(python_bin, inference_bin, model_path, model_args, "python")
     }
 
     /// Like [`spawn`](Self::spawn) but tags every stderr line `[{label}]`
@@ -67,15 +106,14 @@ impl SubprocessModel {
     /// `python` in the label so existing log greps still match.
     pub fn spawn_labeled(
         python_bin: &str,
+        inference_bin: Option<&Path>,
         model_path: &str,
         model_args: &[String],
         label: &str,
     ) -> Result<Self, String> {
         let startup_label = label.to_string();
         let drain_label = label.to_string();
-        let mut child = Command::new(python_bin)
-            .args(["-m", "hexo_a0.inference_server", "--checkpoint", model_path])
-            .args(model_args)
+        let mut child = spawn_command(python_bin, inference_bin, Path::new(model_path), model_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -495,5 +533,63 @@ fn read_i32_slice(r: &mut impl std::io::Read, out: &mut [i32]) -> Result<(), Str
 fn as_u8_slice(slice: &[f32]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
+    }
+}
+
+#[cfg(test)]
+mod spawn_command_tests {
+    use super::*;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn python_path_spawns_module_with_no_inference_bin() {
+        let checkpoint = Path::new("/tmp/model.pt");
+        let extra = vec!["--graph-type".to_string(), "axis".to_string()];
+        let cmd = spawn_command("python3", None, checkpoint, &extra);
+
+        assert_eq!(cmd.get_program(), "python3");
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "-m",
+                "hexo_a0.inference_server",
+                "--checkpoint",
+                "/tmp/model.pt",
+                "--graph-type",
+                "axis",
+            ]
+        );
+    }
+
+    #[test]
+    fn inference_bin_spawns_native_binary_directly() {
+        let checkpoint = Path::new("/tmp/model.pt");
+        let extra = vec!["--graph-type".to_string(), "axis".to_string()];
+        let bin = Path::new("/usr/local/bin/hexo-infer-server");
+        let cmd = spawn_command("python3", Some(bin), checkpoint, &extra);
+
+        assert_eq!(cmd.get_program(), bin.as_os_str());
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec!["--checkpoint", "/tmp/model.pt", "--graph-type", "axis"]
+        );
+    }
+
+    #[test]
+    fn inference_bin_omits_python_module_flag() {
+        let checkpoint = Path::new("/tmp/model.pt");
+        let bin = Path::new("/usr/local/bin/hexo-infer-server");
+        let cmd = spawn_command("python3", Some(bin), checkpoint, &[]);
+
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-m"));
+        assert!(!args.iter().any(|a| a == "hexo_a0.inference_server"));
     }
 }
