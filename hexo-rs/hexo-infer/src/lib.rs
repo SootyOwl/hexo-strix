@@ -8,6 +8,10 @@
 pub mod evaluator;
 pub mod forward;
 pub mod ops;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod server;
 pub mod weights;
 
 pub use forward::InferModel;

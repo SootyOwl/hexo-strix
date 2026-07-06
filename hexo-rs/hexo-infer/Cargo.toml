@@ -17,3 +17,7 @@ rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 rand = "0.9"
 rand_chacha = "0.9"
+
+[[bin]]
+name = "hexo-infer-server"
+path = "src/bin/hexo_infer_server.rs"
