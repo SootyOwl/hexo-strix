@@ -143,7 +143,8 @@ def test_binned_scripted_decode_matches_eager():
     )
 
     # And the eager values themselves are the softmax-expectation decode.
-    _, _, _, bin_logits = net._forward_batch_core(batch, return_value_logits=True)
+    _, _, _, extras = net._forward_batch_core(batch, return_train_extras=True)
+    bin_logits = extras["value_logits"]
     assert torch.allclose(
         eager_values, decode_binned_value(bin_logits, net.value_bin_centers), atol=1e-5
     )

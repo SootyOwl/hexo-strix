@@ -31,6 +31,7 @@ class ModelConfig:
     value_bins: int = _f(0, "Distributional (categorical) value head: number of value bins spanning [value_bin_min, value_bin_max]. 0 = scalar tanh head (legacy, default). When >0 (>=2), the value head outputs a softmax over bins and the scalar is the softmax expectation (decode_binned_value); training uses a two-hot cross-entropy. An odd count puts a bin center exactly at the draw value. Suggested 65. FROM-SCRATCH ONLY (replaces the scalar head; no graft).", group="Output heads")
     value_bin_min: float = _f(-1.0, "Lower end of the distributional value head's bin grid (only used when value_bins>0).", group="Output heads")
     value_bin_max: float = _f(1.0, "Upper end of the distributional value head's bin grid (only used when value_bins>0).", group="Output heads")
+    value_horizons: list[int] = _ff(list, "Short-horizon value heads (TRAIN-ONLY, never exported to self-play). A list of horizons in PLACEMENTS (a HeXO turn is 2 placements); each adds a binned value head trained on the position's outcome IF the game resolves within that many placements, else neutral (0). A denser value signal in long games. Suggested [4, 12, 32] (~2/6/16 turns). Requires value_bins>0 (all value heads share the bin grid). Empty = disabled. Weighted by training.horizon_loss_weight. FROM-SCRATCH ONLY.", group="Output heads")
     # --- Graph construction ---
     graph_type: str = _f("axis", "Graph topology: 'hex' (distance-1 adjacency, ~9 layers) or 'axis' (axis-window with edge features, ~3 layers)", group="Graph construction")
     prune_empty_edges: bool = _f(True, "Drop empty→empty edges in axis-window graphs (reduces graph size, only affects graph_type='axis')", group="Graph construction")
@@ -217,6 +218,7 @@ class TrainingConfig:
     # --- Loss ---
     draw_value: float = _f(-0.3, "Value target for drawn games. 0.0 = neutral, -0.1 = slight penalty for both sides (encourages decisive play). Applied symmetrically: both players see this value for all positions in a drawn game.", group="Loss")
     pc_loss_weight: float = _f(0.0, "Weight for path consistency regularisation loss (0 = disabled)", group="Loss")
+    horizon_loss_weight: float = _f(0.0, "Weight for the short-horizon value heads' aggregate cross-entropy (0 = disabled). Only active when model.value_horizons is non-empty. Suggested ~0.25.", group="Loss")
     # --- Data ---
     augment_symmetries: bool = _f(True, "Apply D6 symmetry augmentation (12x training data via hex rotations/reflections)", group="Data")
     buffer_capacity: int = _f(250_000, "Maximum number of positions stored in the replay buffer", group="Data")
