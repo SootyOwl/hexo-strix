@@ -701,36 +701,44 @@ def analyze_trajectory(model, model_config, moves: list[tuple[int, int]],
     exact +1/-1/0; non-terminal prefixes are evaluated with one ``forward_batch``.
     """
     import hexo_rs as hr
-    graph_fn = make_graph_fn(model_config)
     cfg = hr.GameConfig(win_length, placement_radius, max_moves)
     prefix_states, error_at = _build_prefix_states(moves, cfg)
 
     non_terminal_idx = [i for i, s in enumerate(prefix_states) if not s.is_terminal()]
     non_term_values: dict[int, float] = {}
     if non_terminal_idx:
-        graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
-        try:
-            import torch
-            from torch_geometric.data import Batch
-            batch = Batch.from_data_list(graphs).to("cpu")
-            with torch.inference_mode():
-                _logits_list, values = model.forward_batch(batch)
-            for idx, v in zip(non_terminal_idx, values):
-                non_term_values[idx] = float(v.item() if hasattr(v, "item") else v)
-        except Exception:
-            # Per-graph fallback: one bad graph must not sink the whole
-            # trajectory, so evaluate each independently and skip failures.
-            for idx, d in zip(non_terminal_idx, graphs):
-                try:
-                    with torch.no_grad():
-                        _logits, val = model(
-                            d.x, d.edge_index, d.legal_mask,
-                            stone_mask=d.stone_mask,
-                            edge_attr=getattr(d, "edge_attr", None),
-                        )
-                    non_term_values[idx] = float(val.item())
-                except Exception:
-                    non_term_values[idx] = 0.0
+        native = getattr(model, "_hexo_native", None)
+        if native is not None:
+            # Torch-free: one native forward per non-terminal prefix (value only).
+            for i in non_terminal_idx:
+                _lm, v = native.forward(prefix_states[i])
+                non_term_values[i] = float(v)
+        else:
+            # graph_fn (and its torch import) only on the torch fallback path.
+            graph_fn = make_graph_fn(model_config)
+            graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
+            try:
+                import torch
+                from torch_geometric.data import Batch
+                batch = Batch.from_data_list(graphs).to("cpu")
+                with torch.inference_mode():
+                    _logits_list, values = model.forward_batch(batch)
+                for idx, v in zip(non_terminal_idx, values):
+                    non_term_values[idx] = float(v.item() if hasattr(v, "item") else v)
+            except Exception:
+                # Per-graph fallback: one bad graph must not sink the whole
+                # trajectory, so evaluate each independently and skip failures.
+                for idx, d in zip(non_terminal_idx, graphs):
+                    try:
+                        with torch.no_grad():
+                            _logits, val = model(
+                                d.x, d.edge_index, d.legal_mask,
+                                stone_mask=d.stone_mask,
+                                edge_attr=getattr(d, "edge_attr", None),
+                            )
+                        non_term_values[idx] = float(val.item())
+                    except Exception:
+                        non_term_values[idx] = 0.0
 
     trajectory = []
     for i, st in enumerate(prefix_states):
@@ -794,7 +802,6 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     cancelled, completed_prefixes, error_at.
     """
     import hexo_rs as hr
-    graph_fn = make_graph_fn(model_config)
     cfg = hr.GameConfig(win_length, placement_radius, max_moves)
     prefix_states, error_at = _build_prefix_states(moves, cfg)
     total = len(prefix_states)
@@ -814,37 +821,32 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     non_terminal_idx = [i for i, s in enumerate(prefix_states) if not s.is_terminal()]
     raw_by_idx = {}  # idx -> {value, legal, probs}
     if non_terminal_idx:
-        graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
-        try:
-            import torch
-            from torch_geometric.data import Batch
-            batch = Batch.from_data_list(graphs).to("cpu")
-            with torch.inference_mode():
-                logits_list, values = model.forward_batch(batch)
-            for idx, d, lg, v in zip(non_terminal_idx, graphs, logits_list, values):
-                legal = d.coords[d.legal_mask].tolist()
-                probs_t = torch.softmax(lg, dim=-1)
-                if probs_t.dim() > 1:
-                    probs_t = probs_t.squeeze(-1)
-                if probs_t.shape[0] == d.x.shape[0]:
-                    probs = probs_t[d.legal_mask].tolist()
-                else:
-                    probs = probs_t.tolist()
-                raw_by_idx[idx] = {
-                    "value": float(v.item() if hasattr(v, "item") else v),
-                    "legal": [list(c) for c in legal],
+        native = getattr(model, "_hexo_native", None)
+        if native is not None:
+            # Torch-free: one native forward per non-terminal prefix. Native
+            # logits are already legal-only and in state.legal_moves() order.
+            for i in non_terminal_idx:
+                st = prefix_states[i]
+                logit_map, v = native.forward(st)
+                legal = [list(c) for c in st.legal_moves()]
+                logits = [logit_map[(int(q), int(r))] for q, r in legal]
+                probs = softmax(logits)
+                raw_by_idx[i] = {
+                    "value": float(v),
+                    "legal": legal,
                     "probs": [_finite(p) for p in probs],
                 }
-        except Exception:
-            # Per-graph fallback (one bad graph must not sink the batch).
-            for idx, d in zip(non_terminal_idx, graphs):
-                try:
-                    with torch.no_grad():
-                        lg, val = model(
-                            d.x, d.edge_index, d.legal_mask,
-                            stone_mask=d.stone_mask,
-                            edge_attr=getattr(d, "edge_attr", None),
-                        )
+        else:
+            # graph_fn (and its torch import) only on the torch fallback path.
+            graph_fn = make_graph_fn(model_config)
+            graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
+            try:
+                import torch
+                from torch_geometric.data import Batch
+                batch = Batch.from_data_list(graphs).to("cpu")
+                with torch.inference_mode():
+                    logits_list, values = model.forward_batch(batch)
+                for idx, d, lg, v in zip(non_terminal_idx, graphs, logits_list, values):
                     legal = d.coords[d.legal_mask].tolist()
                     probs_t = torch.softmax(lg, dim=-1)
                     if probs_t.dim() > 1:
@@ -854,12 +856,35 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
                     else:
                         probs = probs_t.tolist()
                     raw_by_idx[idx] = {
-                        "value": float(val.item()),
+                        "value": float(v.item() if hasattr(v, "item") else v),
                         "legal": [list(c) for c in legal],
                         "probs": [_finite(p) for p in probs],
                     }
-                except Exception:
-                    raw_by_idx[idx] = {"value": 0.0, "legal": [], "probs": []}
+            except Exception:
+                # Per-graph fallback (one bad graph must not sink the batch).
+                for idx, d in zip(non_terminal_idx, graphs):
+                    try:
+                        with torch.no_grad():
+                            lg, val = model(
+                                d.x, d.edge_index, d.legal_mask,
+                                stone_mask=d.stone_mask,
+                                edge_attr=getattr(d, "edge_attr", None),
+                            )
+                        legal = d.coords[d.legal_mask].tolist()
+                        probs_t = torch.softmax(lg, dim=-1)
+                        if probs_t.dim() > 1:
+                            probs_t = probs_t.squeeze(-1)
+                        if probs_t.shape[0] == d.x.shape[0]:
+                            probs = probs_t[d.legal_mask].tolist()
+                        else:
+                            probs = probs_t.tolist()
+                        raw_by_idx[idx] = {
+                            "value": float(val.item()),
+                            "legal": [list(c) for c in legal],
+                            "probs": [_finite(p) for p in probs],
+                        }
+                    except Exception:
+                        raw_by_idx[idx] = {"value": 0.0, "legal": [], "probs": []}
 
     # Build the base trajectory (value + raw policy + stones for every prefix).
     trajectory = []
