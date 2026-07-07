@@ -8,9 +8,6 @@ quality heatmap.
 from dataclasses import dataclass, field
 import math
 
-import torch
-from torch_geometric.data import Batch
-
 from hexo_a0.serving.model import make_graph_fn
 
 
@@ -141,6 +138,8 @@ def _eval_fn_for_model(model, graph_fn):
     """Build an MCTS eval_fn that batches graphs and falls back to per-state."""
     def eval_fn(states):
         data_list = [graph_fn(s) for s in states]
+        import torch
+        from torch_geometric.data import Batch
         batch = Batch.from_data_list(data_list).to("cpu")
         with torch.inference_mode():
             try:
@@ -203,6 +202,7 @@ def _run_mcts(model, model_config, state, mcts_sims: int, mcts_m_actions: int):
     )
     legal_moves = state.legal_moves()
     data = graph_fn(state)
+    import torch
     with torch.no_grad():
         _, value = model(
             data.x, data.edge_index, data.legal_mask,
@@ -354,6 +354,7 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
 
     data = make_graph_fn(model_config)(state)
 
+    import torch
     with torch.no_grad():
         raw_logits, raw_value = model(
             data.x, data.edge_index, data.legal_mask,
@@ -669,6 +670,8 @@ def analyze_trajectory(model, model_config, moves: list[tuple[int, int]],
     if non_terminal_idx:
         graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
         try:
+            import torch
+            from torch_geometric.data import Batch
             batch = Batch.from_data_list(graphs).to("cpu")
             with torch.inference_mode():
                 _logits_list, values = model.forward_batch(batch)
@@ -773,6 +776,8 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
     if non_terminal_idx:
         graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
         try:
+            import torch
+            from torch_geometric.data import Batch
             batch = Batch.from_data_list(graphs).to("cpu")
             with torch.inference_mode():
                 logits_list, values = model.forward_batch(batch)

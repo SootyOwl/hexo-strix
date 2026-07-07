@@ -6,14 +6,12 @@ import os
 import sys
 from pathlib import Path
 
-import torch
-
 
 def main(argv=None):
     # Configure the CUDA/HIP caching allocator BEFORE anything touches the
     # device context (PYTORCH_CUDA_ALLOC_CONF is read once, at first device
-    # init — setting it later is a silent no-op). Importing torch above does
-    # NOT initialise the context; the first .to(cuda) does.
+    # init — setting it later is a silent no-op). torch is imported lazily
+    # inside the train/watch/eval subcommands, so the serve path never loads it.
     from hexo_a0.gpu_memory import configure_cuda_alloc
     configure_cuda_alloc()
 
@@ -319,6 +317,8 @@ def main(argv=None):
 
 
 def _run_train(args):
+    import torch
+
     import dataclasses
 
     import hexo_rs
@@ -451,6 +451,8 @@ def _run_train(args):
 # ---------------------------------------------------------------------------
 
 def _run_watch(args):
+    import torch
+
     import dataclasses
 
     from hexo_a0.config_io import load_config
@@ -514,6 +516,8 @@ def _run_watch(args):
 
 
 def _run_eval_sealbot(args):
+    import torch
+
     from hexo_a0.config_io import load_config
     from hexo_a0.model import HeXONet
     from hexo_a0.sealbot_eval import evaluate_vs_sealbot

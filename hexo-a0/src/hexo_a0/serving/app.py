@@ -21,8 +21,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import torch
-
 from hexo_a0.serving.analysis import (
     analyze_game_full, analyze_position, analyze_trajectory, build_state,
     end_of_turn_indices, TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET)
@@ -30,7 +28,7 @@ from hexo_a0.serving.dbmigrate import apply_migrations
 from hexo_a0.serving import hds
 from hexo_a0.serving.game import DEFAULT_DIFFICULTY, DEFAULT_DIFFICULTY_SIMS, DIFFICULTY_ORDER, GameError, GameManager, ServerBusyError, UnknownGameError, make_bot_turn_fn
 from hexo_a0.serving.inference import InferenceGuard, InferenceBusy
-from hexo_a0.serving.model import load_model
+from hexo_a0.serving.model import load_model, load_native_model
 from hexo_a0.serving.recorder import Recorder
 
 # Static frontend assets (CSS/JS/fonts) live beside this module and are served
@@ -154,7 +152,11 @@ def _derive_step(ckpt_path: str, ckpt: dict) -> int | None:
     if m:
         return int(m.group(1))
     v = ckpt.get("train_steps")
-    return int(v) if isinstance(v, int) else None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.isdigit():
+        return int(v)
+    return None
 
 
 def _derive_model_label(ckpt_path: str, ckpt: dict) -> str:
@@ -1242,14 +1244,19 @@ def run(cfg, analyze_ctx: AnalyzeContext | None = None):
 
 def _serve(cfg, analyze_ctx):
     """Server body, run under run()'s flock try/finally."""
-    model, mc, ckpt = load_model(cfg.checkpoint, "cpu",
-                                 model_config_dict=_model_config_fallback(cfg))
+    if str(cfg.checkpoint).endswith(".safetensors"):
+        model, mc, ckpt = load_native_model(cfg.checkpoint)
+    else:
+        model, mc, ckpt = load_model(cfg.checkpoint, "cpu",
+                                     model_config_dict=_model_config_fallback(cfg))
 
     # CPU inference: N slots let analysis run beside the bot instead of 503ing.
-    # Cap torch's intra-op threads so N concurrent forward passes don't
-    # oversubscribe the cores (torch defaults to using all of them per op).
     inference_workers = max(1, getattr(cfg, "inference_workers", 2))
-    torch.set_num_threads(max(1, (os.cpu_count() or 8) // inference_workers))
+    if getattr(model, "_hexo_native", None) is None:
+        # Cap torch's intra-op threads so N concurrent forward passes don't
+        # oversubscribe the cores (torch defaults to using all of them per op).
+        import torch
+        torch.set_num_threads(max(1, (os.cpu_count() or 8) // inference_workers))
     guard = InferenceGuard(capacity=inference_workers)
     recorder = Recorder(cfg.db)
     difficulty_sims = _parse_difficulty_sims(cfg.difficulty_sims)
