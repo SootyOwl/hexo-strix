@@ -9,14 +9,22 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "hexo-rs",
-    "torch>=2.11",
-    "torch-geometric>=2.7",
-    "tensorboard",
     "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
 viewer = ["pygame"]
+# Training/eval deps (torch stack). Serving does NOT need these — it runs the
+# pure-Rust hexo_rs.InferModel over a safetensors checkpoint — so keeping them
+# out of the core deps lets the serving Docker image build torch-free (~742 MB
+# smaller). `just sync`'s --all-extras still pulls them in for dev/training;
+# the torch backend variant (cpu/rocm/cuda) is selected by the root
+# dependency-group + [tool.uv.sources] index mapping, unaffected by this move.
+train = [
+    "torch>=2.11",
+    "torch-geometric>=2.7",
+    "tensorboard",
+]
 
 [project.scripts]
 hexo-a0 = "hexo_a0.cli:main"

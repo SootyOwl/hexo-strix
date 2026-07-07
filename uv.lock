@@ -813,6 +813,10 @@ source = { editable = "hexo-a0" }
 dependencies = [
     { name = "hexo-rs" },
     { name = "safetensors" },
+]
+
+[package.optional-dependencies]
+train = [
     { name = "tensorboard" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'group-4-hexo-cpu') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-cuda') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm') or (extra == 'group-4-hexo-cuda' and extra == 'group-4-hexo-rocm')" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'group-4-hexo-cpu') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-cuda') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm') or (extra == 'group-4-hexo-cuda' and extra == 'group-4-hexo-rocm')" },
@@ -820,8 +824,6 @@ dependencies = [
     { name = "torch", version = "2.12.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'group-4-hexo-cuda' or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm') or (extra != 'group-4-hexo-cpu' and extra != 'group-4-hexo-rocm')" },
     { name = "torch-geometric" },
 ]
-
-[package.optional-dependencies]
 viewer = [
     { name = "pygame" },
 ]
@@ -836,11 +838,11 @@ requires-dist = [
     { name = "hexo-rs", editable = "hexo-rs" },
     { name = "pygame", marker = "extra == 'viewer'" },
     { name = "safetensors", specifier = ">=0.4" },
-    { name = "tensorboard" },
-    { name = "torch", specifier = ">=2.11" },
-    { name = "torch-geometric", specifier = ">=2.7" },
+    { name = "tensorboard", marker = "extra == 'train'" },
+    { name = "torch", marker = "extra == 'train'", specifier = ">=2.11" },
+    { name = "torch-geometric", marker = "extra == 'train'", specifier = ">=2.7" },
 ]
-provides-extras = ["viewer"]
+provides-extras = ["viewer", "train"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]
