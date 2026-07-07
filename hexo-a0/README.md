@@ -84,6 +84,7 @@ For a single fixed-stage run instead of a curriculum, use `hexo-a0 default-confi
 | `head-to-head` | Run an SPRT-bounded match between two checkpoints (configs may differ). |
 | `train` | Train a single fixed configuration (no curriculum). |
 | `watch` | Older pygame viewer for a checkpoint playing a game; largely superseded by `serve`. |
+| `export` | Export a checkpoint's weights to safetensors, for `hexo-infer` / the native serving fast-path / the wasm bot. |
 | `default-config` | Print a standalone training config template. |
 | `default-curriculum` | Print an annotated curriculum config template. |
 
@@ -158,6 +159,8 @@ Promotion between champions can be gated with SPRT (`convergence_mode = "champio
 ```bash
 hexo-a0 serve --config config.toml --checkpoint <ckpt.pt> --port 8765
 ```
+
+On load, `serve` best-effort-attaches a native `hexo-infer` fast-path (`InferModel`, re-serializing the checkpoint to safetensors in memory) for MCTS/policy inference when the checkpoint architecture is supported (GINE/axis/pre-norm); on any mismatch or an older `hexo_rs` build it silently falls back to the torch eval path. Set `HEXO_NATIVE_INFER=0` to disable it and force torch (useful for A/B comparison — on the author's x86 dev box torch measured *faster* for serving-scale MCTS, so this isn't a strict win everywhere). Note this fast-path is inference-only: the server still links torch for the model/eval code, so the serving image is not torch-free.
 
 ## Known limitations
 

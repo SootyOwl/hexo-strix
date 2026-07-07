@@ -10,7 +10,7 @@ This monorepo contains the game engine, an AlphaZero-style training pipeline tha
 
 | Path | What it is |
 |------|-----------|
-| [`hexo-rs/`](hexo-rs/README.md) | Rust workspace — the game engine (`hexo-engine`) and the Gumbel MCTS + graph builders + PyO3 bindings (`hexo-mcts`, exported as the `hexo_rs` Python module). |
+| [`hexo-rs/`](hexo-rs/README.md) | Rust workspace, five crates: the game engine (`hexo-engine`); Gumbel MCTS + graph builders (`hexo-mcts`); a pure-Rust GNN forward pass with no libtorch/Python (`hexo-infer`, powers the browser bot, a native serving fast-path, and a native inference server binary); a browser/WebWorker bot (`hexo-wasm`); and the crate maturin actually builds into the `hexo_rs` Python module (`hexo-py`, which re-registers `hexo-mcts`'s bindings and adds `hexo-infer`-backed native inference). |
 | [`hexo-a0/`](hexo-a0/README.md) | Python package `hexo-a0` — self-play, GNN training, curriculum, evaluation, and the play server. Depends on `hexo_rs`. |
 | `configs/` | TOML training/curriculum configs (axis-graph families, size tiers, ablations). |
 | `scripts/` | Two helper scripts: human-corpus evaluation and a self-play benchmark. |
