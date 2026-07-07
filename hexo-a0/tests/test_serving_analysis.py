@@ -11,6 +11,7 @@ import torch
 from hexo_a0.serving.model import load_model
 from hexo_a0.serving.analysis import (
     analyze_position, analyze_trajectory, analyze_game_full, build_state,
+    classify_turn_quality, QUALITY_BLUNDER,
     AnalysisResult, ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET,
     TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET,
 )
@@ -227,7 +228,182 @@ def test_classify_move_quality_thresholds():
     assert classify(entry(-0.2, "P2"), entry(-0.2, "P1"), "P2") == "good"
 
 
-# --- analyze_game_full (batched value+policy + looped MCTS) ----------------
+# --- classify_turn_quality: forced-win blunders + swing ---------------------
+#
+# classify_turn_quality labels a turn by the q-hat loss between the player's
+# end-of-turn board and the engine's. q-hat routinely misses a forced loss the
+# VCF solver catches, so a turn that hands the opponent a PROVEN forced win
+# must override the loss-based label and read as "blunder" with a full -1.0
+# eval (the user-facing swing then reflects the disaster, not the value head's
+# optimistic q-hat). These build synthetic trajectories so the forcing/terminal
+# fields can be set exactly.
+
+def _qt_entry(cp, ip, qh, cs, lg, *, forcing=None, terminal=False, winner=None):
+    e = {"current_player": cp, "improved_policy": ip, "q_hat": qh,
+         "candidate_set": cs, "legal": lg}
+    if forcing is not None:
+        e["forcing"] = forcing
+    if terminal:
+        e["terminal"] = True
+        e["winner"] = winner
+        e["legal"] = []
+        e["q_hat"] = None
+    return e
+
+
+def _qt_offline(qh_engine_end):
+    """eval_after_fn stub: the position after the engine's first pick, with the
+    engine's second pick carrying q-hat ``qh_engine_end`` (mover-perspective)."""
+    return {"improved_policy": [0.1, 0.1, 0.9], "q_hat": [0.1, 0.1, qh_engine_end],
+            "candidate_set": [1, 1, 1], "legal": [[5, 5], [7, 7], [8, 8]]}
+
+
+# A turn where P1 misses a threat block: small q-hat loss (0.10, a "good" by
+# q-hat alone) but the end-of-turn position is a PROVEN forced win for P2.
+_QT_OPP_FORCED = {"winner": "P2", "attacker_is_mover": True,
+                  "first_move": [5, 5], "pv": [[5, 5]], "pv_len": 1,
+                  "pv_owners": ["P2"]}
+
+
+def test_classify_opponent_forced_win_is_always_blunder():
+    # P1's turn (prev=0, end=2). Engine ends at +0.25, player at +0.15 -> loss
+    # 0.10, a "good" by q-hat. But trajectory[2] proves P2 has a forced win.
+    traj = [
+        _qt_entry("P1", [0.1, 0.8, 0.1], [0.1, 0.2, 0.1], [1, 1, 1],
+                  [[5, 5], [6, 6], [7, 7]]),
+        _qt_entry("P1", [0.5, 0.3, 0.2], [0.1, 0.15, 0.1], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]]),
+        _qt_entry("P2", [0.1, 0.1, 0.9], [0.1, 0.1, 0.25], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]], forcing=_QT_OPP_FORCED),
+    ]
+    q = classify_turn_quality(traj, [0, 2], [[0, 0], [5, 5], [7, 7]],
+                              turn_end_idx=2, prev_boundary_idx=0,
+                              eval_after_fn=lambda a, e0: _qt_offline(0.25))
+    assert q is not None
+    assert q["label"] == "blunder", q
+    assert q["forced_loss"] is True
+    # The effective eval is -1.0 so the swing shows the full disaster, not the
+    # value head's optimistic +0.15.
+    assert q["player_end_q"] == -1.0
+    assert q["engine_end_q"] == pytest.approx(0.25)
+    # loss >= 1.0 (engine could even be slightly losing and it's still forced).
+    assert q["loss"] >= 1.0
+    # The displayed swing crosses the side boundary: -1.0 - 0.25 = -1.25.
+    assert q["player_end_q"] - q["engine_end_q"] == pytest.approx(-1.25)
+
+
+def test_classify_opponent_forced_win_overrides_match():
+    # Same resulting board as the engine's line (matched) but that board is a
+    # proven loss for the mover — still a blunder, never "best". One-placement
+    # turn (played == engine's pick (5,5)); the end-of-turn entry at index 1 is
+    # the opponent's to-move position with the proven forced win.
+    traj = [
+        _qt_entry("P1", [0.9, 0.1], [0.2, 0.1], [1, 1], [[5, 5], [7, 7]]),
+        _qt_entry("P2", [0.1, 0.9], [0.1, 0.1], [1, 1], [[5, 5], [7, 7]],
+                  forcing=_QT_OPP_FORCED),
+    ]
+    q = classify_turn_quality(traj, [0, 1], [[0, 0], [5, 5]],
+                              turn_end_idx=1, prev_boundary_idx=0)
+    assert q is not None
+    assert q["matched"] is True           # same resulting board as the engine
+    assert q["label"] == "blunder"        # but it's a proven loss -> blunder
+    assert q["forced_loss"] is True
+    assert q["player_end_q"] == -1.0
+
+
+def test_classify_terminal_loss_is_blunder():
+    # Mover self-inflicts an instant loss (double-four) on their own turn: the
+    # end-of-turn position is terminal with the opponent winning.
+    traj = [
+        _qt_entry("P1", [0.9, 0.1], [0.2, 0.1], [1, 1], [[5, 5], [7, 7]]),
+        _qt_entry("P2", [0.1, 0.9], [0.1, 0.1], [1, 1], [[5, 5], [7, 7]],
+                  terminal=True, winner="P2"),
+    ]
+    q = classify_turn_quality(traj, [0, 1], [[0, 0], [5, 5]],
+                              turn_end_idx=1, prev_boundary_idx=0)
+    assert q is not None and q["label"] == "blunder"
+    assert q["forced_loss"] is True
+    assert q["player_end_q"] == -1.0
+
+
+def test_classify_movers_own_forced_win_is_not_forced_blunder():
+    # The MOVER had a forced win at turn-start (attacker_is_mover, winner==P1)
+    # and the turn does NOT end in an opponent forced win. Squandering your own
+    # win is the missed-win walk's job, not a forced blunder here.
+    own_win = {"winner": "P1", "attacker_is_mover": True,
+               "first_move": [6, 6], "pv": [[6, 6]], "pv_len": 1}
+    traj = [
+        _qt_entry("P1", [0.1, 0.8, 0.1], [0.1, 0.2, 0.1], [1, 1, 1],
+                  [[5, 5], [6, 6], [7, 7]], forcing=own_win),
+        _qt_entry("P1", [0.5, 0.3, 0.2], [0.1, 0.15, 0.1], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]]),
+        _qt_entry("P2", [0.1, 0.1, 0.9], [0.1, 0.1, 0.25], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]]),  # no forcing: opponent has no win
+    ]
+    q = classify_turn_quality(traj, [0, 2], [[0, 0], [5, 5], [7, 7]],
+                              turn_end_idx=2, prev_boundary_idx=0,
+                              eval_after_fn=lambda a, e0: _qt_offline(0.25))
+    assert q is not None
+    assert q.get("forced_loss") is not True
+    assert q["label"] != "blunder"  # loss 0.10 -> "good"; missed_win flags it elsewhere
+
+
+def test_classify_swing_is_correct_across_side_switch():
+    # No forcing field — pure q-hat swing. Engine favored the mover (+0.4),
+    # player blundered to -0.5 (opponent favored): the eval crosses zero.
+    # swing = player_end_q - engine_end_q must be -0.9 (mover-perspective),
+    # correct in sign AND magnitude across the side switch.
+    traj = [
+        _qt_entry("P1", [0.1, 0.8, 0.1], [0.1, 0.4, 0.1], [1, 1, 1],
+                  [[5, 5], [6, 6], [7, 7]]),
+        _qt_entry("P1", [0.5, 0.3, 0.2], [0.1, -0.5, 0.1], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]]),
+        _qt_entry("P2", [0.1, 0.1, 0.9], [0.1, 0.1, 0.25], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]]),
+    ]
+    q = classify_turn_quality(traj, [0, 2], [[0, 0], [5, 5], [7, 7]],
+                              turn_end_idx=2, prev_boundary_idx=0,
+                              eval_after_fn=lambda a, e0: _qt_offline(0.4))
+    assert q is not None
+    assert q["player_end_q"] == pytest.approx(-0.5)
+    assert q["engine_end_q"] == pytest.approx(0.4)
+    assert q["player_end_q"] - q["engine_end_q"] == pytest.approx(-0.9)
+    assert q["label"] == "blunder"  # loss 0.9 >= QUALITY_BLUNDER
+    assert q["loss"] >= QUALITY_BLUNDER
+
+
+def test_analyze_game_full_forced_loss_quality_end_to_end():
+    # End-to-end through analyze_game_full: P2's first turn ends at prefix index 2
+    # (P1 to move). Inject a proven forced win for P1 at that position so the
+    # quality loop sees the forcing field analyze_game_full put on the entry and
+    # labels P2's turn a forced-loss blunder (verifying the field flows from the
+    # per-prefix solve, through to_json, into classify_turn_quality, out to the
+    # quality dict the frontend reads).
+    model, mc, _ = load_model(CKPT, "cpu")
+    injected = {"winner": "P1", "attacker_is_mover": True,
+                "first_move": [3, 0], "pv": [[3, 0]], "pv_len": 1,
+                "pv_owners": ["P1"]}
+    counter = {"i": 0}
+
+    def run_mcts_fn(st):
+        r = analyze_position(model, mc, st, mcts_sims=16, mcts_m_actions=16)
+        if counter["i"] == 2:        # P2's turn-end position (P1 to move)
+            r.forcing = injected
+        counter["i"] += 1
+        return r
+
+    out = analyze_game_full(model, mc, _GAME, 6, 8, 400, mcts_sims=16,
+                            run_mcts_fn=run_mcts_fn)
+    # P2's first turn is the first non-zero boundary; its mover is P2.
+    b_p2 = next(b for b in out["boundary_indices"] if b != 0)
+    assert out["trajectory"][0]["current_player"] == "P2"
+    q = out["trajectory"][b_p2].get("quality")
+    assert q is not None
+    assert q["label"] == "blunder"
+    assert q["forced_loss"] is True
+    assert q["player_end_q"] == -1.0
+
+
 
 _GAME = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
 

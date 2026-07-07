@@ -539,6 +539,21 @@ def _q_of_move(entry, coord):
     return None
 
 
+def _opponent_forced_loss(end_entry, mover):
+    """True iff ``end_entry`` (the end-of-turn position, with the opponent to
+    move) is a PROVEN loss for ``mover``: the opponent has a forced win
+    (``forcing.attacker_is_mover`` true with ``winner`` == opponent), or the
+    position is terminal with the opponent winning (e.g. a self-inflicted
+    double-four). The VCF solver is ground truth here; the value head often
+    misses a forced loss, so this drives the blunder override in
+    ``classify_turn_quality``."""
+    opp = "P2" if mover == "P1" else "P1"
+    if end_entry.get("terminal"):
+        return end_entry.get("winner") == opp
+    f = end_entry.get("forcing")
+    return bool(f and f.get("attacker_is_mover") and f.get("winner") == opp)
+
+
 def classify_turn_quality(trajectory, boundary_indices, moves, *,
                           turn_end_idx, prev_boundary_idx, eval_after_fn=None):
     """Classify a turn's quality by comparing END-OF-TURN BOARDS, order-free.
@@ -573,7 +588,8 @@ def classify_turn_quality(trajectory, boundary_indices, moves, *,
     Returns a quality dict (see below) or None if it can't be classified. The
     dict carries enough for the frontend to render order-independently:
     ``{"label", "icon", "color", "matched", "engine_pair", "played_pair",
-       "loss", "player_end_q", "engine_end_q", "turn_start_depth"}``.
+       "loss", "player_end_q", "engine_end_q", "forced_loss",
+       "turn_start_depth"}``.
     """
     if turn_end_idx <= 0 or turn_end_idx not in boundary_indices:
         return None
@@ -643,6 +659,25 @@ def classify_turn_quality(trajectory, boundary_indices, moves, *,
         label = "mistake"
     else:
         label = "good"
+
+    # Forced-loss override: if the end-of-turn position is a PROVEN loss for the
+    # mover — the opponent has a forced win (VCF) at trajectory[b], or the
+    # position is terminal with the opponent winning (a self-inflicted
+    # double-four, say) — the turn is a blunder regardless of the q-hat loss.
+    # The value head routinely hasn't noticed a forced loss, so by q-hat alone
+    # such a turn can read "good" (or even "best" if it matched the engine's
+    # own losing line). A proven loss is the worst outcome, so treat the
+    # mover's end-of-turn eval as -1.0: the label is always "blunder" and the
+    # user-facing swing reflects the full disaster (-1.0 - engine_end_q) rather
+    # than the value head's optimistic q_hat. (Missing the mover's OWN forced
+    # win is different — that's the missed-win walk's job, not a forced loss.)
+    forced_loss = _opponent_forced_loss(trajectory[b], mover)
+    if forced_loss:
+        player_end_q = -1.0
+        loss = (max(0.0, engine_end_q - player_end_q)
+                if engine_end_q is not None else 1.0)
+        label = "blunder"
+
     return {
         "label": label, "icon": QUALITY_LABELS[label], "color": QUALITY_COLORS[label],
         "matched": matched,
@@ -650,6 +685,7 @@ def classify_turn_quality(trajectory, boundary_indices, moves, *,
         "played_pair": [list(c) for c in played],
         "loss": _finite(loss),
         "player_end_q": player_end_q, "engine_end_q": engine_end_q,
+        "forced_loss": forced_loss,
         "turn_start_depth": a,
     }
 

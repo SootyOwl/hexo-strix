@@ -304,6 +304,21 @@ function analysisUndo() {
   if (analysisCurrent && analysisCurrent.parent) setCurrent(analysisCurrent.parent);
 }
 
+// Effective P1-perspective eval for a trajectory entry's `result`: a PROVEN
+// forced win (forcing.attacker_is_mover — the side to move wins for certain) or
+// a terminal result pins the eval to ±1.0, overriding the value head, which
+// routinely under-rates a forced win it hasn't been trained to recognise. A
+// mere threat (attacker_is_mover false) is NOT certain — the mover may defend
+// — so it falls through to the value head. Used by the eval bar, the gauge,
+// and the "eval (P1)" readout so they reflect a proven win, not just q̂.
+function effectiveP1Eval(entry) {
+  if (!entry) return 0;
+  if (entry.terminal && entry.winner) return entry.winner === "P1" ? 1.0 : -1.0;
+  const f = entry.forcing;
+  if (f && f.attacker_is_mover && f.winner) return f.winner === "P1" ? 1.0 : -1.0;
+  return p1Perspective(entry.value, entry.current_player);
+}
+
 function renderEvalBar() {
   const canvas = document.getElementById("analysis-eval-bar");
   const ctx = canvas.getContext("2d");
@@ -329,14 +344,14 @@ function renderEvalBar() {
   ctx.beginPath(); ctx.rect(0, 0, W, midY); ctx.clip();
   ctx.fillStyle = "#f08a3c44";
   ctx.beginPath(); ctx.moveTo(xAt(0), midY);
-  for (let i = 0; i < n; i++) { const v = p1Perspective(tr[i].value, tr[i].current_player); ctx.lineTo(xAt(i), yAt(v)); }
+  for (let i = 0; i < n; i++) { const v = effectiveP1Eval(tr[i]); ctx.lineTo(xAt(i), yAt(v)); }
   ctx.lineTo(xAt(n - 1), midY); ctx.closePath(); ctx.fill();
   ctx.restore();
   ctx.save();
   ctx.beginPath(); ctx.rect(0, midY, W, midY); ctx.clip();
   ctx.fillStyle = "#3fb6d944";
   ctx.beginPath(); ctx.moveTo(xAt(0), midY);
-  for (let i = 0; i < n; i++) { const v = p1Perspective(tr[i].value, tr[i].current_player); ctx.lineTo(xAt(i), yAt(v)); }
+  for (let i = 0; i < n; i++) { const v = effectiveP1Eval(tr[i]); ctx.lineTo(xAt(i), yAt(v)); }
   ctx.lineTo(xAt(n - 1), midY); ctx.closePath(); ctx.fill();
   ctx.restore();
   // The eval line itself (P1 perspective — no per-ply oscillation).
@@ -345,7 +360,7 @@ function renderEvalBar() {
   ctx.beginPath();
   for (let i = 0; i < n; i++) {
     const x = xAt(i);
-    const v = p1Perspective(tr[i].value, tr[i].current_player);
+    const v = effectiveP1Eval(tr[i]);
     const y = yAt(v);
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
@@ -354,7 +369,7 @@ function renderEvalBar() {
   for (let i = 0; i < n; i++) {
     if (!boundaries.has(i)) continue;
     const x = xAt(i);
-    const v = p1Perspective(tr[i].value, tr[i].current_player);
+    const v = effectiveP1Eval(tr[i]);
     const y = yAt(v);
     ctx.beginPath();
     ctx.arc(x, y, 3, 0, 2 * Math.PI);
@@ -365,7 +380,7 @@ function renderEvalBar() {
   const slider = document.getElementById("analysis-slider");
   const si = parseInt(slider.value);
   if (si >= 0 && si < n) {
-    const v = p1Perspective(tr[si].value, tr[si].current_player);
+    const v = effectiveP1Eval(tr[si]);
     ctx.strokeStyle = "#c9a35e";
     ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(xAt(si), pad); ctx.lineTo(xAt(si), H - pad); ctx.stroke();
@@ -503,15 +518,40 @@ async function computeTurnQuality(node) {
   // Player's achieved end-of-turn value: q of the last placement at the node
   // just before it (the same board the engine's line is scored against).
   const beforeLast = seq.length >= 2 ? seq[seq.length - 2] : start;
-  const playerEndQ = beforeLast && beforeLast.result
+  let playerEndQ = beforeLast && beforeLast.result
     ? _qOfMove(beforeLast.result, played[played.length - 1]) : null;
   let loss = 0;
   if (!matched && engineEndQ != null && playerEndQ != null) loss = Math.max(0, engineEndQ - playerEndQ);
-  const label = labelFromLoss(matched, loss);
+  let label = labelFromLoss(matched, loss);
+
+  // Forced-loss override (mirrors the server's _opponent_forced_loss): if the
+  // end-of-turn position is a PROVEN loss for the mover — the opponent has a
+  // forced win at this position (forcing.attacker_is_mover with winner == opp)
+  // or it's terminal with the opponent winning — the turn is a blunder
+  // regardless of the q-hat loss, and the effective eval is -1.0 so the swing
+  // shows the full disaster. The value head often misses a forced loss the VCF
+  // solver catches. `node` is the turn-end position (opponent to move).
+  const mover = start.result && start.result.current_player;
+  const opp = mover === "P1" ? "P2" : (mover === "P2" ? "P1" : null);
+  let forcedLoss = false;
+  if (opp && node.result) {
+    const r = node.result;
+    if (r.terminal) {
+      forcedLoss = r.winner === opp;
+    } else if (r.forcing && r.forcing.attacker_is_mover && r.forcing.winner === opp) {
+      forcedLoss = true;
+    }
+  }
+  if (forcedLoss) {
+    playerEndQ = -1.0;
+    loss = engineEndQ != null ? Math.max(0, engineEndQ - playerEndQ) : 1.0;
+    label = "blunder";
+  }
   return {
     label, icon: _QUAL_ICON[label], color: _QUAL_COLOR[label],
     matched, engine_pair: engineLine, played_pair: played,
-    loss, player_end_q: playerEndQ, engine_end_q: engineEndQ, turn_start_depth: a,
+    loss, player_end_q: playerEndQ, engine_end_q: engineEndQ,
+    forced_loss: forcedLoss, turn_start_depth: a,
   };
 }
 
@@ -534,7 +574,7 @@ function renderNode(node) {
   const result = node.result;
   const info = document.getElementById("analysis-info");
   const cp = result.current_player || "?";
-  const v1 = p1Perspective(result.value, cp);
+  const v1 = effectiveP1Eval(result);
   const evalStr = v1 >= 0 ? `+${v1.toFixed(2)}` : v1.toFixed(2);
   const q = qualityOf(node);
 
@@ -563,7 +603,24 @@ function renderNode(node) {
     const enginePair = q.engine_pair || [];
 
     let board, pickTier = "", metric = "";
-    if (q.matched) {
+    const opp = turnPlayer === "P1" ? "P2" : "P1";
+    const forcedLoss = q.forced_loss === true;
+    if (forcedLoss) {
+      // The turn handed the opponent a PROVEN forced win — that overrides the
+      // q-hat loss (the value head often hasn't noticed a forced loss), so it's
+      // always a blunder and the swing reflects the full -1.0 effective eval.
+      if (q.matched) {
+        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and handed ${opp} a <b>forced win</b>. The engine's line reaches the same lost position.`;
+      } else if (enginePair.length) {
+        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and handed ${opp} a <b>forced win</b>. The engine preferred <b class="mvc">${fmt(enginePair)}</b>, which keeps the game alive.`;
+        if (startNode && startNode.result) {
+          pickTier = `<div class="vc-sec"><div class="h">engine's line here</div>`
+                   + `<p>${renderTopMovesHtml(startNode.result, startNode.depth)}</p></div>`;
+        }
+      } else {
+        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and handed ${opp} a <b>forced win</b>.`;
+      }
+    } else if (q.matched) {
       // Same resulting position as the engine's line. Flag a reversed order so the
       // "why isn't this a mistake?" question answers itself.
       const reordered = enginePair.length === playedMoves.length && fmt(enginePair) !== fmt(playedMoves);
@@ -579,14 +636,16 @@ function renderNode(node) {
         pickTier = `<div class="vc-sec"><div class="h">engine's line here</div>`
                  + `<p>${renderTopMovesHtml(startNode.result, startNode.depth)}</p></div>`;
       }
-      // Metric compares the two full TURNS at their end positions (comparable q̂).
-      if (q.player_end_q != null && q.engine_end_q != null)
-        metric = `<div class="vc-metric"><span>your turn <b>${sgn(q.player_end_q)}</b></span><span class="sep">·</span>`
-               + `<span>engine's <b>${sgn(q.engine_end_q)}</b></span><span class="sep">·</span>`
-               + `<span>swing <b>${sgn(q.player_end_q - q.engine_end_q)}</b></span></div>`;
     } else {
       board = `${who} played <b class="mvc">${fmt(playedMoves)}</b>.`;
     }
+    // Metric compares the two full TURNS at their end positions (comparable q̂).
+    // Shown whenever there's a real comparison — including a forced-loss turn
+    // that "matched" the engine's own losing line (the -1.0 swing is the point).
+    if (q.player_end_q != null && q.engine_end_q != null && (forcedLoss || !q.matched))
+      metric = `<div class="vc-metric"><span>your turn <b>${sgn(q.player_end_q)}</b></span><span class="sep">·</span>`
+             + `<span>engine's <b>${sgn(q.engine_end_q)}</b></span><span class="sep">·</span>`
+             + `<span>swing <b>${sgn(q.player_end_q - q.engine_end_q)}</b></span></div>`;
 
     html =
       `<div class="vc-head"><div class="vc-glyph">${q.icon}</div>`
