@@ -44,16 +44,24 @@ deploy checkpoint:
     #!/usr/bin/env bash
     set -euo pipefail
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    # Keep the checkpoint's own name (champion.pt -> champion.safetensors,
+    # checkpoint_245100.pt -> checkpoint_245100.safetensors) so the box keeps a
+    # meaningful, versioned filename.
+    stem="$(basename "{{checkpoint}}")"; stem="${stem%.*}"
+    out="$tmp/${stem}.safetensors"
     case "{{checkpoint}}" in
       *.safetensors)
         echo "-> {{checkpoint}} is already safetensors; shipping as-is..."
-        cp "{{checkpoint}}" "$tmp/champion.safetensors" ;;
+        cp "{{checkpoint}}" "$out" ;;
       *)
-        echo "-> exporting {{checkpoint}} -> champion.safetensors (torch-free serving format)..."
-        uv run --no-sync hexo-a0 export --checkpoint "{{checkpoint}}" --out "$tmp/champion.safetensors" ;;
+        echo "-> exporting {{checkpoint}} -> ${stem}.safetensors (torch-free serving format)..."
+        uv run --no-sync hexo-a0 export --checkpoint "{{checkpoint}}" --out "$out" ;;
     esac
-    echo "-> rsyncing to oracle..."
-    rsync -avz --progress --chmod=Fa+r "$tmp/champion.safetensors" .env.example compose.yaml ubuntu@oracle:/home/ubuntu/hexo-serve/
+    echo "-> rsyncing ${stem}.safetensors to oracle..."
+    rsync -avz --progress --chmod=Fa+r "$out" .env.example compose.yaml ubuntu@oracle:/home/ubuntu/hexo-serve/
+    echo "-> deployed /home/ubuntu/hexo-serve/${stem}.safetensors"
+    echo "   ensure the box's .env has:  HEXO_CHECKPOINT_HOST=/home/ubuntu/hexo-serve/${stem}.safetensors"
+    echo "   then on the box:  docker compose up -d"
 
 # Import an existing games DB into the Oracle deployment's /data volume.
 # WAL-safe online snapshot (the source server can stay up) -> scp -> load into the
