@@ -32,6 +32,8 @@ class ModelConfig:
     value_bin_min: float = _f(-1.0, "Lower end of the distributional value head's bin grid (only used when value_bins>0).", group="Output heads")
     value_bin_max: float = _f(1.0, "Upper end of the distributional value head's bin grid (only used when value_bins>0).", group="Output heads")
     value_horizons: list[int] = _ff(list, "Short-horizon value heads (TRAIN-ONLY, never exported to self-play). A list of horizons in PLACEMENTS (a HeXO turn is 2 placements); each adds a binned value head trained on the position's outcome IF the game resolves within that many placements, else neutral (0). A denser value signal in long games. Suggested [4, 12, 32] (~2/6/16 turns). Requires value_bins>0 (all value heads share the bin grid). Empty = disabled. Weighted by training.horizon_loss_weight. FROM-SCRATCH ONLY.", group="Output heads")
+    q_head: bool = _f(False, "Train-only per-legal-move Q head (never exported to self-play; zero inference cost). An MLP over each legal-move node embedding predicting that move's MCTS completed-Q (the search value the network already produced but self-play discards), distilling per-move search knowledge into the trunk. Trained only on moves the search actually visited (visit>0), regressed with a masked MSE weighted by training.q_loss_weight. Requires HX08 self-play data (per-move q + visit counts). FROM-SCRATCH / new-data only.", group="Output heads")
+    q_hidden: int = _f(64, "Hidden size of the train-only Q head MLP (only used when q_head=true).", group="Output heads")
     # --- Graph construction ---
     graph_type: str = _f("axis", "Graph topology: 'hex' (distance-1 adjacency, ~9 layers) or 'axis' (axis-window with edge features, ~3 layers)", group="Graph construction")
     prune_empty_edges: bool = _f(True, "Drop empty→empty edges in axis-window graphs (reduces graph size, only affects graph_type='axis')", group="Graph construction")
@@ -219,6 +221,7 @@ class TrainingConfig:
     draw_value: float = _f(-0.3, "Value target for drawn games. 0.0 = neutral, -0.1 = slight penalty for both sides (encourages decisive play). Applied symmetrically: both players see this value for all positions in a drawn game.", group="Loss")
     pc_loss_weight: float = _f(0.0, "Weight for path consistency regularisation loss (0 = disabled)", group="Loss")
     horizon_loss_weight: float = _f(0.0, "Weight for the short-horizon value heads' aggregate cross-entropy (0 = disabled). Only active when model.value_horizons is non-empty. Suggested ~0.25.", group="Loss")
+    q_loss_weight: float = _f(0.0, "Weight for the train-only per-move Q head's masked MSE (0 = disabled). Only active when model.q_head=true and HX08 per-move data is present. Suggested ~0.5.", group="Loss")
     # --- Data ---
     augment_symmetries: bool = _f(True, "Apply D6 symmetry augmentation (12x training data via hex rotations/reflections)", group="Data")
     buffer_capacity: int = _f(250_000, "Maximum number of positions stored in the replay buffer", group="Data")

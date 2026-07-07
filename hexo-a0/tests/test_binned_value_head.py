@@ -155,3 +155,25 @@ class TestTrainerValueLoss:
         out = _forward_and_loss(net, examples, torch.device("cpu"))
         # scalar path: value_loss == value_mse (same tensor value)
         assert torch.isclose(out["value_loss"], out["value_mse"])
+
+    def test_binned_diagnostics_surface(self):
+        from hexo_a0.trainer import _forward_and_loss
+        net = HeXONet(_cfg(65))
+        examples = [_example(value=1.0), _example(8, 3, value=-1.0)]
+        out = _forward_and_loss(net, examples, torch.device("cpu"))
+        # Predicted bin-distribution entropy is non-negative and finite.
+        ent = out["value_pred_entropy"]
+        assert torch.is_tensor(ent) and ent.item() >= 0.0
+        # Both examples are non-draw (+1/-1) and the decoded values are bounded
+        # in [-1, 1]; sign-accuracy is a probability in [0, 1].
+        sa = out["value_sign_acc"]
+        assert torch.is_tensor(sa) and 0.0 <= sa.item() <= 1.0
+
+    def test_scalar_diagnostics_absent(self):
+        from hexo_a0.trainer import _forward_and_loss
+        net = HeXONet(_cfg(0))
+        examples = [_example(value=1.0)]
+        out = _forward_and_loss(net, examples, torch.device("cpu"))
+        # Scalar heads have no bin logits → these diagnostics stay None.
+        assert out["value_pred_entropy"] is None
+        assert out["value_sign_acc"] is None

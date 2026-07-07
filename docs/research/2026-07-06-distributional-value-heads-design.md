@@ -188,14 +188,35 @@ reader never change.
 
 - `total_loss = policy_KL + value_loss(+bins) + horizon_loss_weight * Σ_k CE_k
   + q_loss_weight * Q_MSE (+ pc_loss_weight * PC)` — each term follows the
-  `sw`-weighted pattern and lands in the `_forward_and_loss` return dict
-  (`trainer.py:969-978`), accumulates through `train_step`/`train`, and logs
-  as `loss/value_bins`, `loss/value_mse`, `loss/horizon_k{K}`, `loss/q_head`
-  next to the existing scalars (`trainer.py:3107-3160`).
+  `sw`-weighted pattern and lands in the `_forward_and_loss` return dict,
+  accumulates through `train_step`/`train` (GPU-side running tensors, one sync
+  at end of the report block), and logs next to the existing scalars.
+- **Loss scalars** (always logged): `loss/value` (two-hot CE for binned heads,
+  MSE for scalar), `loss/value_mse` (decoded-scalar MSE — outcome-comparable
+  across scalar/binned), `loss/horizon` (mean CE across horizon heads),
+  `loss/q` (per-move masked MSE).
+- **Per-head diagnostics** (gated — emitted only when the head is enabled, so
+  legacy scalar/no-horizon/no-Q runs keep their tag set unchanged):
+  - Distributional value head (`value_bins>0`): `value/pred_entropy` (mean
+    predicted bin-distribution entropy — confidence, high early) and
+    `value/sign_accuracy` (fraction of non-draw examples whose decoded value
+    agrees in sign with the outcome).
+  - Horizon heads: per-horizon `loss/horizon_h{H}` and
+    `horizon/coverage_h{H}` (fraction of examples whose target for that
+    horizon is non-neutral — a proxy for "the game resolved within H
+    placements"; treats draws as neutral). Read `loss/horizon_h{H}` only
+    alongside `horizon/coverage_h{H}`: a flat low loss at ~0 coverage means the
+    head is training on mostly-neutral targets.
+  - Q head: `loss/q_mae` (robust MAE on visited moves, complementing the MSE
+    that exaggerates outlier completed-Q targets), `q/coverage` (fraction of
+    legal moves the search visited and so trained on — signal density), and
+    `q/corr` (Pearson r between predicted and MCTS per-move Q over visited
+    moves, accumulated across the report block — the headline "is the head
+    tracking search knowledge" signal).
 - Model introspection (`layer_analysis`, `trainer.py:4003-4269`): add weight
   norms for the new heads, useful during any later graft experiments.
 - New TB histogram `self_play/hist/q_target` beside
-  `self_play/hist/value_target` (`:3432-3433`) once HX08 lands.
+  `self_play/hist/value_target` once HX08 lands.
 
 ## Tests
 

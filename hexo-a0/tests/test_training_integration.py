@@ -116,6 +116,115 @@ def test_checkpoint_resume(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Test 4: Per-head diagnostic TensorBoard tags
+# ---------------------------------------------------------------------------
+
+
+def _train_with_writer(model_config, training_config, examples, steps, tmp_path):
+    """Run a few train() steps with a real TensorBoard writer and return the
+    set of scalar tags written."""
+    from torch.utils.tensorboard import SummaryWriter
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    from hexo_a0.tb_writer import DescribedWriter
+
+    game_config = hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=30)
+    config = FullConfig(
+        model=model_config,
+        mcts=MCTSConfig(n_simulations=2, m_actions=4, exploration_moves=5),
+        training=training_config,
+        self_play=SelfPlayConfig(device="cpu", workers=1, precision="fp32",
+                                  python=PythonSelfPlayConfig(games_per_write=1)),
+        eval=EvalConfig(interval=0, games=0, sims=0, checkpoint_interval=0),
+    )
+    device = torch.device("cpu")
+    trainer = Trainer(HeXONet(model_config).to(device), config, game_config, device)
+    for ex in examples:
+        trainer.buffer.add(ex)
+    log_dir = tmp_path / "tb"
+    trainer.writer = DescribedWriter(SummaryWriter(log_dir=str(log_dir)))
+    trainer.train(steps=steps)
+    trainer.writer.flush()
+    trainer.writer.close()
+
+    ea = EventAccumulator(str(log_dir))
+    ea.Reload()
+    return set(ea.Tags()["scalars"])
+
+
+def test_per_head_diagnostic_tags_emitted(tmp_path):
+    """All three value-head upgrades emit their diagnostic TensorBoard tags."""
+    from hexo_a0.config import TrainingConfig
+    from hexo_a0.self_play import TrainingExample
+    from hexo_a0.graph import game_to_graph
+
+    model_config = ModelConfig(
+        hidden_dim=16, num_layers=1, num_heads=1, graph_type="hex",
+        conv_type="gatv2", value_bins=9, value_horizons=[4], q_head=True,
+    )
+    training = TrainingConfig(
+        batch_size=8, buffer_capacity=500, edge_budget=0, grad_accumulation=False,
+        lr_schedule="constant", lr_warmup_steps=0, total_train_steps=0,
+        target_reuse=0.0, augment_symmetries=False,
+        horizon_loss_weight=0.25, q_loss_weight=0.5,
+    )
+    game = hexo_rs.GameState(hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=30))
+    data = game_to_graph(game)
+    n_legal = int(data.legal_mask.sum().item())
+    examples = [
+        TrainingExample(
+            data=data, policy_target=torch.ones(n_legal) / n_legal,
+            value_target=1.0, horizon_targets=[1.0],
+            q_targets=[0.5] * n_legal, q_visits=[1] * n_legal,
+        )
+        for _ in range(20)
+    ]
+    tags = _train_with_writer(model_config, training, examples, 3, tmp_path)
+    # Horizon head (per-horizon loss + coverage)
+    assert "loss/horizon_h4" in tags
+    assert "horizon/coverage_h4" in tags
+    # Q head (MAE, coverage, correlation)
+    assert "loss/q_mae" in tags
+    assert "q/coverage" in tags
+    assert "q/corr" in tags
+    # Distributional value head (entropy + sign accuracy)
+    assert "value/pred_entropy" in tags
+    assert "value/sign_accuracy" in tags
+
+
+def test_legacy_config_emits_no_new_head_tags(tmp_path):
+    """A scalar-head, no-horizon, no-Q config must not emit the new tags —
+    legacy runs keep their TensorBoard tag set unchanged."""
+    from hexo_a0.config import TrainingConfig
+    from hexo_a0.self_play import TrainingExample
+    from hexo_a0.graph import game_to_graph
+
+    model_config = ModelConfig(
+        hidden_dim=16, num_layers=1, num_heads=1, graph_type="hex",
+        conv_type="gatv2",  # value_bins=0, no horizons, no q_head
+    )
+    training = TrainingConfig(
+        batch_size=8, buffer_capacity=500, edge_budget=0, grad_accumulation=False,
+        lr_schedule="constant", lr_warmup_steps=0, total_train_steps=0,
+        target_reuse=0.0, augment_symmetries=False,
+    )
+    game = hexo_rs.GameState(hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=30))
+    data = game_to_graph(game)
+    n_legal = int(data.legal_mask.sum().item())
+    examples = [
+        TrainingExample(data=data, policy_target=torch.ones(n_legal) / n_legal,
+                        value_target=0.0)
+        for _ in range(20)
+    ]
+    tags = _train_with_writer(model_config, training, examples, 3, tmp_path)
+    new_tags = {
+        "loss/horizon_h4", "horizon/coverage_h4",
+        "loss/q_mae", "q/coverage", "q/corr",
+        "value/pred_entropy", "value/sign_accuracy",
+    }
+    assert not (tags & new_tags), f"legacy config leaked new tags: {tags & new_tags}"
+
+
+# ---------------------------------------------------------------------------
 # Test 3: Ordering consistency
 # ---------------------------------------------------------------------------
 

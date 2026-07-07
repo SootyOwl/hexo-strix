@@ -199,6 +199,13 @@ def batched_self_play_games(
             policy_hidden=mc.policy_hidden,
             value_hidden=mc.value_hidden,
             graph_type="hex",
+            # Distributional value head (Stage 1): the scriptable model must be
+            # built with the same value_bins as HeXONet or load_from_hexonet
+            # hits a value_mlp size mismatch. Horizon/Q heads are train-only
+            # and never enter the scriptable inference path.
+            value_bins=int(getattr(mc, "value_bins", 0) or 0),
+            value_bin_min=getattr(mc, "value_bin_min", -1.0),
+            value_bin_max=getattr(mc, "value_bin_max", 1.0),
         )
         load_from_hexonet(scriptable_net, network.state_dict())
         scriptable_net.to(device)
@@ -352,6 +359,12 @@ class TrainingExample:
     # entry, in that column order; None when horizon heads are disabled. Built
     # at ingest time (within-trajectory order is not persisted downstream).
     horizon_targets: list[float] | None = None
+    # Per-move Q head data (Stage 3), one entry per legal move (policy order):
+    # q_targets = MCTS completed-Q, q_visits = visit counts (0 = unsearched).
+    # None unless the source data is HX08. The trainer masks the Q loss to
+    # visits>0 and weights by sample_weight.
+    q_targets: list[float] | None = None
+    q_visits: list[int] | None = None
 
     def __post_init__(self):
         if self.data is None and self.game_state is None:

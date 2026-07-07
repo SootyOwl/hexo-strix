@@ -466,6 +466,30 @@ class PolicyHead(nn.Module):
         return logits.squeeze(-1)                   # (num_legal,)
 
 
+class QHead(nn.Module):
+    """Train-only per-legal-move Q head.
+
+    An MLP over each legal-move node embedding predicting that move's MCTS
+    completed-Q (a scalar in [-1, 1], the search value the network already
+    produced during self-play but which is otherwise discarded). Distils
+    per-move search knowledge into the trunk. Never exported to
+    ScriptableHeXONet, so it adds zero self-play/inference cost.
+
+    Args:
+        hidden_dim: Dimensionality of incoming node embeddings.
+        q_hidden:   Hidden size of the intermediate MLP layer.
+    """
+
+    def __init__(self, hidden_dim: int, q_hidden: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, q_hidden),
+            nn.ReLU(),
+            nn.Linear(q_hidden, 1),
+            nn.Tanh(),
+        )
+
+
 class ValueHead(nn.Module):
     """Stone-pooled value head that outputs a scalar game value.
 
@@ -570,6 +594,10 @@ class HeXONet(nn.Module):
                 ValueHead(head_in_dim, config.value_hidden, value_bins=self.value_bins)
                 for _ in self.value_horizons
             ])
+        # Train-only per-move Q head (also excluded from ScriptableHeXONet).
+        self.q_head_enabled = bool(getattr(config, "q_head", False))
+        if self.q_head_enabled:
+            self.q_head = QHead(head_in_dim, int(getattr(config, "q_hidden", 64)))
 
     def forward(
         self,
@@ -647,6 +675,8 @@ class HeXONet(nn.Module):
             value bin logits (present only when ``value_bins>0``).
           - ``"horizon_logits"``: ``(num_graphs, n_horizons, value_bins)``
             short-horizon head logits (present only when ``value_horizons``).
+          - ``"q_values"``: ``(total_legal,)`` per-legal-move Q predictions,
+            aligned with ``all_logits`` (present only when ``q_head``).
         The scalar decode still rides in ``values_tensor`` for reporting. Under
         torch.compile this constant keyword selects a distinct graph, so the
         default 3-tuple path stays graph-break-free and byte-identical; train-only
@@ -722,6 +752,10 @@ class HeXONet(nn.Module):
                 extras["horizon_logits"] = torch.stack(
                     [h.mlp(pooled) for h in self.horizon_value_heads], dim=1
                 )
+            if self.q_head_enabled:
+                # (total_legal,) — per-legal-move Q, aligned with all_logits
+                # (both indexed by legal_idx / batch node order).
+                extras["q_values"] = self.q_head.mlp(all_legal_embeddings).squeeze(-1)
             return all_logits, legal_counts, values_tensor, extras
 
         return all_logits, legal_counts, values_tensor

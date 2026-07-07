@@ -150,6 +150,34 @@ class TestTrainerHorizonLoss:
         out = _forward_and_loss(net, examples, torch.device("cpu"), horizon_loss_weight=0.25)
         assert torch.is_tensor(out["horizon_loss"])
 
+    def test_per_horizon_loss_and_coverage_surface(self):
+        from hexo_a0.trainer import _forward_and_loss
+        net = HeXONet(_cfg(horizons=[4, 12]))
+        examples = [
+            _example7(value=1.0, horizons_row=[1.0, 0.0]),   # h4 resolved, h12 neutral
+            _example7(8, 3, value=-1.0, horizons_row=[-1.0, -1.0]),  # both resolved
+        ]
+        out = _forward_and_loss(net, examples, torch.device("cpu"), horizon_loss_weight=0.25)
+        per_loss = out["per_horizon_loss"]
+        per_cov = out["per_horizon_cov"]
+        assert torch.is_tensor(per_loss) and per_loss.shape == (2,)
+        assert torch.is_tensor(per_cov) and per_cov.shape == (2,)
+        # Coverage is the fraction of (weighted) examples whose target for each
+        # horizon is non-neutral. h4: both examples resolved → 1.0. h12: one
+        # neutral → 0.5 (equal sample weights).
+        assert per_cov[0].item() == pytest.approx(1.0, abs=1e-6)
+        assert per_cov[1].item() == pytest.approx(0.5, abs=1e-6)
+        # The mean of the per-horizon losses matches the reported horizon loss.
+        assert per_loss.mean().item() == pytest.approx(out["horizon_loss"].item(), abs=1e-6)
+
+    def test_per_horizon_loss_none_when_weight_off(self):
+        from hexo_a0.trainer import _forward_and_loss
+        net = HeXONet(_cfg(horizons=[4, 12]))
+        examples = [_example7(value=1.0, horizons_row=[1.0, 1.0])]
+        out = _forward_and_loss(net, examples, torch.device("cpu"), horizon_loss_weight=0.0)
+        assert out["per_horizon_loss"] is None
+        assert out["per_horizon_cov"] is None
+
 
 # --- Export unaffected ------------------------------------------------------
 

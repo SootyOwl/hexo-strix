@@ -153,7 +153,8 @@ def _resync_binary(fh) -> bool:
         i05 = buf.find(b"HX05")
         i06 = buf.find(b"HX06")
         i07 = buf.find(b"HX07")
-        candidates = [i for i in (i03, i04, i05, i06, i07) if i >= 0]
+        i08 = buf.find(b"HX08")
+        candidates = [i for i in (i03, i04, i05, i06, i07, i08) if i >= 0]
         if candidates:
             idx = min(candidates)
             fh.seek(fh.tell() - len(buf) + idx)
@@ -314,6 +315,48 @@ def _parse_binary_example_hx07(data: bytes, offset: int) -> tuple[dict, int]:
         "value": float(value),
         "sample_weight": float(sample_weight),
     }
+    return ex, offset
+
+
+def _parse_binary_example_hx08(data: bytes, offset: int) -> tuple[dict, int]:
+    """Parse one HX08 board-state example (HX07 + per-move Q head data).
+
+    Identical to :func:`_parse_binary_example_hx07`, then two extra per-legal
+    blocks after the policy: ``[num_legal*4B q f32][num_legal*2B visits u16]``.
+    ``q`` is the MCTS completed-Q per legal move (root/side-to-move perspective,
+    aligned with ``policy`` order); ``visits`` is the per-move visit count (0 for
+    moves the search never expanded). The trainer masks the Q loss to visits>0.
+
+    Must match ``write_example_hx08`` in self_play.rs.
+    """
+    import struct
+    import numpy as np
+
+    ex, offset = _parse_binary_example_hx07(data, offset)
+    num_legal = ex["num_legal"]
+
+    q_needed = num_legal * 4
+    if offset + q_needed > len(data):
+        raise ValueError(
+            f"HX08 record truncated: q block needs {offset + q_needed} bytes "
+            f"({num_legal} legal moves), buffer has {len(data)}")
+    q_targets = np.frombuffer(
+        data, dtype=np.float32, count=num_legal, offset=offset
+    ).astype(np.float64).tolist()
+    offset += q_needed
+
+    v_needed = num_legal * 2
+    if offset + v_needed > len(data):
+        raise ValueError(
+            f"HX08 record truncated: visits block needs {offset + v_needed} bytes "
+            f"({num_legal} legal moves), buffer has {len(data)}")
+    q_visits = np.frombuffer(
+        data, dtype=np.uint16, count=num_legal, offset=offset
+    ).astype(np.int64).tolist()
+    offset += v_needed
+
+    ex["q_targets"] = q_targets
+    ex["q_visits"] = q_visits
     return ex, offset
 from hexo_a0.self_play import batched_self_play_games, TrainingExample
 
@@ -736,6 +779,8 @@ def _prefetch_worker(
                 getattr(ex, "_age", None),
                 float(getattr(ex, "sample_weight", 1.0)),
                 getattr(ex, "horizon_targets", None),
+                getattr(ex, "q_targets", None),
+                getattr(ex, "q_visits", None),
             ))
 
         # Block on put with timeout so the worker can notice stop_event.
@@ -826,6 +871,7 @@ def _forward_and_loss(
     loss_scale: float = 1.0,
     pc_loss_weight: float = 0.0,
     horizon_loss_weight: float = 0.0,
+    q_loss_weight: float = 0.0,
 ) -> dict[str, "torch.Tensor | float"]:
     """Forward pass + loss computation + backward (no optimizer step).
 
@@ -844,17 +890,23 @@ def _forward_and_loss(
         the NaN/Inf guard. ``pc_loss`` is a tensor when PC loss is active,
         otherwise the float ``0.0`` sentinel.
     """
-    # Unpack — examples may have 3, 4, 5, 6, or 7 elements:
+    # Unpack — examples may have 3, 4, 5, 6, 7, or 9 elements:
     #   3-tuple: (data, policy, value)
     #   4-tuple: + trajectory_id
     #   5-tuple: + age (buffer position at sample time, [0, 1], 0=newest)
     #   6-tuple: + sample_weight (in (0, 1]; <1 for PCR fast-cap examples)
     #   7-tuple: + horizon_targets (list[float] per example, or None; Stage 2)
+    #   9-tuple: + q_targets, q_visits (per-legal-move lists, or None; Stage 3)
     ages: tuple | None = None
     sample_weights: tuple | None = None
     horizon_targets_tup: tuple | None = None
+    q_targets_tup: tuple | None = None
+    q_visits_tup: tuple | None = None
     arity = len(examples[0])
-    if arity == 7:
+    if arity == 9:
+        (data_list, policy_targets, value_targets, traj_ids, ages,
+         sample_weights, horizon_targets_tup, q_targets_tup, q_visits_tup) = zip(*examples)
+    elif arity == 7:
         data_list, policy_targets, value_targets, traj_ids, ages, sample_weights, horizon_targets_tup = zip(*examples)
     elif arity == 6:
         data_list, policy_targets, value_targets, traj_ids, ages, sample_weights = zip(*examples)
@@ -907,7 +959,8 @@ def _forward_and_loss(
     # byte-identical 3-tuple path.
     value_bins = int(getattr(model, "value_bins", 0) or 0)
     horizons = list(getattr(model, "value_horizons", []) or [])
-    need_extras = value_bins > 0 or bool(horizons)
+    q_head_enabled = bool(getattr(model, "q_head_enabled", False))
+    need_extras = value_bins > 0 or bool(horizons) or q_head_enabled
 
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
         if need_extras:
@@ -1020,10 +1073,33 @@ def _forward_and_loss(
 
         total_loss = mean_policy + mean_value
 
+    # Distributional value-head diagnostics (train-only, no gradient): mean
+    # predicted bin-distribution entropy (confidence — high early, drops as
+    # the head commits) and the sign-agreement rate with the outcome over
+    # non-draw examples. Skipped for scalar heads (no bin logits) so legacy
+    # configs see no new tags.
+    value_pred_entropy: "torch.Tensor | None" = None
+    value_sign_acc: "torch.Tensor | None" = None
+    if value_bins > 0:
+        vprobs = torch.softmax(extras["value_logits"].float(), dim=-1)   # (N, B)
+        ent = -(vprobs * torch.log(vprobs.clamp_min(1e-12))).sum(dim=-1)  # (N,)
+        value_pred_entropy = ((ent * sw).sum() / sw_sum).detach()
+        nondraw = (v_targets != 0).float()
+        nd_w = (nondraw * sw).sum().clamp_min(1e-8)
+        match = ((values.float() * v_targets) > 0).float() * nondraw      # (N,)
+        value_sign_acc = ((match * sw).sum() / nd_w).detach()
+
     # Short-horizon value heads (train-only): mean two-hot CE across horizons,
     # each weighted by the same per-example sample weights. Skipped unless the
     # heads exist, the weight is on, and targets were built at ingest.
     horizon_loss_val: "torch.Tensor | float" = 0.0
+    # Per-horizon weighted-mean CE and coverage (fraction of examples, by
+    # weight, whose target for that horizon is non-neutral — a proxy for
+    # "the game resolved within horizon h"; treats draws as neutral). Both
+    # are None unless horizon heads are active, so the trainer logs nothing
+    # new for configs without them.
+    per_horizon_loss_t: "torch.Tensor | None" = None
+    per_horizon_cov_t: "torch.Tensor | None" = None
     if (
         horizon_loss_weight > 0.0
         and horizons
@@ -1041,12 +1117,79 @@ def _forward_and_loss(
         hz_logits = extras["horizon_logits"].float()                    # (N, n_h, bins)
         centers = model.value_bin_centers
         hz_loss = torch.zeros((), device=device)
+        per_j_loss = torch.zeros(n_h, device=device)
+        per_j_cov = torch.zeros(n_h, device=device)
+        nonneutral = (ht != 0.0).float()                                 # (N, n_h)
         for j in range(n_h):
             ce_j = binned_value_ce(hz_logits[:, j, :], ht[:, j], centers)  # (N,)
-            hz_loss = hz_loss + (ce_j * sw).sum() / sw_sum
+            wmean_j = (ce_j * sw).sum() / sw_sum
+            hz_loss = hz_loss + wmean_j
+            per_j_loss[j] = wmean_j.detach()
+            per_j_cov[j] = ((nonneutral[:, j] * sw).sum() / sw_sum).detach()
         hz_loss = hz_loss / n_h
         total_loss = total_loss + horizon_loss_weight * hz_loss
         horizon_loss_val = hz_loss.detach()
+        per_horizon_loss_t = per_j_loss
+        per_horizon_cov_t = per_j_cov
+
+    # Train-only per-move Q head: masked MSE against the MCTS completed-Q,
+    # trained only on moves the search actually visited (visit>0), weighted by
+    # the per-example sample weight. q_values are aligned with all_logits (both
+    # in batch legal-node order), so targets/masks are built per example in the
+    # same order as the policy targets.
+    q_loss_val: "torch.Tensor | float" = 0.0
+    # Q-head diagnostics (train-only): MAE on visited moves (robust to the
+    # outliers MSE exaggerates), coverage = fraction of legal moves the
+    # search visited (so the density of the per-move signal), and a (6,)
+    # vector of population sums over visited moves [n, Σx, Σy, Σx², Σy², Σxy]
+    # for an unweighted Pearson r between predicted and MCTS per-move Q —
+    # the headline "is the head tracking search knowledge" signal. All stay
+    # 0.0/None when the Q head is off or the data lacks per-move Q (HX07).
+    q_mae_val: "torch.Tensor | float" = 0.0
+    q_coverage_val: "torch.Tensor | float" = 0.0
+    q_corr_sums: "torch.Tensor | None" = None
+    if (
+        q_loss_weight > 0.0
+        and q_head_enabled
+        and q_targets_tup is not None
+        and "q_values" in extras
+    ):
+        q_tgt_list, q_msk_list = [], []
+        for i in range(len(policy_targets)):
+            nl = policy_targets[i].shape[0]
+            qt = q_targets_tup[i]
+            qv = q_visits_tup[i] if q_visits_tup is not None else None
+            if qt is None or qv is None:
+                q_tgt_list.append(torch.zeros(nl, dtype=torch.float32))
+                q_msk_list.append(torch.zeros(nl, dtype=torch.float32))
+            else:
+                q_tgt_list.append(torch.tensor(qt, dtype=torch.float32))
+                q_msk_list.append(
+                    (torch.tensor(qv, dtype=torch.float32) > 0).float()
+                )
+        q_tgt = torch.cat(q_tgt_list).to(device, non_blocking=True)     # (total_legal,)
+        q_msk = torch.cat(q_msk_list).to(device, non_blocking=True)
+        q_pred = extras["q_values"].float()                            # (total_legal,)
+        # Per-node sample weight via the legal-node→graph map computed above.
+        sw_node = sw[graph_idx]
+        weighted_mask = q_msk * sw_node
+        wm_sum = weighted_mask.sum().clamp_min(1.0)
+        q_sq = (q_pred - q_tgt).pow(2) * weighted_mask
+        q_loss = q_sq.sum() / wm_sum
+        total_loss = total_loss + q_loss_weight * q_loss
+        q_loss_val = q_loss.detach()
+        q_mae_val = ((q_pred - q_tgt).abs() * weighted_mask).sum().detach() / wm_sum
+        q_coverage_val = (weighted_mask.sum().detach()
+                          / sw_node.sum().clamp_min(1e-8))
+        # Population sums over visited moves (unweighted) for Pearson r.
+        sel = q_msk.bool()
+        if int(sel.numel()) > 0 and bool(sel.any()):
+            xp = q_pred.detach()[sel]
+            yp = q_tgt.detach()[sel]
+            q_corr_sums = torch.stack([
+                torch.tensor(float(xp.numel()), device=device, dtype=torch.float32),
+                xp.sum(), yp.sum(), (xp * xp).sum(), (yp * yp).sum(), (xp * yp).sum(),
+            ]).detach()
 
     # Path consistency loss (PCZero)
     pc_loss_val: "torch.Tensor | float" = 0.0
@@ -1102,11 +1245,52 @@ def _forward_and_loss(
         "value_loss": mean_value.detach(),
         "value_mse": value_mse.detach(),
         "horizon_loss": horizon_loss_val,
+        "per_horizon_loss": per_horizon_loss_t,
+        "per_horizon_cov": per_horizon_cov_t,
+        "q_loss": q_loss_val,
+        "q_mae": q_mae_val,
+        "q_coverage": q_coverage_val,
+        "q_corr_sums": q_corr_sums,
         "pc_loss": pc_loss_val,
         "cross_entropy": mean_cross_entropy.detach(),
         "target_entropy": mean_target_entropy.detach(),
+        "value_pred_entropy": value_pred_entropy,
+        "value_sign_acc": value_sign_acc,
         "staleness_kl_q_sum": staleness_kl_q_sum,
         "staleness_kl_q_count": staleness_kl_q_count,
+    }
+
+
+def _extract_step_diagnostics(
+    mb_losses: dict, n_hz: int, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Pull the train-only per-head diagnostics out of one
+    ``_forward_and_loss`` result, substituting zeros for the head-off
+    sentinels (``None``/``0.0``) so the caller can accumulate
+    unconditionally without per-key branching. Keys are normalized
+    (``value_pred_entropy`` → ``value_entropy``) for terse accumulation.
+    """
+    def _t(key):
+        v = mb_losses.get(key)
+        return v if torch.is_tensor(v) else None
+
+    phl = _t("per_horizon_loss")
+    phc = _t("per_horizon_cov")
+    return {
+        "per_horizon_loss": phl if phl is not None else torch.zeros(n_hz, device=device),
+        "per_horizon_cov": phc if phc is not None else torch.zeros(n_hz, device=device),
+        "q_mae": mb_losses["q_mae"] if torch.is_tensor(mb_losses.get("q_mae"))
+        else torch.zeros((), device=device),
+        "q_coverage": mb_losses["q_coverage"] if torch.is_tensor(mb_losses.get("q_coverage"))
+        else torch.zeros((), device=device),
+        "q_corr_sums": mb_losses["q_corr_sums"] if mb_losses.get("q_corr_sums") is not None
+        else torch.zeros(6, device=device),
+        "value_entropy": mb_losses["value_pred_entropy"]
+        if torch.is_tensor(mb_losses.get("value_pred_entropy"))
+        else torch.zeros((), device=device),
+        "value_sign_acc": mb_losses["value_sign_acc"]
+        if torch.is_tensor(mb_losses.get("value_sign_acc"))
+        else torch.zeros((), device=device),
     }
 
 
@@ -1939,6 +2123,9 @@ class Trainer:
             cmd.append("--threat-features")
         if getattr(self.model_config, "relative_stone_encoding", False):
             cmd.append("--relative-stones")
+        # Emit HX08 (per-move Q + visit counts) for the train-only Q head.
+        if getattr(self.model_config, "q_head", False):
+            cmd.append("--emit-q")
 
         if rust_cfg.playout_cap_fraction > 0.0 and rust_cfg.playout_cap_divisor > 1:
             cmd.extend(["--playout-cap-fraction", str(rust_cfg.playout_cap_fraction)])
@@ -2240,6 +2427,7 @@ class Trainer:
     _RECORD_MAGIC_LEGACY = b"HX03"
     _RECORD_MAGIC_HX06 = b"HX06"
     _RECORD_MAGIC_HX07 = b"HX07"
+    _RECORD_MAGIC_HX08 = b"HX08"
 
     @staticmethod
     def _read_binary_records(fh, batch: list, max_records: int) -> None:
@@ -2283,7 +2471,16 @@ class Trainer:
 
             magic = header[:4]
             is_hx07 = False
-            if magic == Trainer._RECORD_MAGIC_HX07:
+            is_hx08 = False
+            if magic == Trainer._RECORD_MAGIC_HX08:
+                # Board-state record + per-move Q head data. Same envelope as
+                # HX07; each example additionally carries per-legal q + visits.
+                is_hx07 = True   # shares HX07's envelope/body-offset handling
+                is_hx08 = True   # selects the HX08 per-example parser
+                has_sample_weight = True
+                has_node_dim = False
+                has_window_stats = False
+            elif magic == Trainer._RECORD_MAGIC_HX07:
                 # Board-state record: no node_dim byte; a 1B has_window flag
                 # sits at offset 9 (body starts at 10, or 22 with window stats).
                 is_hx07 = True
@@ -2360,9 +2557,13 @@ class Trainer:
                             "acted_deficit_sum": acted_deficit_sum,
                         }
                         offset += 12
+                    parse_example = (
+                        _parse_binary_example_hx08 if is_hx08
+                        else _parse_binary_example_hx07
+                    )
                     examples = []
                     for _ in range(num_examples):
-                        ex, offset = _parse_binary_example_hx07(data, offset)
+                        ex, offset = parse_example(data, offset)
                         examples.append(ex)
                     batch.append({
                         "length": num_examples,
@@ -2496,6 +2697,8 @@ class Trainer:
                 game_state=gs,
                 sample_weight=float(ex.get("sample_weight", 1.0)),
                 horizon_targets=horizon_rows[i] if horizon_rows is not None else None,
+                q_targets=ex.get("q_targets"),
+                q_visits=ex.get("q_visits"),
             ))
         total = len(examples) + skipped
         if total:
@@ -2859,9 +3062,16 @@ class Trainer:
             "value_loss": 0.0,
             "value_mse": 0.0,
             "horizon_loss": 0.0,
+            "q_loss": 0.0,
             "pc_loss": 0.0,
             "cross_entropy": 0.0,
             "target_entropy": 0.0,
+            # Per-head diagnostics (train-only; stay 0 unless the head is on):
+            "q_mae": 0.0,
+            "q_coverage": 0.0,
+            "q_corr": 0.0,
+            "value_pred_entropy": 0.0,
+            "value_sign_acc": 0.0,
         }
 
         augment = tc.augment_symmetries
@@ -2919,6 +3129,8 @@ class Trainer:
             # Short-horizon value-head aggregate CE (train-only; 0 unless
             # value_horizons + horizon_loss_weight are set).
             running_horizon_t = torch.zeros((), device=self.device)
+            # Per-move Q-head masked MSE (train-only; 0 unless q_head + q_loss_weight).
+            running_q_t = torch.zeros((), device=self.device)
             running_pc_t = torch.zeros((), device=self.device)
             running_cross_entropy_t = torch.zeros((), device=self.device)
             running_target_entropy_t = torch.zeros((), device=self.device)
@@ -2927,6 +3139,17 @@ class Trainer:
             # the buffer at sample time (Q1=newest 25%, Q4=oldest 25%).
             running_staleness_kl_q_sum = torch.zeros(4, device=self.device)
             running_staleness_kl_q_count = torch.zeros(4, device=self.device)
+            # Per-head diagnostics (train-only). Sized to the model's heads;
+            # empty/zero when the head is off, so legacy configs log nothing
+            # new and the display string is unchanged.
+            _n_hz = len(getattr(self.model, "value_horizons", []) or [])
+            running_per_horizon_loss_t = torch.zeros(_n_hz, device=self.device)
+            running_per_horizon_cov_t = torch.zeros(_n_hz, device=self.device)
+            running_q_mae_t = torch.zeros((), device=self.device)
+            running_q_coverage_t = torch.zeros((), device=self.device)
+            running_q_corr_sums = torch.zeros(6, device=self.device)
+            running_value_entropy_t = torch.zeros((), device=self.device)
+            running_value_sign_acc_t = torch.zeros((), device=self.device)
             # Last known display values (only refreshed every 5 steps).
             last_disp_total = 0.0
             last_disp_policy = 0.0
@@ -2997,6 +3220,7 @@ class Trainer:
                 _t0 = time.time()
                 pc_weight = tc.pc_loss_weight
                 horizon_weight = getattr(tc, "horizon_loss_weight", 0.0)
+                q_weight = getattr(tc, "q_loss_weight", 0.0)
 
                 if use_prefetch:
                     # Background thread already sampled + augmented + pinned.
@@ -3056,6 +3280,8 @@ class Trainer:
                             getattr(ex, '_age', None),
                             float(getattr(ex, 'sample_weight', 1.0)),
                             getattr(ex, 'horizon_targets', None),
+                            getattr(ex, 'q_targets', None),
+                            getattr(ex, 'q_visits', None),
                         ))
 
                 # ----- Forward / backward (sync-free; returns GPU tensors) -----
@@ -3086,16 +3312,26 @@ class Trainer:
                         step_value_t = torch.zeros((), device=self.device)
                         step_value_mse_t = torch.zeros((), device=self.device)
                         step_horizon_t = torch.zeros((), device=self.device)
+                        step_q_t = torch.zeros((), device=self.device)
                         step_pc_t = torch.zeros((), device=self.device)
                         step_cross_entropy_t = torch.zeros((), device=self.device)
                         step_target_entropy_t = torch.zeros((), device=self.device)
+                        step_per_horizon_loss_t = torch.zeros(_n_hz, device=self.device)
+                        step_per_horizon_cov_t = torch.zeros(_n_hz, device=self.device)
+                        step_q_mae_t = torch.zeros((), device=self.device)
+                        step_q_coverage_t = torch.zeros((), device=self.device)
+                        step_q_corr_sums = torch.zeros(6, device=self.device)
+                        step_value_entropy_t = torch.zeros((), device=self.device)
+                        step_value_sign_acc_t = torch.zeros((), device=self.device)
                         for mb in micro_batches:
                             mb_losses = _forward_and_loss(
                                 self.model, mb, self.device, use_fp16,
                                 loss_scale=1.0 / n_micro,
                                 pc_loss_weight=pc_weight,
                                 horizon_loss_weight=horizon_weight,
+                                q_loss_weight=q_weight,
                             )
+                            mb_diag = _extract_step_diagnostics(mb_losses, _n_hz, self.device)
                             step_total_t = step_total_t + mb_losses["total_loss"] / n_micro
                             step_policy_t = step_policy_t + mb_losses["policy_loss"] / n_micro
                             step_value_t = step_value_t + mb_losses["value_loss"] / n_micro
@@ -3104,8 +3340,22 @@ class Trainer:
                             step_target_entropy_t = step_target_entropy_t + mb_losses["target_entropy"] / n_micro
                             if torch.is_tensor(mb_losses["horizon_loss"]):
                                 step_horizon_t = step_horizon_t + mb_losses["horizon_loss"] / n_micro
+                            if torch.is_tensor(mb_losses["q_loss"]):
+                                step_q_t = step_q_t + mb_losses["q_loss"] / n_micro
                             if torch.is_tensor(mb_losses["pc_loss"]):
                                 step_pc_t = step_pc_t + mb_losses["pc_loss"] / n_micro
+                            # Per-head diagnostics: mean-of-means for the loss
+                            # populations (÷n_micro, matching the loss accum
+                            # above); q_corr_sums is a raw population sum (no
+                            # division) so the Pearson r is computed over all
+                            # visited moves in the report block, not per micro.
+                            step_per_horizon_loss_t = step_per_horizon_loss_t + mb_diag["per_horizon_loss"] / n_micro
+                            step_per_horizon_cov_t = step_per_horizon_cov_t + mb_diag["per_horizon_cov"] / n_micro
+                            step_q_mae_t = step_q_mae_t + mb_diag["q_mae"] / n_micro
+                            step_q_coverage_t = step_q_coverage_t + mb_diag["q_coverage"] / n_micro
+                            step_value_entropy_t = step_value_entropy_t + mb_diag["value_entropy"] / n_micro
+                            step_value_sign_acc_t = step_value_sign_acc_t + mb_diag["value_sign_acc"] / n_micro
+                            step_q_corr_sums = step_q_corr_sums + mb_diag["q_corr_sums"]
                             if mb_losses.get("staleness_kl_q_sum") is not None:
                                 running_staleness_kl_q_sum = running_staleness_kl_q_sum + mb_losses["staleness_kl_q_sum"]
                                 running_staleness_kl_q_count = running_staleness_kl_q_count + mb_losses["staleness_kl_q_count"]
@@ -3115,6 +3365,7 @@ class Trainer:
                             self.model, all_examples, self.device, use_fp16,
                             pc_loss_weight=pc_weight,
                             horizon_loss_weight=horizon_weight,
+                            q_loss_weight=q_weight,
                         )
                         step_total_t = mb_losses["total_loss"]
                         step_policy_t = mb_losses["policy_loss"]
@@ -3127,11 +3378,24 @@ class Trainer:
                             if torch.is_tensor(mb_losses["horizon_loss"])
                             else torch.zeros((), device=self.device)
                         )
+                        step_q_t = (
+                            mb_losses["q_loss"]
+                            if torch.is_tensor(mb_losses["q_loss"])
+                            else torch.zeros((), device=self.device)
+                        )
                         step_pc_t = (
                             mb_losses["pc_loss"]
                             if torch.is_tensor(mb_losses["pc_loss"])
                             else torch.zeros((), device=self.device)
                         )
+                        _mbd = _extract_step_diagnostics(mb_losses, _n_hz, self.device)
+                        step_per_horizon_loss_t = _mbd["per_horizon_loss"]
+                        step_per_horizon_cov_t = _mbd["per_horizon_cov"]
+                        step_q_mae_t = _mbd["q_mae"]
+                        step_q_coverage_t = _mbd["q_coverage"]
+                        step_q_corr_sums = _mbd["q_corr_sums"]
+                        step_value_entropy_t = _mbd["value_entropy"]
+                        step_value_sign_acc_t = _mbd["value_sign_acc"]
                         if mb_losses.get("staleness_kl_q_sum") is not None:
                             running_staleness_kl_q_sum = running_staleness_kl_q_sum + mb_losses["staleness_kl_q_sum"]
                             running_staleness_kl_q_count = running_staleness_kl_q_count + mb_losses["staleness_kl_q_count"]
@@ -3140,6 +3404,7 @@ class Trainer:
                         self.model, all_examples, self.device, use_fp16,
                         pc_loss_weight=pc_weight,
                         horizon_loss_weight=horizon_weight,
+                        q_loss_weight=q_weight,
                     )
                     step_total_t = mb_losses["total_loss"]
                     step_policy_t = mb_losses["policy_loss"]
@@ -3152,11 +3417,24 @@ class Trainer:
                         if torch.is_tensor(mb_losses["horizon_loss"])
                         else torch.zeros((), device=self.device)
                     )
+                    step_q_t = (
+                        mb_losses["q_loss"]
+                        if torch.is_tensor(mb_losses["q_loss"])
+                        else torch.zeros((), device=self.device)
+                    )
                     step_pc_t = (
                         mb_losses["pc_loss"]
                         if torch.is_tensor(mb_losses["pc_loss"])
                         else torch.zeros((), device=self.device)
                     )
+                    _mbd = _extract_step_diagnostics(mb_losses, _n_hz, self.device)
+                    step_per_horizon_loss_t = _mbd["per_horizon_loss"]
+                    step_per_horizon_cov_t = _mbd["per_horizon_cov"]
+                    step_q_mae_t = _mbd["q_mae"]
+                    step_q_coverage_t = _mbd["q_coverage"]
+                    step_q_corr_sums = _mbd["q_corr_sums"]
+                    step_value_entropy_t = _mbd["value_entropy"]
+                    step_value_sign_acc_t = _mbd["value_sign_acc"]
                     if mb_losses.get("staleness_kl_q_sum") is not None:
                         running_staleness_kl_q_sum = running_staleness_kl_q_sum + mb_losses["staleness_kl_q_sum"]
                         running_staleness_kl_q_count = running_staleness_kl_q_count + mb_losses["staleness_kl_q_count"]
@@ -3194,9 +3472,17 @@ class Trainer:
                 running_value_t = running_value_t + step_value_t
                 running_value_mse_t = running_value_mse_t + step_value_mse_t
                 running_horizon_t = running_horizon_t + step_horizon_t
+                running_q_t = running_q_t + step_q_t
                 running_pc_t = running_pc_t + step_pc_t
                 running_cross_entropy_t = running_cross_entropy_t + step_cross_entropy_t
                 running_target_entropy_t = running_target_entropy_t + step_target_entropy_t
+                running_per_horizon_loss_t = running_per_horizon_loss_t + step_per_horizon_loss_t
+                running_per_horizon_cov_t = running_per_horizon_cov_t + step_per_horizon_cov_t
+                running_q_mae_t = running_q_mae_t + step_q_mae_t
+                running_q_coverage_t = running_q_coverage_t + step_q_coverage_t
+                running_q_corr_sums = running_q_corr_sums + step_q_corr_sums
+                running_value_entropy_t = running_value_entropy_t + step_value_entropy_t
+                running_value_sign_acc_t = running_value_sign_acc_t + step_value_sign_acc_t
 
                 actual_steps += 1
                 self.train_steps += 1
@@ -3225,9 +3511,39 @@ class Trainer:
                 losses["value_loss"] = (running_value_t / actual_steps).item()
                 losses["value_mse"] = (running_value_mse_t / actual_steps).item()
                 losses["horizon_loss"] = (running_horizon_t / actual_steps).item()
+                losses["q_loss"] = (running_q_t / actual_steps).item()
                 losses["pc_loss"] = (running_pc_t / actual_steps).item()
                 losses["cross_entropy"] = (running_cross_entropy_t / actual_steps).item()
                 losses["target_entropy"] = (running_target_entropy_t / actual_steps).item()
+                # Per-head diagnostics (train-only). Per-step means are
+                # averaged over steps (matching the loss scalars above);
+                # q_corr_sums is a population total, reduced to a Pearson r
+                # here. Lists are None when the head is disabled so the
+                # writer block below logs nothing new for legacy configs.
+                per_horizon_loss_means: list[float] | None = None
+                per_horizon_cov_means: list[float] | None = None
+                if _n_hz > 0:
+                    per_horizon_loss_means = (running_per_horizon_loss_t / actual_steps).tolist()
+                    per_horizon_cov_means = (running_per_horizon_cov_t / actual_steps).tolist()
+                losses["q_mae"] = (running_q_mae_t / actual_steps).item()
+                losses["q_coverage"] = (running_q_coverage_t / actual_steps).item()
+                q_corr: float = 0.0
+                _q_n = running_q_corr_sums[0].item()
+                if _q_n > 1:
+                    # Pearson r from population sums [n, Σx, Σy, Σx², Σy², Σxy].
+                    n = _q_n
+                    sx, sy = running_q_corr_sums[1].item(), running_q_corr_sums[2].item()
+                    sxx, syy = running_q_corr_sums[3].item(), running_q_corr_sums[4].item()
+                    sxy = running_q_corr_sums[5].item()
+                    cov = sxy - sx * sy / n
+                    var_x = sxx - sx * sx / n
+                    var_y = syy - sy * sy / n
+                    denom = math.sqrt(max(var_x, 0.0) * max(var_y, 0.0))
+                    if denom > 0.0:
+                        q_corr = cov / denom
+                losses["q_corr"] = q_corr
+                losses["value_pred_entropy"] = (running_value_entropy_t / actual_steps).item()
+                losses["value_sign_acc"] = (running_value_sign_acc_t / actual_steps).item()
                 # Staleness quartile means: per-quartile mean policy KL across
                 # all examples in this train() call. None if no examples had
                 # ages attached (tests / non-buffer-sampled paths).
@@ -3329,6 +3645,8 @@ class Trainer:
             "sp_examples_per_sec": sp_examples_per_sec,
             "sample_reuse": sample_reuse,
             "staleness_kl_quartiles": staleness_q_means if actual_steps > 0 else None,
+            "per_horizon_loss": per_horizon_loss_means if actual_steps > 0 else None,
+            "per_horizon_cov": per_horizon_cov_means if actual_steps > 0 else None,
         }
 
         if self.writer is not None:
@@ -3403,6 +3721,31 @@ class Trainer:
                     "loss/value shows the optimized cross-entropy."
                 ),
             )
+            # Distributional value-head diagnostics (only when value_bins>0).
+            if int(getattr(self.model, "value_bins", 0) or 0) > 0:
+                self.writer.add_scalar(
+                    "value/pred_entropy",
+                    metrics["value_pred_entropy"],
+                    step,
+                    description=(
+                        "Mean entropy (nats) of the value head's predicted bin "
+                        "distribution. High early when the head is unsure; drops as it "
+                        "commits to a side. For a scalar (tanh) head this tag is absent."
+                    ),
+                )
+                self.writer.add_scalar(
+                    "value/sign_accuracy",
+                    metrics["value_sign_acc"],
+                    step,
+                    description=(
+                        "Fraction of non-draw examples whose decoded value sign agrees "
+                        "with the eventual outcome (+1/-1). 1.0 = perfect side-call, 0.5 "
+                        "= at chance. A direct value-head accuracy metric that, unlike "
+                        "loss/value_mse, is comparable across scalar and distributional "
+                        "configs. Only for distributional heads (scalar heads skip this "
+                        "tag)."
+                    ),
+                )
             self.writer.add_scalar(
                 "loss/horizon",
                 metrics["horizon_loss"],
@@ -3415,6 +3758,95 @@ class Trainer:
                     "denser value signal in long games; not part of self-play inference."
                 ),
             )
+            # Per-horizon breakdown (only when horizon heads are active). Each
+            # head h predicts the outcome if the game resolves within h
+            # placements; the coverage is the fraction of examples whose target
+            # for that horizon is non-neutral (proxy for "resolved within h";
+            # treats draws as neutral). Read loss/horizon_h{j} only alongside
+            # horizon/coverage_h{j}: a flat low loss on a horizon with ~0
+            # coverage means the head is training on mostly-neutral targets.
+            phl = metrics.get("per_horizon_loss")
+            phc = metrics.get("per_horizon_cov")
+            horizons = list(getattr(self.model, "value_horizons", []) or [])
+            if phl is not None and phc is not None and horizons:
+                for j, h in enumerate(horizons):
+                    self.writer.add_scalar(
+                        f"loss/horizon_h{h}",
+                        phl[j],
+                        step,
+                        description=(
+                            f"Two-hot CE of the h={h} short-horizon value head "
+                            f"(train-only). See horizon/coverage_h{h} to judge how much "
+                            f"signal the head received."
+                        ),
+                    )
+                    self.writer.add_scalar(
+                        f"horizon/coverage_h{h}",
+                        phc[j],
+                        step,
+                        description=(
+                            f"Fraction of examples (by sample weight) whose h={h} "
+                            f"horizon target was non-neutral — i.e. the game resolved "
+                            f"within h placements. Treats draws (0.0) as neutral. ~0 "
+                            f"means the head sees almost no resolved targets this report "
+                            f"block; its loss/horizon_h{h} is then near-meaningless."
+                        ),
+                    )
+            self.writer.add_scalar(
+                "loss/q",
+                metrics["q_loss"],
+                step,
+                description=(
+                    "Train-only per-move Q head: masked MSE between the head's "
+                    "predicted per-legal-move value and the MCTS completed-Q, over "
+                    "moves the search actually visited (visit>0). Distils per-move "
+                    "search knowledge into the trunk. 0 when the Q head is disabled or "
+                    "the data lacks per-move Q (needs HX08). Not part of self-play."
+                ),
+            )
+            # Q-head diagnostics (only when the Q head is enabled). MAE
+            # complements the MSE above (robust to the outlier targets MCTS
+            # completed-Q occasionally produces); coverage is the fraction of
+            # legal moves the search visited and so trained on (the density of
+            # the per-move signal); corr is the Pearson r between predicted
+            # and MCTS per-move Q over visited moves — the headline "is the
+            # head tracking search knowledge" signal (0 = none, 1 = perfect
+            # monotone agreement).
+            if bool(getattr(self.model, "q_head_enabled", False)):
+                self.writer.add_scalar(
+                    "loss/q_mae",
+                    metrics["q_mae"],
+                    step,
+                    description=(
+                        "Mean absolute error between the Q head's predictions and the "
+                        "MCTS completed-Q over visited moves (train-only). A robust "
+                        "complement to loss/q (MSE), which exaggerates the occasional "
+                        "wild completed-Q target."
+                    ),
+                )
+                self.writer.add_scalar(
+                    "q/coverage",
+                    metrics["q_coverage"],
+                    step,
+                    description=(
+                        "Fraction of legal moves the search actually visited (visit>0) "
+                        "and so contributed to the Q loss (train-only). Low coverage "
+                        "means the head trains on few moves per position — the signal "
+                        "is sparse even when loss/q is healthy."
+                    ),
+                )
+                self.writer.add_scalar(
+                    "q/corr",
+                    metrics["q_corr"],
+                    step,
+                    description=(
+                        "Pearson correlation between the Q head's predicted per-move "
+                        "value and the MCTS completed-Q over visited moves, accumulated "
+                        "across the report block (train-only). 1.0 = the head ranks "
+                        "moves the way search does; 0 = no per-move knowledge yet. The "
+                        "single best 'is the Q head learning' signal."
+                    ),
+                )
             # Staleness instrumentation: per-quartile mean policy KL by sample
             # age in the buffer. Q1 = newest 25%, Q4 = oldest 25%. The ratio
             # Q4/Q1 is the headline single-number staleness signal: ratio ≈ 1

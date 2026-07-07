@@ -234,6 +234,12 @@ def _validate_config(cfg: FullConfig) -> None:
             "[model] value_horizons."
         )
 
+    # Train-only per-move Q head.
+    if getattr(tc, "q_loss_weight", 0.0) > 0.0 and not getattr(mc, "q_head", False):
+        raise ValueError(
+            "[training] q_loss_weight>0 requires [model] q_head=true."
+        )
+
     if getattr(tc, "graft_threat_features", False) and getattr(
         mc, "relative_stone_encoding", False
     ):
