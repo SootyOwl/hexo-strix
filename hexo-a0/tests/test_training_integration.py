@@ -225,6 +225,89 @@ def test_legacy_config_emits_no_new_head_tags(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Model-analysis (layer_analysis / node+edge feature gradient) — axis_relational
+# ---------------------------------------------------------------------------
+
+
+def _analysis_tags(model_config, tmp_path):
+    """Run one _log_model_analysis pass and return the set of scalar tags."""
+    from torch.utils.tensorboard import SummaryWriter
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    from hexo_a0.tb_writer import DescribedWriter
+    from hexo_a0.self_play import TrainingExample
+
+    game_config = hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=30)
+    config = FullConfig(
+        model=model_config,
+        mcts=MCTSConfig(n_simulations=2, m_actions=4, exploration_moves=5),
+        training=TrainingConfig(
+            batch_size=8, buffer_capacity=500, edge_budget=0, grad_accumulation=False,
+            lr_schedule="constant", lr_warmup_steps=0, total_train_steps=0,
+            target_reuse=0.0, augment_symmetries=False,
+        ),
+        self_play=SelfPlayConfig(device="cpu", workers=1, precision="fp32",
+                                  python=PythonSelfPlayConfig(games_per_write=1)),
+        eval=EvalConfig(interval=1, games=0, sims=0, checkpoint_interval=0,
+                        model_analysis_interval=1),
+    )
+    device = torch.device("cpu")
+    trainer = Trainer(HeXONet(model_config).to(device), config, game_config, device)
+    data = trainer.graph_fn(hexo_rs.GameState(game_config))
+    n_legal = int(data.legal_mask.sum().item())
+    for _ in range(24):
+        trainer.buffer.add(TrainingExample(
+            data=data, policy_target=torch.ones(n_legal) / n_legal,
+            value_target=1.0, trajectory_id=0,
+        ))
+    log_dir = tmp_path / "tb"
+    trainer.writer = DescribedWriter(SummaryWriter(log_dir=str(log_dir)))
+    trainer._log_model_analysis(0)
+    trainer.writer.flush()
+    trainer.writer.close()
+    ea = EventAccumulator(str(log_dir))
+    ea.Reload()
+    return set(ea.Tags()["scalars"])
+
+
+def test_axis_relational_emits_model_analysis(tmp_path):
+    """The d6-invariant (axis_relational) architecture has no edge_proj and uses
+    AxisRelationalConv (not the edge_attr conv signature). The analysis function
+    must still emit layer_analysis/*, node_features/gradient/*, and an
+    edge_features/weight_norm/* analog (per-hop distance + global embed)."""
+    mc = ModelConfig(
+        hidden_dim=32, num_layers=2, num_heads=4, conv_type="gine",
+        graph_type="axis", axis_relational=True, compact_stone_onehot=True,
+        node_coords=False, moves_scope="node", axis_window=8,
+        threat_features=True, relative_stone_encoding=True,
+        use_jk=True, jk_mode="cat", value_bins=9, value_horizons=[4], q_head=True,
+    )
+    tags = _analysis_tags(mc, tmp_path)
+    assert any(t.startswith("layer_analysis/conv_ratio/") for t in tags), tags
+    assert any(t.startswith("layer_analysis/conv_norm/") for t in tags), tags
+    assert any(t.startswith("layer_analysis/residual_norm/") for t in tags), tags
+    assert any(t.startswith("node_features/gradient/") for t in tags), tags
+    # d6-invariant edge-weight analog: per-hop distance embedding + global embed.
+    assert any(t.startswith("edge_features/weight_norm/dist_hop_") for t in tags), tags
+    assert any(t.startswith("edge_features/weight_norm/global/") for t in tags), tags
+
+
+def test_legacy_axis_emits_edge_feature_gradient(tmp_path):
+    """A legacy (non-axis_relational) gatv2 axis model still emits the legacy
+    edge_features/gradient/* + weight_norm/* (edge_proj path) and
+    node_features/gradient/* — the refactor must not regress it."""
+    mc = ModelConfig(
+        hidden_dim=32, num_layers=2, num_heads=4, conv_type="gatv2",
+        graph_type="axis", threat_features=False,
+        relative_stone_encoding=False, use_jk=False,
+    )
+    tags = _analysis_tags(mc, tmp_path)
+    assert any(t.startswith("edge_features/weight_norm/q_axis") for t in tags), tags
+    assert any(t.startswith("edge_features/gradient/q_axis") for t in tags), tags
+    assert any(t.startswith("node_features/gradient/") for t in tags), tags
+    assert any(t.startswith("layer_analysis/conv_ratio/") for t in tags), tags
+
+
+# ---------------------------------------------------------------------------
 # Test 3: Ordering consistency
 # ---------------------------------------------------------------------------
 

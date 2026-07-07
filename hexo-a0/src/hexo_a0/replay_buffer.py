@@ -246,6 +246,7 @@ class ReplayBuffer:
                 for blob, sid in zip(rows, ids):
                     ex = pickle.loads(blob)
                     ex._age = (max_id - sid) / denom
+                    ex._sid = sid
                     out.append(ex)
                 return out
 
@@ -306,6 +307,7 @@ class ReplayBuffer:
             for sid, blob in rows:
                 ex = pickle.loads(blob)
                 ex._age = (max_id - sid) / denom
+                ex._sid = sid
                 out.append(ex)
             return out
 

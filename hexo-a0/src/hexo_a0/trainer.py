@@ -685,10 +685,12 @@ def _prefetch_worker(
     copy. Pinning is skipped on CPU device.
 
     The worker produces a list of ``(data, policy_target, value_target,
-    trajectory_id, age)`` tuples — the same shape the main loop used to
-    build inline. The main loop just calls ``q.get()``. ``age`` is a float
-    in [0.0, 1.0] (0=newest, 1=oldest) attached by the buffer at sample
-    time; used for staleness stratification in `_forward_and_loss`.
+    trajectory_id, age, sample_weight, horizon_targets, q_targets, q_visits,
+    _sid)`` tuples — the same shape the main loop builds inline. The main loop
+    just calls ``q.get()``. ``age`` is a float in [0.0, 1.0] (0=newest,
+    1=oldest) attached by the buffer at sample time, used for staleness
+    stratification in `_forward_and_loss`; ``_sid`` is the raw buffer insertion
+    id, used to recover within-game order for PCZero.
 
     Fast path: when ``augment_fn`` is provided, augmentation is enabled, and
     every sampled example is game_state-bearing (``ex.data is None``), the
@@ -781,6 +783,7 @@ def _prefetch_worker(
                 getattr(ex, "horizon_targets", None),
                 getattr(ex, "q_targets", None),
                 getattr(ex, "q_visits", None),
+                getattr(ex, "_sid", None),
             ))
 
         # Block on put with timeout so the worker can notice stop_event.
@@ -890,20 +893,27 @@ def _forward_and_loss(
         the NaN/Inf guard. ``pc_loss`` is a tensor when PC loss is active,
         otherwise the float ``0.0`` sentinel.
     """
-    # Unpack — examples may have 3, 4, 5, 6, 7, or 9 elements:
+    # Unpack — examples may have 3, 4, 5, 6, 7, 9, or 10 elements:
     #   3-tuple: (data, policy, value)
     #   4-tuple: + trajectory_id
     #   5-tuple: + age (buffer position at sample time, [0, 1], 0=newest)
     #   6-tuple: + sample_weight (in (0, 1]; <1 for PCR fast-cap examples)
     #   7-tuple: + horizon_targets (list[float] per example, or None; Stage 2)
     #   9-tuple: + q_targets, q_visits (per-legal-move lists, or None; Stage 3)
+    #   10-tuple: + _sid (raw buffer insertion id; recovers within-game order
+    #            for PCZero — games are added via add_many in temporal order)
     ages: tuple | None = None
     sample_weights: tuple | None = None
     horizon_targets_tup: tuple | None = None
     q_targets_tup: tuple | None = None
     q_visits_tup: tuple | None = None
+    sids_tup: tuple | None = None
     arity = len(examples[0])
-    if arity == 9:
+    if arity == 10:
+        (data_list, policy_targets, value_targets, traj_ids, ages,
+         sample_weights, horizon_targets_tup, q_targets_tup, q_visits_tup,
+         sids_tup) = zip(*examples)
+    elif arity == 9:
         (data_list, policy_targets, value_targets, traj_ids, ages,
          sample_weights, horizon_targets_tup, q_targets_tup, q_visits_tup) = zip(*examples)
     elif arity == 7:
@@ -1192,8 +1202,30 @@ def _forward_and_loss(
             ]).detach()
 
     # Path consistency loss (PCZero)
+    #
+    # Two correctness bugs existed here before this fix:
+    #   1. No temporal ordering. `traj_groups` collected indices in batch-sample
+    #      order (random), so `values[indices]` was a shuffled sequence and the
+    #      consistency term paired arbitrary same-game positions. We now sort
+    #      each trajectory's indices by insertion id (`_sid`): games are added via
+    #      `ReplayBuffer.add_many` in temporal order, so ascending sid recovers
+    #      the within-game move order.
+    #   2. Wrong terminal sign. The terminal term paired `values[-1]` (latest
+    #      position) with `v_targets[indices[0]]` (an EARLIER position's label),
+    #      which is side-to-move-relative and so has the wrong sign whenever the
+    #      earliest and latest movers differ in parity. It now uses the latest
+    #      position's own `value_target`.
+    # The consistency term additionally needs move-parity to pair only
+    # opposite-mover (odd-gap) positions; `path_consistency_loss` does that when
+    # given `sids`. Without sids (legacy tuples) it degrades to the
+    # consecutive-pairs assumption and the term is skipped here to avoid
+    # penalising correct predictions on even-gap pairs.
     pc_loss_val: "torch.Tensor | float" = 0.0
     if pc_loss_weight > 0 and traj_ids is not None and traj_ids[0] is not None:
+        have_sids = (
+            sids_tup is not None
+            and all(s is not None for s in sids_tup)
+        )
         traj_groups: dict[int, list[int]] = {}
         for i, tid in enumerate(traj_ids):
             if tid is not None:
@@ -1201,10 +1233,25 @@ def _forward_and_loss(
 
         pc_losses = []
         for tid, indices in traj_groups.items():
-            if len(indices) > 1:
-                traj_values = values[indices]
-                traj_outcome = v_targets[indices[0]]
-                pc_losses.append(path_consistency_loss(traj_values, traj_outcome))
+            if len(indices) < 2:
+                continue
+            if have_sids:
+                # Sort into forward temporal order (oldest position first).
+                indices = sorted(indices, key=lambda i: sids_tup[i])
+            else:
+                # Without sids we cannot recover order or parity; the
+                # consistency term would be unsound, so skip the whole
+                # trajectory (terminal-only is redundant with value_loss and
+                # adds no signal). Full PCZero requires the _sid field.
+                continue
+            traj_values = values[indices].float()
+            traj_sids = torch.tensor(
+                [sids_tup[i] for i in indices], device=device, dtype=torch.long
+            )
+            traj_outcome = v_targets[indices[-1]].float()
+            pc_losses.append(
+                path_consistency_loss(traj_values, traj_outcome, traj_sids)
+            )
         if pc_losses:
             pc_loss = torch.stack(pc_losses).mean()
             total_loss = total_loss + pc_loss_weight * pc_loss
@@ -3282,6 +3329,7 @@ class Trainer:
                             getattr(ex, 'horizon_targets', None),
                             getattr(ex, 'q_targets', None),
                             getattr(ex, 'q_visits', None),
+                            getattr(ex, '_sid', None),
                         ))
 
                 # ----- Forward / backward (sync-free; returns GPU tensors) -----
@@ -4713,10 +4761,18 @@ class Trainer:
             )
 
         # --- Edge feature weight norms ---
+        # Legacy (non-axis_relational) models project a 5-channel edge_attr through
+        # `edge_proj`; the per-channel column norm tracks feature adoption. The
+        # d6-invariant (axis_relational) architecture has no `edge_proj` — the 3
+        # axes are an edge-type partition consumed by a single tied conv and the
+        # unsigned hop distance is a per-hop embedding — so we emit the analog:
+        # per-hop distance-embedding norms and the global-relation edge-embed norm
+        # for each conv layer.
+        edge_names = ["q_axis", "r_axis", "diagonal", "signed_distance", "src_player"]
         if hasattr(rep, "edge_proj"):
             w = rep.edge_proj.weight.detach()  # (hidden_dim, 5)
             norms = w.norm(dim=0)
-            names = ["q_axis", "r_axis", "diagonal", "signed_distance", "src_player"]
+            names = edge_names[: w.shape[1]]
             for i, name in enumerate(names):
                 writer.add_scalar(
                     f"edge_features/weight_norm/{name}",
@@ -4728,70 +4784,124 @@ class Trainer:
                         "drifting to 0 mean a feature has been pruned."
                     ),
                 )
-
-        # --- Edge feature gradient attribution (small sample) ---
-        if hasattr(rep, "edge_proj"):
-            try:
-                model.eval()
-                total_grad = torch.zeros(rep.edge_proj.weight.shape[1], device=self.device)
-                node_dim = rep.input_proj.weight.shape[1]
-                total_node_grad = torch.zeros(node_dim, device=self.device)
-                count = 0
-
-                for data in self._analysis_sample_graphs(10):
-                    edge_attr = data.edge_attr.to(self.device).clone().requires_grad_(True)
-                    x = data.x.to(self.device).clone().requires_grad_(True)
-                    policy, value = model(
-                        x,
-                        data.edge_index.to(self.device),
-                        data.legal_mask.to(self.device),
-                        data.stone_mask.to(self.device),
-                        edge_attr=edge_attr,
+        elif rep.axis_relational:
+            for li, conv in enumerate(rep.convs):
+                de = conv.dist_embed.weight.detach()  # (window, edge_dim)
+                for d in range(de.shape[0]):
+                    writer.add_scalar(
+                        f"edge_features/weight_norm/dist_hop_{d + 1}/layer_{li}",
+                        de[d].norm().item(),
+                        step,
+                        description=(
+                            "L2 norm of the per-hop distance-embedding row for hop "
+                            f"{d + 1} in conv layer {li}. The d6-invariant analog of the "
+                            "legacy per-channel edge weight norm: the axes share one tied "
+                            "conv, so edge-importance lives in the distance embedding and "
+                            "the global-relation embed (see edge_features/weight_norm/global)."
+                        ),
                     )
-                    (policy.sum() + value.sum()).backward()
-                    if edge_attr.grad is not None:
-                        total_grad += edge_attr.grad.abs().mean(dim=0)
-                        count += 1
-                    if x.grad is not None:
-                        total_node_grad += x.grad.abs().mean(dim=0)
-                    model.zero_grad()
+                if getattr(conv, "global_edge_embed", None) is not None:
+                    writer.add_scalar(
+                        f"edge_features/weight_norm/global/layer_{li}",
+                        conv.global_edge_embed.detach().norm().item(),
+                        step,
+                        description=(
+                            f"L2 norm of the global-relation edge embedding in conv layer "
+                            f"{li} (the d6-invariant analog of the legacy src_player/global "
+                            "edge-feature channel). Growth tracks adoption of the global "
+                            "(dummy-axis) relation."
+                        ),
+                    )
 
-                if count > 0:
-                    mean_grad = total_grad / count
-                    for i, name in enumerate(names):
-                        writer.add_scalar(
-                            f"edge_features/gradient/{name}",
-                            mean_grad[i].item(),
-                            step,
-                            description=(
-                                "Mean absolute gradient flowing into each edge-feature "
-                                "weight. Indicates which features are still being actively "
-                                "updated."
-                            ),
-                        )
-                    mean_node_grad = total_node_grad / count
-                    for i, name in enumerate(
-                        _node_feature_names(self.model_config)[:node_dim]
-                    ):
-                        writer.add_scalar(
-                            f"node_features/gradient/{name}",
-                            mean_node_grad[i].item(),
-                            step,
-                            description=(
-                                "Mean absolute gradient w.r.t. each node-feature input "
-                                "channel (same sampled positions as edge_features/gradient). "
-                                "How sensitive the output currently is to each feature."
-                            ),
-                        )
-            except Exception as e:
-                logger.debug("Edge gradient analysis failed: %s", e)
+        # --- Node/edge feature gradient attribution (small sample) ---
+        # Node-feature gradient is decoupled from `edge_proj` so it also fires
+        # for the d6-invariant (axis_relational) architecture, which has no
+        # per-channel edge projection. Edge-feature gradient
+        # (edge_features/gradient/*) is legacy-only: it requires a continuous
+        # edge_attr to differentiate, whereas axis_relational edges are a
+        # discrete (axis-type, hop-distance) pair. The model forward is called
+        # with every available edge field so it dispatches correctly for both
+        # the legacy (edge_attr) and lean (edge_type/edge_dist/global) schemas.
+        try:
+            model.eval()
+            node_dim = rep.input_proj.weight.shape[1]
+            total_node_grad = torch.zeros(node_dim, device=self.device)
+            total_edge_grad = None
+            if hasattr(rep, "edge_proj"):
+                total_edge_grad = torch.zeros(
+                    rep.edge_proj.weight.shape[1], device=self.device
+                )
+            count = 0
+
+            for data in self._analysis_sample_graphs(10):
+                x = data.x.to(self.device).clone().requires_grad_(True)
+                edge_attr = None
+                if (
+                    hasattr(rep, "edge_proj")
+                    and getattr(data, "edge_attr", None) is not None
+                ):
+                    edge_attr = data.edge_attr.to(self.device).clone().requires_grad_(True)
+                kw: dict = {"edge_attr": edge_attr}
+                for k in ("edge_type", "edge_dist", "global_edge_index"):
+                    v = getattr(data, k, None)
+                    if v is not None:
+                        kw[k] = v.to(self.device)
+                policy, value = model(
+                    x,
+                    data.edge_index.to(self.device),
+                    data.legal_mask.to(self.device),
+                    data.stone_mask.to(self.device),
+                    **kw,
+                )
+                (policy.sum() + value.sum()).backward()
+                if x.grad is not None:
+                    total_node_grad += x.grad.abs().mean(dim=0)
+                if (
+                    edge_attr is not None
+                    and edge_attr.grad is not None
+                    and total_edge_grad is not None
+                ):
+                    total_edge_grad += edge_attr.grad.abs().mean(dim=0)
+                    count += 1
+                model.zero_grad()
+
+            n_used = max(count, 1)
+            mean_node_grad = total_node_grad / n_used
+            for i, name in enumerate(
+                _node_feature_names(self.model_config)[:node_dim]
+            ):
+                writer.add_scalar(
+                    f"node_features/gradient/{name}",
+                    mean_node_grad[i].item(),
+                    step,
+                    description=(
+                        "Mean absolute gradient w.r.t. each node-feature input "
+                        "channel (sampled from on-policy buffer positions). How "
+                        "sensitive the output currently is to each feature."
+                    ),
+                )
+            if total_edge_grad is not None and count > 0:
+                mean_grad = total_edge_grad / count
+                for i, name in enumerate(edge_names[: mean_grad.shape[0]]):
+                    writer.add_scalar(
+                        f"edge_features/gradient/{name}",
+                        mean_grad[i].item(),
+                        step,
+                        description=(
+                            "Mean absolute gradient flowing into each edge-feature "
+                            "weight. Indicates which features are still being actively "
+                            "updated. Legacy (non-axis_relational) models only — the "
+                            "d6-invariant architecture has no per-channel edge projection."
+                        ),
+                    )
+        except Exception as e:
+            logger.debug("Node/edge gradient analysis failed: %s", e)
 
         # --- Per-layer contribution ---
         # Measure how much each GATv2Conv layer changes the representation
         # relative to the residual. ratio = ||conv_out|| / ||residual||
         # High ratio = layer is active. Near-zero = layer is a skip-through.
         try:
-            from hexo_a0.graph import game_to_axis_graph
             import random
 
             model.eval()
@@ -4805,26 +4915,48 @@ class Trainer:
                 game.apply_move(m[0], m[1])
 
             if not game.is_terminal():
-                data = game_to_axis_graph(
-                    game,
-                    prune_empty_edges=self.model_config.prune_empty_edges,
-                    threat_features=getattr(self.model_config, "threat_features", False),
-                    relative_stones=getattr(self.model_config, "relative_stone_encoding", False),
-                )
+                axis_rel = bool(getattr(self.model_config, "axis_relational", False))
+                # Use self.graph_fn (graph_fn_from_model_config) — the single
+                # source of truth for graph-construction flags — so the node
+                # schema matches rep.input_proj. The old direct
+                # game_to_axis_graph call omitted the lean node flags
+                # (compact_stone_onehot/node_coords/moves_scope), so an
+                # axis_relational model's input_proj (8-col lean) was handed the
+                # legacy 11-col node layout and this block silently no-op'd.
+                data = self.graph_fn(game)
                 x = data.x.to(self.device)
                 edge_index = data.edge_index.to(self.device)
                 edge_attr = data.edge_attr.to(self.device) if data.edge_attr is not None else None
+                edge_type = getattr(data, "edge_type", None)
+                edge_type = edge_type.to(self.device) if edge_type is not None else None
+                edge_dist = getattr(data, "edge_dist", None)
+                edge_dist = edge_dist.to(self.device) if edge_dist is not None else None
+                global_edge_index = getattr(data, "global_edge_index", None)
+                global_edge_index = (
+                    global_edge_index.to(self.device)
+                    if global_edge_index is not None
+                    else None
+                )
 
                 with torch.no_grad():
                     h = rep.input_proj(x)
                     projected_edge_attr = None
                     if hasattr(rep, "edge_proj") and edge_attr is not None:
                         projected_edge_attr = rep.edge_proj(edge_attr)
+                    if axis_rel and edge_dist is not None:
+                        # Mirror rep.forward's defensive clamp into the per-hop
+                        # embedding table's valid range [1, axis_window].
+                        edge_dist = edge_dist.long().clamp(1, rep.axis_window)
 
                     layer_scales = getattr(rep, "layer_scales", None)
                     for i, (conv, norm) in enumerate(zip(rep.convs, rep.norms)):
                         residual = h
-                        conv_out = conv(h, edge_index, edge_attr=projected_edge_attr)
+                        if axis_rel:
+                            conv_out = conv(
+                                h, edge_index, edge_type, edge_dist, global_edge_index
+                            )
+                        else:
+                            conv_out = conv(h, edge_index, edge_attr=projected_edge_attr)
                         # Measure contribution before residual addition
                         conv_norm = conv_out.norm().item()
                         res_norm = residual.norm().item()

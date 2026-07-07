@@ -303,3 +303,36 @@ class TestPathConsistencyLoss:
         outcome = torch.tensor(1.0)
         loss = path_consistency_loss(values, outcome)
         assert loss.item() == 0.0
+
+    def test_parity_aware_zero_when_alternating(self):
+        """Odd-gap (opponent) pairs that perfectly cancel → ~0 consistency."""
+        from hexo_a0.loss import path_consistency_loss
+        # sids 0..3, perfectly alternating values; last position's own label = -1.
+        values = torch.tensor([1.0, -1.0, 1.0, -1.0])
+        sids = torch.tensor([0, 1, 2, 3])
+        outcome = torch.tensor(-1.0)  # terminal (sid 3) mover's value_target
+        loss = path_consistency_loss(values, outcome, sids)
+        assert loss.item() < 1e-6
+
+    def test_parity_aware_ignores_even_gap_pairs(self):
+        """Same-mover (even-gap) positions with equal values must NOT be
+        penalised — the old consecutive code would have paired them."""
+        from hexo_a0.loss import path_consistency_loss
+        # Two even-sid positions, both +1 (same mover, agreeing). No odd-sid
+        # positions → consistency term skipped; only the terminal term remains.
+        values = torch.tensor([1.0, 1.0])
+        sids = torch.tensor([0, 2])
+        outcome = torch.tensor(1.0)  # terminal (sid 2) label
+        loss = path_consistency_loss(values, outcome, sids)
+        assert loss.item() < 1e-6
+
+    def test_parity_aware_nonzero_when_inconsistent(self):
+        """Opposite-mover pairs that fail to cancel → nonzero consistency."""
+        from hexo_a0.loss import path_consistency_loss
+        # sid 0 (+1) and sid 1 (+1) are opposite movers but both predict +1 →
+        # their sum is 2, which should be penalised.
+        values = torch.tensor([1.0, 1.0])
+        sids = torch.tensor([0, 1])
+        outcome = torch.tensor(1.0)
+        loss = path_consistency_loss(values, outcome, sids)
+        assert loss.item() > 0.1

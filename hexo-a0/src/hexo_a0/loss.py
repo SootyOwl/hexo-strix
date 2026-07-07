@@ -162,28 +162,57 @@ def alphazero_loss(
     return total, {"policy_loss": policy_loss, "value_loss": value_loss}
 
 
-def path_consistency_loss(values: torch.Tensor, outcome: torch.Tensor) -> torch.Tensor:
+def path_consistency_loss(
+    values: torch.Tensor, outcome: torch.Tensor, sids: torch.Tensor | None = None
+) -> torch.Tensor:
     """Temporal consistency loss along a game trajectory.
 
     Penalizes value predictions that are inconsistent with each other
     and with the final outcome. Based on PCZero (Zhao et al., 2022).
 
     Args:
-        values: 1-D tensor of value predictions at each position in a trajectory.
-        outcome: scalar ground-truth outcome (+1/-1/0).
+        values: 1-D tensor of value predictions at each position in a trajectory,
+            ordered by game position (oldest first). When ``sids`` is given the
+            caller must sort both ``values`` and ``sids`` into that order.
+        outcome: scalar ground-truth outcome for the *last* position in
+            ``values`` (+1/-1/0, side-to-move-relative — i.e. that position's
+            own ``value_target``).
+        sids: optional 1-D tensor of per-position insertion ids, aligned with
+            ``values``. Games are added via ``ReplayBuffer.add_many`` in
+            temporal order, so the insertion id is a proxy for the within-game
+            move index and its parity tracks which player is to move. When
+            provided, the consistency term pairs positions with an ODD sid gap
+            (opponent perspective: v[t] + v[t+odd] ≈ 0) and ignores even-gap
+            pairs (same mover: v[t] + v[t+even] ≈ 2·v, penalising which would
+            punish correct predictions). Without ``sids`` the term falls back
+            to the consecutive-pairs assumption, which is only sound when
+            ``values`` are truly consecutive game positions.
 
     Returns:
-        Scalar loss: MSE between consecutive value differences and zero,
-        plus MSE between final prediction and outcome.
+        Scalar loss: consistency term + terminal term (last prediction vs
+        outcome).
     """
     if values.numel() <= 1:
         return torch.tensor(0.0, device=values.device)
 
-    # Consecutive consistency: v[t] and v[t+1] should be close (sign-flipped for alternating players)
-    diffs = values[1:] + values[:-1]  # sum because players alternate: v_opponent ~ -v_self
-    consistency = (diffs ** 2).mean()
+    if sids is not None:
+        # Parity-aware consistency for a (possibly gapped) sampled subset:
+        # pair every even-sid position with every odd-sid position. These are
+        # opposite-mover positions, so their values should sum to ~0.
+        even = (sids % 2) == 0
+        odd = ~even
+        if bool(even.any()) and bool(odd.any()):
+            sums = values[even].unsqueeze(1) + values[odd].unsqueeze(0)
+            consistency = (sums ** 2).mean()
+        else:
+            consistency = torch.zeros((), device=values.device)
+    else:
+        # Consecutive consistency: v[t] and v[t+1] should be close (sign-flipped
+        # for alternating players). Only sound for truly consecutive positions.
+        diffs = values[1:] + values[:-1]  # sum because players alternate: v_opponent ~ -v_self
+        consistency = (diffs ** 2).mean()
 
-    # Terminal consistency: last prediction should match outcome
+    # Terminal consistency: last prediction should match outcome.
     terminal = (values[-1] - outcome) ** 2
 
     return consistency + terminal

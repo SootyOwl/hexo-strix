@@ -35,9 +35,17 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CORPUS = REPO_ROOT / "data" / "corpus" / "hexo_human_corpus.jsonl"
 DEFAULT_RESULTS = REPO_ROOT / "data" / "corpus" / "eval_results.jsonl"
+# Pinned to a specific HF revision, NOT `main`: the corpus eval deliberately
+# stays on the 6,902-game `54fae7ae…` corpus for comparability with historical
+# runs (jkcat-rel2 s1–s3, lean-d6-qhead, …). HF `main` was regenerated on
+# 2026-07-07 to a newer, larger 8,698-game corpus (`b2fe61eb…`); pinning the
+# revision keeps `ensure_corpus` downloads on the canonical version regardless
+# of `main` drifting. To adopt the new corpus, update CORPUS_REVISION (→ the
+# new commit, or `main`) AND CORPUS_SHA256 together.
+CORPUS_REVISION = "e685b34eddeef1dbea29fe4e13c13cf33cf26d45"
 CORPUS_URL = (
     "https://huggingface.co/datasets/timmyburn/hexo-bootstrap-corpus"
-    "/resolve/main/hexo_human_corpus.jsonl"
+    f"/resolve/{CORPUS_REVISION}/hexo_human_corpus.jsonl"
 )
 CORPUS_SHA256 = "54fae7aebcef2a9d19d13c1946fae36c0565e21bc726c25e2e4e230cfb42a5b7"
 
