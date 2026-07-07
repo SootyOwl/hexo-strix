@@ -42,7 +42,7 @@ def is_own_dead(cell, player, stones_by_coord, win_length):
 
 def classify_position(state):
     cfg = state.config()
-    win_length = cfg.win_length()
+    win_length = cfg.win_length
     stones = state.placed_stones()  # list of ((q,r), "p1"/"p2")
     stones_by_coord = {c: p for c, p in stones}
     legal = set(state.legal_moves())

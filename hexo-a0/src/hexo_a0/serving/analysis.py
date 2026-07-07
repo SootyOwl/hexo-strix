@@ -220,7 +220,6 @@ def _scan_threats(data, legal_coords, probs, *, current_player, relative_stones)
     P1 and col1 is P2; under ``relative_stone_encoding`` col0 is the side to move
     (``current_player``) and col1 is the opponent.
     """
-    AXES = [(1, 0), (0, 1), (1, -1)]
     features = data.x
     if relative_stones:
         own = current_player
@@ -235,6 +234,16 @@ def _scan_threats(data, legal_coords, probs, *, current_player, relative_stones)
                 stone_sets[own].add(c)
             elif features[i, 1] > 0.5:
                 stone_sets[opp].add(c)
+    return _threats_from_stone_sets(stone_sets, legal_coords, probs)
+
+
+def _threats_from_stone_sets(stone_sets, legal_coords, probs):
+    """Shared 3+-in-a-row open-threat walk over pre-bucketed stone sets.
+
+    ``stone_sets`` maps owner-label -> set of (q, r); ``legal_coords`` is the
+    move ordering ``probs`` is indexed in.
+    """
+    AXES = [(1, 0), (0, 1), (1, -1)]
     legal_set = set(tuple(c) for c in legal_coords)
     legal_list = [tuple(c) for c in legal_coords]
 
@@ -266,6 +275,19 @@ def _scan_threats(data, legal_coords, probs, *, current_player, relative_stones)
                         extensions=exts,
                     ))
     return threats
+
+
+def _scan_threats_from_state(state, legal_coords, probs, *, current_player, relative_stones):
+    """Torch-free threat scan: buckets stones from state.placed_stones()."""
+    if relative_stones:
+        own, opp = current_player, ("P2" if current_player == "P1" else "P1")
+    else:
+        own, opp = "P1", "P2"
+    own_abs = current_player if relative_stones else "P1"
+    stone_sets = {own: set(), opp: set()}
+    for (q, r), p in state.placed_stones():
+        stone_sets[own if p == own_abs else opp].add((int(q), int(r)))
+    return _threats_from_stone_sets(stone_sets, legal_coords, probs)
 
 
 def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
