@@ -7,7 +7,10 @@ set -eu
 
 if [ ! -f "$HEXO_CHECKPOINT" ]; then
     echo "FATAL: checkpoint not found at $HEXO_CHECKPOINT" >&2
-    echo "       mount one, e.g. -v \$PWD/champion.pt:/models/champion.pt:ro,Z" >&2
+    echo "       This image serves torch-free, so mount a .safetensors (NOT a .pt):" >&2
+    echo "         -v \$PWD/champion.safetensors:/models/champion.safetensors:ro,Z" >&2
+    echo "       Produce one from a champion checkpoint on a torch-capable box:" >&2
+    echo "         hexo-a0 export --checkpoint champion.pt --out champion.safetensors" >&2
     exit 1
 fi
 if [ ! -r "$HEXO_CHECKPOINT" ]; then

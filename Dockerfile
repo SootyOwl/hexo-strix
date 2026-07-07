@@ -2,19 +2,26 @@
 #
 # HeXO serving image — the `hexo-a0 serve` public play/analysis server.
 #
-# Serving-only: it needs the PyO3 module (hexo_rs, built WITHOUT the `torch`
-# Rust feature) plus Python torch — NOT the native self_play binary or libtorch —
-# so the whole ROCm/LD_PRELOAD crash surface is avoided. CPU torch by default,
-# which is the only option on aarch64 (Ampere/Oracle Cloud) anyway.
+# Serving-only and TORCH-FREE: it needs just the PyO3 module (hexo_rs, built
+# WITHOUT the `torch` Rust feature) — serving runs the pure-Rust
+# hexo_rs.InferModel over a safetensors checkpoint, so NO Python torch, no
+# torch-geometric, no libtorch, and none of the ROCm/LD_PRELOAD crash surface.
+# Dropping the ~742 MB CPU torch wheel is the point. The checkpoint must be a
+# `.safetensors` (torch-free code can't torch.load a `.pt` pickle); produce one
+# from a champion with `hexo-a0 export --checkpoint champion.pt --out champ.safetensors`.
+#
+# (A torch serving fallback still exists for dev via `uv run hexo-a0 serve` on a
+# .pt, but it is deliberately NOT containerized. To build a torch image anyway:
+# `--build-arg TORCH_GROUP=cpu` — pulls the torch stack via the `train` extra.)
 #
 # Build ON the target host (native) — recommended for the arm64 box:
 #   docker build -t hexo-serve .
-# Or cross-build from x86 (slower; QEMU emulates the Rust + torch install):
+# Or cross-build from x86 (slower; QEMU emulates the Rust build):
 #   docker buildx build --platform linux/arm64 -t hexo-serve .
 #
-# Run (mount the checkpoint + a data volume for the SQLite files):
+# Run (mount the safetensors checkpoint + a data volume for the SQLite files):
 #   docker run -d --name hexo -p 8080:8080 \
-#     -v /path/to/champion.pt:/models/champion.pt:ro,Z \
+#     -v /path/to/champ.safetensors:/models/champion.safetensors:ro,Z \
 #     -v hexo-data:/data \
 #     -e HEXO_ADMIN_TOKEN=changeme \
 #     hexo-serve
@@ -46,25 +53,26 @@ ENV PATH="/root/.cargo/bin:${PATH}" \
 
 WORKDIR /app
 
-# Torch backend. Default `cpu` pulls lean CPU-only wheels (no CUDA/ROCm libs)
-# from the pinned pytorch-cpu index — the CPU wheels cover BOTH linux x86_64 and
-# aarch64, so the same image builds on your dev box and the ARM host. Override
-# with `--build-arg TORCH_GROUP=rocm` (etc.) or `=""` for the plain-PyPI torch.
-ARG TORCH_GROUP=cpu
+# Torch backend. Default `""` = TORCH-FREE: serving runs the pure-Rust
+# hexo_rs.InferModel, so no torch is installed and the image is ~742 MB leaner.
+# To build a torch serving image anyway, pass `--build-arg TORCH_GROUP=cpu`
+# (or rocm/cuda) — that selects the backend group AND pulls hexo-a0's `train`
+# extra (torch + torch-geometric) so the torch eval/analysis path is complete.
+ARG TORCH_GROUP=""
 
 # --- Phase 1: third-party dependencies only ---------------------------------
 # Copy just the lockfile + every workspace member's pyproject (small, rarely
-# change). --no-install-workspace builds NONE of our code, so this heavy layer —
-# torch, torch-geometric, tensorboard, … — is cached and only re-runs when the
-# lock or a pyproject changes, NOT when Python/JS/Rust source does. The torch
-# backend groups live at the workspace ROOT (matching `just sync`), so we select
-# --group cpu here rather than scoping to a member with --package.
+# change). --no-install-workspace builds NONE of our code, so this heavy layer
+# is cached and only re-runs when the lock or a pyproject changes, NOT when
+# Python/JS/Rust source does. With TORCH_GROUP="" this installs no torch at all;
+# a non-empty group adds `--group $TORCH_GROUP --all-extras` (the torch stack
+# lives in the ROOT backend group + hexo-a0's `train` extra).
 #   --no-dev → no pytest
 COPY pyproject.toml uv.lock ./
 COPY hexo-a0/pyproject.toml hexo-a0/
 COPY hexo-rs/pyproject.toml hexo-rs/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP"; \
+    GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP --all-extras"; \
     uv sync --frozen --no-dev --no-install-workspace $GRP
 
 # --- Phase 2: build + install our workspace members -------------------------
@@ -90,7 +98,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     else \
         export RUSTFLAGS="-C target-cpu=x86-64-v3"; \
     fi; \
-    GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP"; \
+    GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP --all-extras"; \
     uv sync --frozen --no-dev --no-editable $GRP
 
 # Fail the build early if the static assets weren't packaged into the venv.
@@ -102,10 +110,12 @@ RUN test -n "$(find /app/.venv -type d -name static -path '*serving*' -print -qu
 ########################################
 FROM python:3.13-slim-bookworm AS runtime
 
-# libgomp1: OpenMP runtime that the torch CPU wheel links against.
 # tini: correct signal handling / zombie reaping for the long-lived server.
+# No libgomp1: the torch-free default only links libgcc_s (in the base image);
+# hexo_rs pulls in no OpenMP. A `--build-arg TORCH_GROUP=...` torch build should
+# re-add `libgomp1` here if its torch wheel needs system OpenMP.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 tini \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user owning the writable mounts.
@@ -124,7 +134,7 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     # ---- serving config (override with `docker run -e NAME=value`) ----
     HEXO_CONFIG=/app/configs/curriculum.toml \
-    HEXO_CHECKPOINT=/models/champion.pt \
+    HEXO_CHECKPOINT=/models/champion.safetensors \
     HEXO_DB=/data/games.sqlite \
     HEXO_PORT=8080 \
     HEXO_BIND=0.0.0.0 \
