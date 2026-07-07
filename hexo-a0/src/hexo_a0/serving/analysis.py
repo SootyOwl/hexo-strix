@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import math
 
 from hexo_a0.serving.model import make_graph_fn
+from hexo_a0.serving.nativeutil import softmax
 
 
 # Forcing-solver (VCF) budgets for the analysis display.
@@ -374,18 +375,25 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
             current_player=None,
         )
 
-    data = make_graph_fn(model_config)(state)
-
-    import torch
-    with torch.no_grad():
-        raw_logits, raw_value = model(
-            data.x, data.edge_index, data.legal_mask,
-            stone_mask=data.stone_mask,
-            edge_attr=getattr(data, "edge_attr", None),
-        )
-    logits_list = raw_logits.tolist()
-    value = float(raw_value.item())
-    legal_coords = data.coords[data.legal_mask].tolist()
+    native = getattr(model, "_hexo_native", None)
+    if native is not None:
+        logit_map, raw_value = native.forward(state)
+        legal_coords = [list(c) for c in state.legal_moves()]
+        logits_list = [logit_map[(int(q), int(r))] for q, r in legal_coords]
+        value = float(raw_value)
+        data = None
+    else:
+        data = make_graph_fn(model_config)(state)
+        import torch
+        with torch.no_grad():
+            raw_logits, raw_value = model(
+                data.x, data.edge_index, data.legal_mask,
+                stone_mask=data.stone_mask,
+                edge_attr=getattr(data, "edge_attr", None),
+            )
+        logits_list = raw_logits.tolist()
+        value = float(raw_value.item())
+        legal_coords = data.coords[data.legal_mask].tolist()
 
     q_hat = None
     improved_pol = None
@@ -394,8 +402,8 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
     # ``candidate_set`` are indexed in. The frontend maps legal[i] -> probs[i],
     # so these MUST share an ordering. In the MCTS branch the diagnostic arrays
     # come back in ``state.legal_moves()`` order, not graph-builder order, so we
-    # use that; in the raw branch we use graph-builder order (which the logits
-    # match after filtering).
+    # use that; in the raw branch we use graph-builder order (torch) or
+    # legal_moves order (native) — both aligned to logits_list.
     legal_out = legal_coords
 
     if mcts_sims > 0 and not state.is_terminal():
@@ -423,23 +431,33 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
         candidate_set = (candidate_set + [False] * max(0, n_legal - len(candidate_set)))[:n_legal]
         legal_out = mcts_legal
     else:
-        probs_t = torch.softmax(raw_logits, dim=-1)
-        # Some heads return [N, 1] logits; squeeze so probs is a flat list (a
-        # nested list would crash _scan_threats' float(probs[idx])).
-        if probs_t.dim() > 1:
-            probs_t = probs_t.squeeze(-1)
-        # HeXONet may return either legal-only or all-node logits; mask to the
-        # legal nodes when the logits cover the full graph so probs[i] lines up
-        # with legal_coords[i] (mirrors _pick_move's shape handling).
-        if probs_t.shape[0] == data.x.shape[0]:
-            probs = probs_t[data.legal_mask].tolist()
+        if native is not None:
+            probs = softmax(logits_list)
         else:
-            probs = probs_t.tolist()
+            import torch
+            probs_t = torch.softmax(raw_logits, dim=-1)
+            # Some heads return [N, 1] logits; squeeze so probs is a flat list
+            # (a nested list would crash _scan_threats' float(probs[idx])).
+            if probs_t.dim() > 1:
+                probs_t = probs_t.squeeze(-1)
+            # HeXONet may return either legal-only or all-node logits; mask to
+            # the legal nodes when the logits cover the full graph so probs[i]
+            # lines up with legal_coords[i] (mirrors _pick_move's shape
+            # handling).
+            if probs_t.shape[0] == data.x.shape[0]:
+                probs = probs_t[data.legal_mask].tolist()
+            else:
+                probs = probs_t.tolist()
 
     relative = bool(getattr(model_config, "relative_stone_encoding", False))
-    threats = _scan_threats(data, legal_out, probs,
-                            current_player=state.current_player(),
-                            relative_stones=relative)
+    if data is not None:
+        threats = _scan_threats(data, legal_out, probs,
+                                current_player=state.current_player(),
+                                relative_stones=relative)
+    else:
+        threats = _scan_threats_from_state(state, legal_out, probs,
+                                           current_player=state.current_player(),
+                                           relative_stones=relative)
     forcing = _solve_forcing(state, forcing_depth_cap, forcing_node_budget)
     return AnalysisResult(
         legal=[list(c) for c in legal_out],

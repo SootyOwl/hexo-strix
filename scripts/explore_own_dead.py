@@ -1,20 +1,20 @@
 """Exploratory measurement: own-dead node prevalence in axis-window graphs.
 
 This script is throwaway analysis to inform a pruning design, not part of
-production code. It plays random games and classifies stones / empty cells as
-own-dead for their controlling player.
+production code. It reads real positions from games.analysis.sqlite and
+classifies stones / empty cells as own-dead for their controlling player.
 
 Run: uv run --no-sync python scripts/explore_own_dead.py
 """
 from __future__ import annotations
 
-import random
+import json
+import sqlite3
 from collections import Counter
 from statistics import mean, median
 
-import hexo_rs
-
 WIN_AXES = [(1, 0), (0, 1), (1, -1)]
+WIN_LENGTH = 6
 
 
 def is_own_dead(cell, player, stones_by_coord, win_length):
@@ -23,10 +23,9 @@ def is_own_dead(cell, player, stones_by_coord, win_length):
     The board is treated as infinite / sparse: any cell not occupied by an
     opponent stone is empty, and empties are potential future own stones.
     """
-    opp = "p2" if player == "p1" else "p1"
+    opp = "P2" if player == "P1" else "P1"
     cq, cr = cell
     for dq, dr in WIN_AXES:
-        # Cell can sit at any offset 0..W-1 within the window.
         for offset in range(win_length):
             clear = True
             for step in range(win_length):
@@ -40,12 +39,10 @@ def is_own_dead(cell, player, stones_by_coord, win_length):
     return True
 
 
-def classify_position(state):
-    cfg = state.config()
-    win_length = cfg.win_length
-    stones = state.placed_stones()  # list of ((q,r), "p1"/"p2")
+def classify_entry(entry):
+    stones = [((q, r), p) for [q, r], p in entry["stones"]]
     stones_by_coord = {c: p for c, p in stones}
-    legal = set(state.legal_moves())
+    legal = set(tuple(c) for c in entry["legal"])
 
     p1_dead_stones = 0
     p2_dead_stones = 0
@@ -55,14 +52,14 @@ def classify_position(state):
     alive_empty = 0
 
     for c, p in stones:
-        if p == "p1" and is_own_dead(c, "p1", stones_by_coord, win_length):
+        if p == "P1" and is_own_dead(c, "P1", stones_by_coord, WIN_LENGTH):
             p1_dead_stones += 1
-        if p == "p2" and is_own_dead(c, "p2", stones_by_coord, win_length):
+        if p == "P2" and is_own_dead(c, "P2", stones_by_coord, WIN_LENGTH):
             p2_dead_stones += 1
 
     for c in legal:
-        d1 = is_own_dead(c, "p1", stones_by_coord, win_length)
-        d2 = is_own_dead(c, "p2", stones_by_coord, win_length)
+        d1 = is_own_dead(c, "P1", stones_by_coord, WIN_LENGTH)
+        d2 = is_own_dead(c, "P2", stones_by_coord, WIN_LENGTH)
         if d1 and d2:
             both_dead_empty += 1
         elif d1:
@@ -81,30 +78,23 @@ def classify_position(state):
         "p1_only_dead_empty": p1_only_dead_empty,
         "p2_only_dead_empty": p2_only_dead_empty,
         "alive_empty": alive_empty,
+        "model": entry.get("model", "?"),
     }
 
 
-def play_random_game(seed):
-    rng = random.Random(seed)
-    state = hexo_rs.GameState()
-    positions = []
-    while not state.is_terminal():
-        positions.append((state.clone(), classify_position(state)))
-        moves = state.legal_moves()
-        if not moves:
-            break
-        q, r = rng.choice(moves)
-        state.apply_move(q, r)
-    return positions
+def main():
+    conn = sqlite3.connect("/var/home/tyto/Development/personal/hexo-strix/games.analysis.sqlite")
+    rows = conn.execute("SELECT entry, model, sims FROM positions").fetchall()
+    conn.close()
 
-
-def main(n_games=200):
     stats = []
-    for seed in range(n_games):
-        for _, cls in play_random_game(seed):
-            stats.append(cls)
+    for entry_json, model, sims in rows:
+        entry = json.loads(entry_json)
+        entry["model"] = model
+        stats.append(classify_entry(entry))
 
     print(f"Positions sampled: {len(stats)}")
+    print(f"Models: {sorted(set(s['model'] for s in stats))}")
     print()
     print("Node counts (median / mean)")
     for k in ["n_stones", "n_legal"]:
@@ -129,7 +119,6 @@ def main(n_games=200):
         print(f"  {k:20s}: median={median(abs_vals):5.1f} ({median(ratios):5.1f}%)")
     print()
 
-    # Estimated graph-node pruning impact if we remove own-dead stones + both-dead empties.
     total_nodes = sum(s["n_stones"] + s["n_legal"] for s in stats)
     prunable = sum(
         s["p1_dead_stones"]
@@ -139,7 +128,6 @@ def main(n_games=200):
     )
     print(f"Rough prunable real nodes: {prunable}/{total_nodes} ({prunable/total_nodes*100:.1f}%)")
 
-    # Per-position breakdown bucketed by total stones.
     print("\nBy stone count bucket (median prunable-node share):")
     buckets = Counter()
     bucket_prune = Counter()
