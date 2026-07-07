@@ -128,6 +128,33 @@ def _attach_native(model, ckpt, checkpoint_path):
             "native search engine unavailable (%s); torch eval path in use", e)
 
 
+def load_native_model(checkpoint: str):
+    """Load a safetensors checkpoint into the pure-Rust engine — no torch.
+
+    Returns ``(model, model_config, meta)`` with the same arity as
+    ``load_model``. ``model`` is a ``NativeModel`` shim carrying
+    ``._hexo_native``; ``model_config`` is resolved from the safetensors
+    ``__metadata__`` (authoritative for graph flags); ``meta`` is the parsed
+    metadata dict. Builds NO ``HeXONet`` and imports no torch.
+    """
+    import json
+    import hexo_rs
+    from hexo_a0.config import model_config_from_checkpoint
+    from hexo_a0.serving.nativeutil import NativeModel
+
+    with open(checkpoint, "rb") as f:
+        blob = f.read()
+    infer = hexo_rs.InferModel(blob)
+    meta = json.loads(infer.metadata_json())
+    mc_json = meta.get("model_config")
+    mc_dict = json.loads(mc_json) if isinstance(mc_json, str) else mc_json
+    if not isinstance(mc_dict, dict):
+        raise ValueError(
+            f"safetensors {checkpoint!r} has no usable model_config metadata")
+    mc = model_config_from_checkpoint({"model_config": mc_dict})
+    return NativeModel(infer), mc, meta
+
+
 def make_graph_fn(mc):
     """Per-state graph builder threading all graph flags from the model config."""
     _ensure_imports()
