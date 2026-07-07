@@ -257,14 +257,17 @@ def make_bot_turn_fn(
     The closure mutates ``rec.state`` and ``rec.move_log`` in place. Caller must
     already hold ``rec.lock``; the guard serializes the actual GPU work.
     """
-    import torch
-    from torch_geometric.data import Batch
     import hexo_rs as hr
 
     forcing_depth_map = difficulty_forcing_depth or DEFAULT_DIFFICULTY_FORCING_DEPTH
-    graph_fn = make_graph_fn(model_config)
 
     def _eval_fn(states):
+        # Torch-only leaf evaluator (native path uses _pick_move's native
+        # branch and never reaches here) — import torch + build the graph
+        # builder lazily so the native serve path never loads torch.
+        import torch
+        from torch_geometric.data import Batch
+        graph_fn = make_graph_fn(model_config)
         data_list = [graph_fn(s) for s in states]
         batch = Batch.from_data_list(data_list).to("cpu")
         with torch.inference_mode():
@@ -315,6 +318,9 @@ def make_bot_turn_fn(
                     raise RuntimeError("no legal moves within restrict_to")
             q, r = max(coords, key=lambda c: logit_map[c])
             return (int(q), int(r))
+        # Torch fallback (native returned above): build graph + import torch lazily.
+        import torch
+        graph_fn = make_graph_fn(model_config)
         data = graph_fn(state)
         with torch.no_grad():
             logits, _ = model(
