@@ -3,7 +3,8 @@
 # This pulls the prebuilt image from GHCR (no local build / no repo needed on the
 # host). One-time host setup:
 #   1) docker login ghcr.io                     # PAT with read:packages
-#   2) copy a checkpoint onto the box, make it readable:  chmod a+r champion.pt
+#   2) put a .safetensors checkpoint on the box, readable:  chmod a+r champion.safetensors
+#      (the image is torch-free and can't load a .pt; `just deploy <ckpt>` exports one)
 #   3) create a .env next to this file (see .env.example) with at least
 #      HEXO_ADMIN_TOKEN and HEXO_CHECKPOINT_HOST
 #   4) docker compose up -d      (then: docker compose logs -f)
@@ -39,16 +40,17 @@ services:
       # logs survive container recreation (docker's own logs do not). The
       # bot-placement timing lines land here. Set empty to disable.
       HEXO_LOG_FILE: "${HEXO_LOG_FILE:-/data/logs/serve.log}"
-      # Pure-Rust inference engine for bot moves ("0"/"false"/"off" -> torch
-      # eval path). A/B lever: on the x86 dev box the Rust kernel measured
-      # ~1.3x SLOWER than torch for serving MCTS — compare on this host via
-      # the placement timing logs before trusting the default.
+      # NOTE: this image is torch-free and serves a .safetensors, which ALWAYS
+      # uses the pure-Rust engine — HEXO_NATIVE_INFER has no effect here (its
+      # "0" torch-eval fallback only applies to a .pt loaded in a torch build).
+      # Left in for a torch image built with `--build-arg TORCH_GROUP=...`.
       HEXO_NATIVE_INFER: "${HEXO_NATIVE_INFER:-1}"
 
     volumes:
-      # Trained checkpoint, read-only. ",Z" relabels it for SELinux (Oracle Linux
-      # runs SELinux enforcing); the file must also be world-readable (chmod a+r).
-      - "${HEXO_CHECKPOINT_HOST:?set HEXO_CHECKPOINT_HOST in .env}:/models/champion.pt:ro,Z"
+      # Trained checkpoint (.safetensors), read-only. ",Z" relabels it for SELinux
+      # (Oracle Linux runs SELinux enforcing); the file must also be world-readable
+      # (chmod a+r). Mount target matches the image's default HEXO_CHECKPOINT.
+      - "${HEXO_CHECKPOINT_HOST:?set HEXO_CHECKPOINT_HOST in .env}:/models/champion.safetensors:ro,Z"
       # Persistent SQLite: games history + analysis cache (survives restarts).
       - hexo-data:/data
 

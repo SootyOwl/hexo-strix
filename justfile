@@ -33,11 +33,27 @@ image-push tag="arm64":
 
 # Ship a checkpoint + deploy files to the Oracle box (Ubuntu). Usage:
 #   just deploy runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/self_play/champion.pt
-# --chmod=Fa+r makes the transferred files world-readable on the box, so the
-# non-root container (uid 10001) can read the checkpoint (they're 0600 at rest).
-# Then on the box: cp .env.example .env, fill it in, `docker compose up -d`.
+# The serving image is torch-free and loads a .safetensors, so a .pt checkpoint
+# is exported to champion.safetensors first (via `hexo-a0 export`, which needs
+# torch — runs here on the dev box, not on the ARM host). Pass an already-exported
+# .safetensors to skip that step. --chmod=Fa+r makes the transferred files
+# world-readable on the box so the non-root container (uid 10001) can read them
+# (they're 0600 at rest). Then on the box: cp .env.example .env, fill it in,
+# `docker compose up -d`.
 deploy checkpoint:
-    rsync -avz --progress --chmod=Fa+r {{checkpoint}} .env.example compose.yaml ubuntu@oracle:/home/ubuntu/hexo-serve/
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    case "{{checkpoint}}" in
+      *.safetensors)
+        echo "-> {{checkpoint}} is already safetensors; shipping as-is..."
+        cp "{{checkpoint}}" "$tmp/champion.safetensors" ;;
+      *)
+        echo "-> exporting {{checkpoint}} -> champion.safetensors (torch-free serving format)..."
+        uv run --no-sync hexo-a0 export --checkpoint "{{checkpoint}}" --out "$tmp/champion.safetensors" ;;
+    esac
+    echo "-> rsyncing to oracle..."
+    rsync -avz --progress --chmod=Fa+r "$tmp/champion.safetensors" .env.example compose.yaml ubuntu@oracle:/home/ubuntu/hexo-serve/
 
 # Import an existing games DB into the Oracle deployment's /data volume.
 # WAL-safe online snapshot (the source server can stay up) -> scp -> load into the
