@@ -27,6 +27,7 @@ set -- hexo-a0 serve \
     --port "$HEXO_PORT" \
     --bind "$HEXO_BIND" \
     --mcts-sims "$HEXO_MCTS_SIMS" \
+    --max-moves "$HEXO_MAX_MOVES" \
     --model-label "$HEXO_MODEL_LABEL"
 
 [ -n "${HEXO_URL_PREFIX:-}" ] && set -- "$@" --url-prefix "$HEXO_URL_PREFIX"

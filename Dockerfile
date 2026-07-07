@@ -149,6 +149,7 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     HEXO_PORT=8080 \
     HEXO_BIND=0.0.0.0 \
     HEXO_MCTS_SIMS=64 \
+    HEXO_MAX_MOVES=400 \
     HEXO_MODEL_LABEL=hexo \
     HEXO_URL_PREFIX="" \
     HEXO_ADMIN_TOKEN="" \

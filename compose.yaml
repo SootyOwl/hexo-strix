@@ -26,6 +26,8 @@ services:
     environment:
       # MCTS sims per bot stone (strength vs latency). 64 is a good CPU default.
       HEXO_MCTS_SIMS: "${HEXO_MCTS_SIMS:-64}"
+      # Draw declared after this many total placements (game length cap).
+      HEXO_MAX_MOVES: "${HEXO_MAX_MOVES:-400}"
       # Stable stats label; keep it fixed across checkpoint swaps.
       HEXO_MODEL_LABEL: "${HEXO_MODEL_LABEL:-hexo}"
       # Set to e.g. /hexo when serving under a path prefix behind a proxy.
