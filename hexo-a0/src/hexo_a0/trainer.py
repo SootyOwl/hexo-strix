@@ -152,7 +152,8 @@ def _resync_binary(fh) -> bool:
         i05 = buf.find(b"HX05")
         i06 = buf.find(b"HX06")
         i07 = buf.find(b"HX07")
-        candidates = [i for i in (i03, i04, i05, i06, i07) if i >= 0]
+        i08 = buf.find(b"HX08")
+        candidates = [i for i in (i03, i04, i05, i06, i07, i08) if i >= 0]
         if candidates:
             idx = min(candidates)
             fh.seek(fh.tell() - len(buf) + idx)
@@ -313,6 +314,48 @@ def _parse_binary_example_hx07(data: bytes, offset: int) -> tuple[dict, int]:
         "value": float(value),
         "sample_weight": float(sample_weight),
     }
+    return ex, offset
+
+
+def _parse_binary_example_hx08(data: bytes, offset: int) -> tuple[dict, int]:
+    """Parse one HX08 board-state example (HX07 + per-move Q head data).
+
+    Identical to :func:`_parse_binary_example_hx07`, then two extra per-legal
+    blocks after the policy: ``[num_legal*4B q f32][num_legal*2B visits u16]``.
+    ``q`` is the MCTS completed-Q per legal move (root/side-to-move perspective,
+    aligned with ``policy`` order); ``visits`` is the per-move visit count (0 for
+    moves the search never expanded). The trainer masks the Q loss to visits>0.
+
+    Must match ``write_example_hx08`` in self_play.rs.
+    """
+    import struct
+    import numpy as np
+
+    ex, offset = _parse_binary_example_hx07(data, offset)
+    num_legal = ex["num_legal"]
+
+    q_needed = num_legal * 4
+    if offset + q_needed > len(data):
+        raise ValueError(
+            f"HX08 record truncated: q block needs {offset + q_needed} bytes "
+            f"({num_legal} legal moves), buffer has {len(data)}")
+    q_targets = np.frombuffer(
+        data, dtype=np.float32, count=num_legal, offset=offset
+    ).astype(np.float64).tolist()
+    offset += q_needed
+
+    v_needed = num_legal * 2
+    if offset + v_needed > len(data):
+        raise ValueError(
+            f"HX08 record truncated: visits block needs {offset + v_needed} bytes "
+            f"({num_legal} legal moves), buffer has {len(data)}")
+    q_visits = np.frombuffer(
+        data, dtype=np.uint16, count=num_legal, offset=offset
+    ).astype(np.int64).tolist()
+    offset += v_needed
+
+    ex["q_targets"] = q_targets
+    ex["q_visits"] = q_visits
     return ex, offset
 from hexo_a0.self_play import batched_self_play_games, TrainingExample
 
@@ -695,6 +738,8 @@ def _prefetch_worker(
                 getattr(ex, "_age", None),
                 float(getattr(ex, "sample_weight", 1.0)),
                 getattr(ex, "horizon_targets", None),
+                getattr(ex, "q_targets", None),
+                getattr(ex, "q_visits", None),
             ))
 
         # Block on put with timeout so the worker can notice stop_event.
@@ -785,6 +830,7 @@ def _forward_and_loss(
     loss_scale: float = 1.0,
     pc_loss_weight: float = 0.0,
     horizon_loss_weight: float = 0.0,
+    q_loss_weight: float = 0.0,
 ) -> dict[str, "torch.Tensor | float"]:
     """Forward pass + loss computation + backward (no optimizer step).
 
@@ -803,17 +849,23 @@ def _forward_and_loss(
         the NaN/Inf guard. ``pc_loss`` is a tensor when PC loss is active,
         otherwise the float ``0.0`` sentinel.
     """
-    # Unpack — examples may have 3, 4, 5, 6, or 7 elements:
+    # Unpack — examples may have 3, 4, 5, 6, 7, or 9 elements:
     #   3-tuple: (data, policy, value)
     #   4-tuple: + trajectory_id
     #   5-tuple: + age (buffer position at sample time, [0, 1], 0=newest)
     #   6-tuple: + sample_weight (in (0, 1]; <1 for PCR fast-cap examples)
     #   7-tuple: + horizon_targets (list[float] per example, or None; Stage 2)
+    #   9-tuple: + q_targets, q_visits (per-legal-move lists, or None; Stage 3)
     ages: tuple | None = None
     sample_weights: tuple | None = None
     horizon_targets_tup: tuple | None = None
+    q_targets_tup: tuple | None = None
+    q_visits_tup: tuple | None = None
     arity = len(examples[0])
-    if arity == 7:
+    if arity == 9:
+        (data_list, policy_targets, value_targets, traj_ids, ages,
+         sample_weights, horizon_targets_tup, q_targets_tup, q_visits_tup) = zip(*examples)
+    elif arity == 7:
         data_list, policy_targets, value_targets, traj_ids, ages, sample_weights, horizon_targets_tup = zip(*examples)
     elif arity == 6:
         data_list, policy_targets, value_targets, traj_ids, ages, sample_weights = zip(*examples)
@@ -866,7 +918,8 @@ def _forward_and_loss(
     # byte-identical 3-tuple path.
     value_bins = int(getattr(model, "value_bins", 0) or 0)
     horizons = list(getattr(model, "value_horizons", []) or [])
-    need_extras = value_bins > 0 or bool(horizons)
+    q_head_enabled = bool(getattr(model, "q_head_enabled", False))
+    need_extras = value_bins > 0 or bool(horizons) or q_head_enabled
 
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
         if need_extras:
@@ -1007,6 +1060,42 @@ def _forward_and_loss(
         total_loss = total_loss + horizon_loss_weight * hz_loss
         horizon_loss_val = hz_loss.detach()
 
+    # Train-only per-move Q head: masked MSE against the MCTS completed-Q,
+    # trained only on moves the search actually visited (visit>0), weighted by
+    # the per-example sample weight. q_values are aligned with all_logits (both
+    # in batch legal-node order), so targets/masks are built per example in the
+    # same order as the policy targets.
+    q_loss_val: "torch.Tensor | float" = 0.0
+    if (
+        q_loss_weight > 0.0
+        and q_head_enabled
+        and q_targets_tup is not None
+        and "q_values" in extras
+    ):
+        q_tgt_list, q_msk_list = [], []
+        for i in range(len(policy_targets)):
+            nl = policy_targets[i].shape[0]
+            qt = q_targets_tup[i]
+            qv = q_visits_tup[i] if q_visits_tup is not None else None
+            if qt is None or qv is None:
+                q_tgt_list.append(torch.zeros(nl, dtype=torch.float32))
+                q_msk_list.append(torch.zeros(nl, dtype=torch.float32))
+            else:
+                q_tgt_list.append(torch.tensor(qt, dtype=torch.float32))
+                q_msk_list.append(
+                    (torch.tensor(qv, dtype=torch.float32) > 0).float()
+                )
+        q_tgt = torch.cat(q_tgt_list).to(device, non_blocking=True)     # (total_legal,)
+        q_msk = torch.cat(q_msk_list).to(device, non_blocking=True)
+        q_pred = extras["q_values"].float()                            # (total_legal,)
+        # Per-node sample weight via the legal-node→graph map computed above.
+        sw_node = sw[graph_idx]
+        weighted_mask = q_msk * sw_node
+        q_sq = (q_pred - q_tgt).pow(2) * weighted_mask
+        q_loss = q_sq.sum() / weighted_mask.sum().clamp_min(1.0)
+        total_loss = total_loss + q_loss_weight * q_loss
+        q_loss_val = q_loss.detach()
+
     # Path consistency loss (PCZero)
     pc_loss_val: "torch.Tensor | float" = 0.0
     if pc_loss_weight > 0 and traj_ids is not None and traj_ids[0] is not None:
@@ -1061,6 +1150,7 @@ def _forward_and_loss(
         "value_loss": mean_value.detach(),
         "value_mse": value_mse.detach(),
         "horizon_loss": horizon_loss_val,
+        "q_loss": q_loss_val,
         "pc_loss": pc_loss_val,
         "cross_entropy": mean_cross_entropy.detach(),
         "target_entropy": mean_target_entropy.detach(),
@@ -1864,6 +1954,9 @@ class Trainer:
             cmd.append("--threat-features")
         if getattr(self.model_config, "relative_stone_encoding", False):
             cmd.append("--relative-stones")
+        # Emit HX08 (per-move Q + visit counts) for the train-only Q head.
+        if getattr(self.model_config, "q_head", False):
+            cmd.append("--emit-q")
 
         if rust_cfg.playout_cap_fraction > 0.0 and rust_cfg.playout_cap_divisor > 1:
             cmd.extend(["--playout-cap-fraction", str(rust_cfg.playout_cap_fraction)])
@@ -2165,6 +2258,7 @@ class Trainer:
     _RECORD_MAGIC_LEGACY = b"HX03"
     _RECORD_MAGIC_HX06 = b"HX06"
     _RECORD_MAGIC_HX07 = b"HX07"
+    _RECORD_MAGIC_HX08 = b"HX08"
 
     @staticmethod
     def _read_binary_records(fh, batch: list, max_records: int) -> None:
@@ -2208,7 +2302,16 @@ class Trainer:
 
             magic = header[:4]
             is_hx07 = False
-            if magic == Trainer._RECORD_MAGIC_HX07:
+            is_hx08 = False
+            if magic == Trainer._RECORD_MAGIC_HX08:
+                # Board-state record + per-move Q head data. Same envelope as
+                # HX07; each example additionally carries per-legal q + visits.
+                is_hx07 = True   # shares HX07's envelope/body-offset handling
+                is_hx08 = True   # selects the HX08 per-example parser
+                has_sample_weight = True
+                has_node_dim = False
+                has_window_stats = False
+            elif magic == Trainer._RECORD_MAGIC_HX07:
                 # Board-state record: no node_dim byte; a 1B has_window flag
                 # sits at offset 9 (body starts at 10, or 22 with window stats).
                 is_hx07 = True
@@ -2285,9 +2388,13 @@ class Trainer:
                             "acted_deficit_sum": acted_deficit_sum,
                         }
                         offset += 12
+                    parse_example = (
+                        _parse_binary_example_hx08 if is_hx08
+                        else _parse_binary_example_hx07
+                    )
                     examples = []
                     for _ in range(num_examples):
-                        ex, offset = _parse_binary_example_hx07(data, offset)
+                        ex, offset = parse_example(data, offset)
                         examples.append(ex)
                     batch.append({
                         "length": num_examples,
@@ -2421,6 +2528,8 @@ class Trainer:
                 game_state=gs,
                 sample_weight=float(ex.get("sample_weight", 1.0)),
                 horizon_targets=horizon_rows[i] if horizon_rows is not None else None,
+                q_targets=ex.get("q_targets"),
+                q_visits=ex.get("q_visits"),
             ))
         total = len(examples) + skipped
         if total:
@@ -2784,6 +2893,7 @@ class Trainer:
             "value_loss": 0.0,
             "value_mse": 0.0,
             "horizon_loss": 0.0,
+            "q_loss": 0.0,
             "pc_loss": 0.0,
             "cross_entropy": 0.0,
             "target_entropy": 0.0,
@@ -2844,6 +2954,8 @@ class Trainer:
             # Short-horizon value-head aggregate CE (train-only; 0 unless
             # value_horizons + horizon_loss_weight are set).
             running_horizon_t = torch.zeros((), device=self.device)
+            # Per-move Q-head masked MSE (train-only; 0 unless q_head + q_loss_weight).
+            running_q_t = torch.zeros((), device=self.device)
             running_pc_t = torch.zeros((), device=self.device)
             running_cross_entropy_t = torch.zeros((), device=self.device)
             running_target_entropy_t = torch.zeros((), device=self.device)
@@ -2922,6 +3034,7 @@ class Trainer:
                 _t0 = time.time()
                 pc_weight = tc.pc_loss_weight
                 horizon_weight = getattr(tc, "horizon_loss_weight", 0.0)
+                q_weight = getattr(tc, "q_loss_weight", 0.0)
 
                 if use_prefetch:
                     # Background thread already sampled + augmented + pinned.
@@ -2981,6 +3094,8 @@ class Trainer:
                             getattr(ex, '_age', None),
                             float(getattr(ex, 'sample_weight', 1.0)),
                             getattr(ex, 'horizon_targets', None),
+                            getattr(ex, 'q_targets', None),
+                            getattr(ex, 'q_visits', None),
                         ))
 
                 # ----- Forward / backward (sync-free; returns GPU tensors) -----
@@ -3011,6 +3126,7 @@ class Trainer:
                         step_value_t = torch.zeros((), device=self.device)
                         step_value_mse_t = torch.zeros((), device=self.device)
                         step_horizon_t = torch.zeros((), device=self.device)
+                        step_q_t = torch.zeros((), device=self.device)
                         step_pc_t = torch.zeros((), device=self.device)
                         step_cross_entropy_t = torch.zeros((), device=self.device)
                         step_target_entropy_t = torch.zeros((), device=self.device)
@@ -3020,6 +3136,7 @@ class Trainer:
                                 loss_scale=1.0 / n_micro,
                                 pc_loss_weight=pc_weight,
                                 horizon_loss_weight=horizon_weight,
+                                q_loss_weight=q_weight,
                             )
                             step_total_t = step_total_t + mb_losses["total_loss"] / n_micro
                             step_policy_t = step_policy_t + mb_losses["policy_loss"] / n_micro
@@ -3029,6 +3146,8 @@ class Trainer:
                             step_target_entropy_t = step_target_entropy_t + mb_losses["target_entropy"] / n_micro
                             if torch.is_tensor(mb_losses["horizon_loss"]):
                                 step_horizon_t = step_horizon_t + mb_losses["horizon_loss"] / n_micro
+                            if torch.is_tensor(mb_losses["q_loss"]):
+                                step_q_t = step_q_t + mb_losses["q_loss"] / n_micro
                             if torch.is_tensor(mb_losses["pc_loss"]):
                                 step_pc_t = step_pc_t + mb_losses["pc_loss"] / n_micro
                             if mb_losses.get("staleness_kl_q_sum") is not None:
@@ -3040,6 +3159,7 @@ class Trainer:
                             self.model, all_examples, self.device, use_fp16,
                             pc_loss_weight=pc_weight,
                             horizon_loss_weight=horizon_weight,
+                            q_loss_weight=q_weight,
                         )
                         step_total_t = mb_losses["total_loss"]
                         step_policy_t = mb_losses["policy_loss"]
@@ -3050,6 +3170,11 @@ class Trainer:
                         step_horizon_t = (
                             mb_losses["horizon_loss"]
                             if torch.is_tensor(mb_losses["horizon_loss"])
+                            else torch.zeros((), device=self.device)
+                        )
+                        step_q_t = (
+                            mb_losses["q_loss"]
+                            if torch.is_tensor(mb_losses["q_loss"])
                             else torch.zeros((), device=self.device)
                         )
                         step_pc_t = (
@@ -3065,6 +3190,7 @@ class Trainer:
                         self.model, all_examples, self.device, use_fp16,
                         pc_loss_weight=pc_weight,
                         horizon_loss_weight=horizon_weight,
+                        q_loss_weight=q_weight,
                     )
                     step_total_t = mb_losses["total_loss"]
                     step_policy_t = mb_losses["policy_loss"]
@@ -3075,6 +3201,11 @@ class Trainer:
                     step_horizon_t = (
                         mb_losses["horizon_loss"]
                         if torch.is_tensor(mb_losses["horizon_loss"])
+                        else torch.zeros((), device=self.device)
+                    )
+                    step_q_t = (
+                        mb_losses["q_loss"]
+                        if torch.is_tensor(mb_losses["q_loss"])
                         else torch.zeros((), device=self.device)
                     )
                     step_pc_t = (
@@ -3119,6 +3250,7 @@ class Trainer:
                 running_value_t = running_value_t + step_value_t
                 running_value_mse_t = running_value_mse_t + step_value_mse_t
                 running_horizon_t = running_horizon_t + step_horizon_t
+                running_q_t = running_q_t + step_q_t
                 running_pc_t = running_pc_t + step_pc_t
                 running_cross_entropy_t = running_cross_entropy_t + step_cross_entropy_t
                 running_target_entropy_t = running_target_entropy_t + step_target_entropy_t
@@ -3150,6 +3282,7 @@ class Trainer:
                 losses["value_loss"] = (running_value_t / actual_steps).item()
                 losses["value_mse"] = (running_value_mse_t / actual_steps).item()
                 losses["horizon_loss"] = (running_horizon_t / actual_steps).item()
+                losses["q_loss"] = (running_q_t / actual_steps).item()
                 losses["pc_loss"] = (running_pc_t / actual_steps).item()
                 losses["cross_entropy"] = (running_cross_entropy_t / actual_steps).item()
                 losses["target_entropy"] = (running_target_entropy_t / actual_steps).item()
@@ -3338,6 +3471,18 @@ class Trainer:
                     "position's outcome if the game resolves within its horizon (in "
                     "placements), else neutral. 0 when horizon heads are disabled. A "
                     "denser value signal in long games; not part of self-play inference."
+                ),
+            )
+            self.writer.add_scalar(
+                "loss/q",
+                metrics["q_loss"],
+                step,
+                description=(
+                    "Train-only per-move Q head: masked MSE between the head's "
+                    "predicted per-legal-move value and the MCTS completed-Q, over "
+                    "moves the search actually visited (visit>0). Distils per-move "
+                    "search knowledge into the trunk. 0 when the Q head is disabled or "
+                    "the data lacks per-move Q (needs HX08). Not part of self-play."
                 ),
             )
             # Staleness instrumentation: per-quartile mean policy KL by sample

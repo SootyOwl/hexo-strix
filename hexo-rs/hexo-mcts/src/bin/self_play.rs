@@ -1100,6 +1100,12 @@ struct PositionData {
     /// the search budget that produced it. Written to the wire format
     /// (HX04) and applied multiplicatively in the trainer's loss.
     sample_weight: f32,
+    /// Per-legal-move completed-Q from MCTS (root/side-to-move perspective),
+    /// aligned 1:1 with `policy`. Written only in the HX08 format (--emit-q).
+    per_child_q: Vec<f64>,
+    /// Per-legal-move visit count (0 = the search never expanded that move),
+    /// aligned 1:1 with `policy`. Written only in the HX08 format (--emit-q).
+    visit_counts: Vec<u32>,
 }
 
 /// Completed game data.
@@ -1169,7 +1175,15 @@ impl GameResult {
 ///   side-to-move + moves_remaining) is shipped, and the graph is rebuilt
 ///   downstream via `GameState::from_state`. Drops the HX05 `node_dim` byte
 ///   and replaces the HX05/HX06 magic split with a 1B `has_window` flag.
+/// - HX08: board-state record + per-move Q head data (per-legal q f32 +
+///   visits u16) for the train-only Q head. Envelope + per-example layout are
+///   identical to HX07, then each example appends `[num_legal*4B q f32]
+///   [num_legal*2B visits u16]` after the policy block. Written iff --emit-q;
+///   with the flag off HX07 is written (byte-identical to before).
 const RECORD_MAGIC_HX07: &[u8; 4] = b"HX07";
+
+/// See the version history on `RECORD_MAGIC_HX07`. HX08 = HX07 + per-move Q.
+const RECORD_MAGIC_HX08: &[u8; 4] = b"HX08";
 
 /// Map a `Player` to its wire byte: P1 → 0, P2 → 1.
 #[inline]
@@ -1274,6 +1288,90 @@ fn write_example_hx07<W: Write>(writer: &mut W, pos: &PositionData, value: f64) 
     }
     // Policy (f32 LE)
     for &p in &pos.policy { writer.write_all(&(p as f32).to_le_bytes())?; }
+
+    Ok(())
+}
+
+/// Write a game as a length-prefixed binary record (HX08).
+///
+/// HX08 = HX07 + per-move Q head data. The envelope (magic `"HX08"`, size,
+/// num_examples, winner, move_count, has_window + optional 12B window stats)
+/// and per-example header/stones/policy are IDENTICAL to `write_game_binary_hx07`.
+/// Each example then appends `[num_legal*4B q f32][num_legal*2B visits u16]`
+/// after the policy block (see `write_example_hx08`), so the per-example size
+/// grows by `num_legal*4 + num_legal*2`.
+fn write_game_binary_hx08<W: Write>(writer: &mut W, result: &GameResult, draw_value: f32) -> std::io::Result<()> {
+    let has_window_stats = result.window_stats.is_some();
+
+    // First pass: total size (everything after the 4B size field).
+    let envelope_extra: u32 = if has_window_stats { 12 } else { 0 };
+    let mut size = 4u32 + 1 + 4 + 1 + envelope_extra;
+    for pos in &result.positions {
+        let num_stones = pos.stones.len();
+        let num_legal = pos.policy.len();
+        size += 14; // per-example header (2+1+1+2+4+4)
+        size += (num_stones * 5) as u32; // stones (2B q + 2B r + 1B player)
+        size += (num_legal * 4) as u32; // policy (f32)
+        size += (num_legal * 4) as u32; // per-legal q (f32)
+        size += (num_legal * 2) as u32; // per-legal visits (u16)
+    }
+
+    writer.write_all(RECORD_MAGIC_HX08)?;
+    writer.write_all(&size.to_le_bytes())?;
+    writer.write_all(&(result.positions.len() as u32).to_le_bytes())?;
+    let winner_byte: i8 = match result.winner {
+        "P1" => 1,
+        "P2" => -1,
+        _ => 0,
+    };
+    writer.write_all(&[winner_byte as u8])?;
+    writer.write_all(&result.move_count.to_le_bytes())?;
+    writer.write_all(&[has_window_stats as u8])?;
+
+    if let Some(ws) = result.window_stats {
+        writer.write_all(&ws.in_window_moves.to_le_bytes())?;
+        writer.write_all(&ws.gated_moves.to_le_bytes())?;
+        writer.write_all(&ws.mass_removed_sum.to_le_bytes())?;
+        writer.write_all(&ws.acted_deficit_sum.to_le_bytes())?;
+    }
+
+    for pos in &result.positions {
+        let value: f64 = if result.winner == "draw" {
+            draw_value as f64
+        } else if result.winner == pos.player {
+            1.0
+        } else {
+            -1.0
+        };
+        write_example_hx08(writer, pos, value)?;
+    }
+    writer.flush()
+}
+
+fn write_example_hx08<W: Write>(writer: &mut W, pos: &PositionData, value: f64) -> std::io::Result<()> {
+    let num_stones = pos.stones.len();
+    let num_legal = pos.policy.len();
+
+    // Header (14 bytes)
+    writer.write_all(&(num_stones as u16).to_le_bytes())?;
+    writer.write_all(&[player_byte_from_str(pos.player)])?;
+    writer.write_all(&[pos.moves_remaining])?;
+    writer.write_all(&(num_legal as u16).to_le_bytes())?;
+    writer.write_all(&(value as f32).to_le_bytes())?;
+    writer.write_all(&pos.sample_weight.to_le_bytes())?;
+
+    // Stones: 2B q i16, 2B r i16, 1B player u8
+    for &((q, r), p) in &pos.stones {
+        writer.write_all(&(q as i16).to_le_bytes())?;
+        writer.write_all(&(r as i16).to_le_bytes())?;
+        writer.write_all(&[player_byte(p)])?;
+    }
+    // Policy (f32 LE)
+    for &p in &pos.policy { writer.write_all(&(p as f32).to_le_bytes())?; }
+    // HX08 per-legal completed-Q (f32 LE), same order/length as policy.
+    for &q in &pos.per_child_q { writer.write_all(&(q as f32).to_le_bytes())?; }
+    // HX08 per-legal visit counts (u16 LE), same order/length as policy.
+    for &v in &pos.visit_counts { writer.write_all(&(v as u16).to_le_bytes())?; }
 
     Ok(())
 }
@@ -1546,6 +1644,11 @@ fn play_one_game(
             stones: game.placed_stones(),
             moves_remaining: game.moves_remaining_this_turn(),
             sample_weight,
+            // Cheap Vec moves; always populated (only the WRITE is gated by
+            // --emit-q). Both are length == num_legal, aligned with `policy`.
+            // Prior uses at ~1473/1530 are by ref/index before this push.
+            per_child_q: result.per_child_q,
+            visit_counts: result.visit_counts,
         });
 
         if !running.load(Ordering::Relaxed) {
@@ -1604,10 +1707,12 @@ struct RotatingWriter {
     writer: BufWriter<fs::File>,
     bytes_written: u64,
     draw_value: f32,
+    /// When true, write records in HX08 (per-move Q head data) instead of HX07.
+    emit_q: bool,
 }
 
 impl RotatingWriter {
-    fn new(dir: &str, filename: &str, max_bytes: u64, draw_value: f32) -> Self {
+    fn new(dir: &str, filename: &str, max_bytes: u64, draw_value: f32, emit_q: bool) -> Self {
         let (stem, ext) = match filename.rsplit_once('.') {
             Some((s, e)) => (s.to_string(), e.to_string()),
             None => (filename.to_string(), "bin".to_string()),
@@ -1621,6 +1726,7 @@ impl RotatingWriter {
             writer: BufWriter::new(fs::File::create("/dev/null").unwrap()),
             bytes_written: 0,
             draw_value,
+            emit_q,
         };
         rw.rotate();
         rw
@@ -1645,7 +1751,11 @@ impl RotatingWriter {
             self.rotate();
         }
         let pos_before = self.bytes_written;
-        write_game_binary_hx07(&mut self.writer, result, self.draw_value)?;
+        if self.emit_q {
+            write_game_binary_hx08(&mut self.writer, result, self.draw_value)?;
+        } else {
+            write_game_binary_hx07(&mut self.writer, result, self.draw_value)?;
+        }
         // Estimate bytes written (flush ensures data hits OS)
         self.writer.flush()?;
         // Use the file position to track actual bytes
@@ -1708,6 +1818,8 @@ fn main() {
     let mut prune_empty_edges = false;
     let mut threat_features = false;
     let mut relative_stones = false;
+    // Emit HX08 records (HX07 + per-move Q head data) instead of HX07.
+    let mut emit_q = false;
 
     // Python subprocess inference flags
     let mut python_inference = false;
@@ -1815,6 +1927,7 @@ fn main() {
             "--prune-empty-edges" => { prune_empty_edges = true; i += 1; }
             "--threat-features" => { threat_features = true; i += 1; }
             "--relative-stones" => { relative_stones = true; i += 1; }
+            "--emit-q" => { emit_q = true; i += 1; }
             "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
@@ -2168,7 +2281,7 @@ fn main() {
         fs::create_dir_all(&dir).expect("Failed to create output directory");
 
         let rotating_writer = Arc::new(Mutex::new(
-            RotatingWriter::new(&dir, &output_filename, max_file_mb * 1024 * 1024, draw_value),
+            RotatingWriter::new(&dir, &output_filename, max_file_mb * 1024 * 1024, draw_value, emit_q),
         ));
 
         if let Some(frac) = exploration_fraction {
@@ -2871,6 +2984,8 @@ mod tests {
                 stones: game.placed_stones(),
                 moves_remaining: game.moves_remaining_this_turn(),
                 sample_weight: 1.0,
+                per_child_q: vec![],
+                visit_counts: vec![],
             }],
             winner,
             move_count: 1,
@@ -2898,6 +3013,8 @@ mod tests {
                 stones: stones.clone(),
                 moves_remaining,
                 sample_weight: 0.5,
+                per_child_q: vec![],
+                visit_counts: vec![],
             }],
             winner: "P1",
             move_count: 7,
@@ -2978,6 +3095,54 @@ mod tests {
     }
 
     #[test]
+    fn write_example_hx08_layout() {
+        // Lock the HX08 per-example layout against the Python reader
+        // (`_parse_binary_example_hx08`): HX07 example, then
+        // `[num_legal*4B q f32][num_legal*2B visits u16]`.
+        let stones: Vec<(hexo_engine::types::Coord, hexo_engine::types::Player)> =
+            vec![((0, 0), hexo_engine::types::Player::P1),
+                 ((1, -1), hexo_engine::types::Player::P2)];
+        let policy = vec![0.25f64, 0.5, 0.25];
+        let per_child_q = vec![0.5f64, -0.25, 0.125];
+        let visit_counts = vec![7u32, 0, 40000];
+        let pos = PositionData {
+            policy: policy.clone(),
+            player: "P1",
+            stones: stones.clone(),
+            moves_remaining: 3,
+            sample_weight: 0.5,
+            per_child_q: per_child_q.clone(),
+            visit_counts: visit_counts.clone(),
+        };
+        let num_stones = stones.len();
+        let num_legal = policy.len();
+
+        let mut buf = Vec::new();
+        write_example_hx08(&mut buf, &pos, 1.0).unwrap();
+
+        // Total length: HX07 header(14) + stones*5 + policy(num_legal*4)
+        //               + q(num_legal*4) + visits(num_legal*2).
+        let expected_len = 14 + num_stones * 5 + num_legal * 4 + num_legal * 4 + num_legal * 2;
+        assert_eq!(buf.len(), expected_len, "HX08 example byte length");
+
+        // q block starts after header + stones + policy.
+        let q_off = 14 + num_stones * 5 + num_legal * 4;
+        for (i, &q) in per_child_q.iter().enumerate() {
+            let o = q_off + i * 4;
+            let got = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+            assert_eq!(got, q as f32, "q[{i}]");
+        }
+        // visits block starts right after the q block.
+        let v_off = q_off + num_legal * 4;
+        for (i, &v) in visit_counts.iter().enumerate() {
+            let o = v_off + i * 2;
+            let got = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap());
+            assert_eq!(got, v as u16, "visits[{i}]");
+        }
+        assert_eq!(v_off + num_legal * 2, buf.len(), "parsed the whole example");
+    }
+
+    #[test]
     fn node_dim_all_combos() {
         assert_eq!(node_dim(false, false), 8);
         assert_eq!(node_dim(false, true), 7);
@@ -3007,9 +3172,9 @@ mod tests {
         let mr = game.moves_remaining_this_turn();
         let result = GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
-                PositionData { policy: vec![0.5, 0.5], player: "P2", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
-                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0, per_child_q: vec![], visit_counts: vec![] },
+                PositionData { policy: vec![0.5, 0.5], player: "P2", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0, per_child_q: vec![], visit_counts: vec![] },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0, per_child_q: vec![], visit_counts: vec![] },
             ],
             winner: "P1",
             move_count: 10,
@@ -3038,6 +3203,8 @@ mod tests {
                 stones: stones.clone(),
                 moves_remaining: mr,
                 sample_weight: 1.0,
+                per_child_q: vec![],
+                visit_counts: vec![],
             }],
             winner: "P1",
             move_count: 1,
@@ -3074,6 +3241,8 @@ mod tests {
                     stones: stones.clone(),
                     moves_remaining: mr,
                     sample_weight: 1.0,
+                    per_child_q: vec![],
+                    visit_counts: vec![],
                 }],
                 winner: "P1",
                 move_count: 1,
@@ -3140,8 +3309,8 @@ mod tests {
         let mr = game.moves_remaining_this_turn();
         let result = GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
-                PositionData { policy: vec![0.3, 0.7], player: "P2", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0, per_child_q: vec![], visit_counts: vec![] },
+                PositionData { policy: vec![0.3, 0.7], player: "P2", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0, per_child_q: vec![], visit_counts: vec![] },
             ],
             winner: "P1",
             move_count: 2,
