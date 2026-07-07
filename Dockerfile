@@ -37,16 +37,20 @@ FROM python:3.13-slim-bookworm AS builder
 # uv (Astral) — copied from the official multi-arch image (amd64 + arm64).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Rust toolchain + a C linker for the maturin/PyO3 build. No libtorch needed.
+# Rust toolchain + a C linker for the maturin/PyO3 build, in one layer. No libtorch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential curl ca-certificates \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+         | sh -s -- -y --profile minimal --default-toolchain stable \
     && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --default-toolchain stable
 
+# CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256: serving inference is not
+# throughput-critical (unlike self-play), so favour more parallel codegen over
+# the last sliver of runtime speed — noticeably faster compile on a many-core box.
 ENV PATH="/root/.cargo/bin:${PATH}" \
     CARGO_HOME=/root/.cargo \
     CARGO_TARGET_DIR=/root/cargo-target \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
@@ -75,20 +79,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP --all-extras"; \
     uv sync --frozen --no-dev --no-install-workspace $GRP
 
-# --- Phase 2: build + install our workspace members -------------------------
-# Bring in the source and build hexo_rs (Rust, via maturin — release profile
-# under PEP 517) + hexo-a0 (pure Python). The cargo registry/target cache mounts
-# make the Rust compile incremental across builds: a change that doesn't touch
-# *.rs (e.g. app.js) recompiles nothing and just relinks. --no-editable bakes the
-# workspace members into .venv so the runtime stage needs no source.
-COPY hexo-rs/ hexo-rs/
-COPY hexo-a0/ hexo-a0/
-# Tune the Rust build for the actual deploy CPUs instead of the baseline ISA:
-# Oracle Ampere A1 is Neoverse N1; x86-64-v3 = AVX2+FMA (any post-2015 x86
-# host). rustc does no FP contraction by default, so results are unchanged.
-# (RUSTFLAGS would clobber .cargo/config.toml rustflags, but that config is
-# wasm-target-only and no wasm is built here.)
+# --- Phase 2: build hexo_rs (Rust) — the slow step, busted only by *.rs -------
+# Split from the Python install (Phase 3) so editing hexo-a0 (app.py, app.js, …)
+# does NOT re-trigger the maturin/Rust compile — only hexo-rs source invalidates
+# this layer. --no-install-package hexo-a0 builds + installs hexo-rs (+ its deps)
+# but skips the pure-Python member. The cargo cache mounts keep the compile
+# incremental across builds (a no-*.rs change just relinks).
+#
+# RUSTFLAGS tunes for the deploy CPU (Oracle Ampere A1 = Neoverse N1 on arm64;
+# x86-64-v3 = AVX2+FMA on any post-2015 x86). rustc does no FP contraction, so
+# results are unchanged. (config.toml rustflags are wasm-target-only; no wasm here.)
 ARG TARGETARCH
+COPY hexo-rs/ hexo-rs/
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
@@ -98,6 +100,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     else \
         export RUSTFLAGS="-C target-cpu=x86-64-v3"; \
     fi; \
+    GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP --all-extras"; \
+    uv sync --frozen --no-dev --no-editable --no-install-package hexo-a0 $GRP
+
+# --- Phase 3: install hexo-a0 (pure Python) — fast, changes often -------------
+# hexo_rs is already built in Phase 2; this only bakes the Python package (server,
+# frontend assets) into .venv, so the common edit-serve loop skips Rust entirely.
+COPY hexo-a0/ hexo-a0/
+RUN --mount=type=cache,target=/root/.cache/uv \
     GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP --all-extras"; \
     uv sync --frozen --no-dev --no-editable $GRP
 
