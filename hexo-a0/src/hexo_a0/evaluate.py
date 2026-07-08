@@ -91,6 +91,7 @@ def play_eval_game(
     opponent_mcts_virtual_loss: float = 0.0,
     opening: list[tuple[int, int]] | None = None,
     disable_gumbel_noise: bool = False,
+    disable_forcing_solver: bool = False,
 ) -> dict:
     """Play one complete evaluation game: model vs opponent.
 
@@ -169,12 +170,18 @@ def play_eval_game(
                   capture_k: int = 0, vl: float = 0.0):
         if sims <= 0:
             return None
+        # Only pass disable_forcing_solver when set (solver-off diagnostic),
+        # so the default path stays compatible with hexo_rs extensions built
+        # before the kwarg existed. The Rust default is solver-ON regardless,
+        # so omitting the kwarg is identical to disable_forcing_solver=False.
+        extra = {"disable_forcing_solver": True} if disable_forcing_solver else {}
         return hexo_rs.MCTSConfig(
             n_simulations=sims, m_actions=m_actions,
             c_visit=c_visit, c_scale=c_scale,
             virtual_loss=vl,
             forced_candidate_capture_k=capture_k,
             disable_gumbel_noise=disable_gumbel_noise,
+            **extra,
         )
 
     mcts_config = _make_cfg(

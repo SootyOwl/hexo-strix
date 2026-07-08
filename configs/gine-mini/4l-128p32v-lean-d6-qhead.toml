@@ -121,7 +121,7 @@ lr_min = 2e-05
 lr_warmup_steps = 1000
 total_train_steps = 12000
 step_delay = 0.0
-target_reuse = 8.0
+target_reuse = 4.0
 max_step_delay = 5.0
 step_delay_smoothing = 0.8
 draw_value = 0
@@ -145,7 +145,7 @@ source = "trainee"
 [self_play.rust]
 max_batch = 512
 max_batch_edges = 45000
-batch_timeout_ms = 5
+batch_timeout_ms = 1
 padded_inference = false
 python_inference = true
 python_inference_workers = 2

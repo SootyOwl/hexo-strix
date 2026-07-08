@@ -235,6 +235,7 @@ def run_head_to_head(
     opening_plies: int = 0,
     opening_temperature: float = 1.0,
     opening_generator: Literal["alternate", "a", "b", "champion"] = "alternate",
+    disable_forcing_solver: bool = False,
 ) -> dict:
     """Run a SPRT-bounded match between two checkpoints.
 
@@ -342,6 +343,7 @@ def run_head_to_head(
             opponent_mcts_virtual_loss=mcts_b_virtual_loss,
             opening=current_opening if noise_off else None,
             disable_gumbel_noise=noise_off,
+            disable_forcing_solver=disable_forcing_solver,
         )
         game_move_logs.append(result["move_log"])  # collected in both modes
         if noise_off:

@@ -89,8 +89,13 @@ test: test-rust test-python
 # parse time when torch isn't importable yet.
 torch_lib_dir := `uv run --no-sync python -c "import torch, os; print(os.path.dirname(torch.__file__) + '/lib')" 2>/dev/null || true`
 
+# Isolated CARGO_TARGET_DIR: keeps native/torch test builds off the shared
+# hexo-rs/target/ the live trainer uses, so they never contend for its build
+# lock or clobber its artifacts. Separate from the wasm target dir (this is a
+# native torch build, not wasm).
 test-rust:
     cd hexo-rs && \
+      CARGO_TARGET_DIR=$HOME/.cache/hexo-test-target \
       LIBTORCH_USE_PYTORCH=1 \
       CXX="${CXX:-$(command -v c++ || command -v g++-15 || command -v g++-14 || command -v g++ || echo c++)}" \
       LIBRARY_PATH="{{brew_prefix}}/lib:{{brew_prefix}}/lib/gcc/current:${LIBRARY_PATH:-}" \

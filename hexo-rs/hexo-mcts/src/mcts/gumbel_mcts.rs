@@ -376,10 +376,24 @@ where
         }
     }
 
-    if game.moves_remaining_this_turn() == 2 {
-        if let forcing::Outcome::Win(w) =
-            forcing::solve(game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET)
-        {
+    // Change (A): fire at mr>=1, not only at start-of-turn (mr==2). At an
+    // mr==1 root the solver models "attacker places its 1 remaining stone ->
+    // defender full turn -> attacker full turns"; its `pv[0]` is then the
+    // single completing placement, so the one-hot construction below is
+    // already correct for mr==1.
+    if !config.disable_forcing_solver && game.moves_remaining_this_turn() >= 1 {
+        // 0 = sentinel -> compile-time default; any non-zero value overrides.
+        let cap = if config.forcing_depth_cap == 0 {
+            SELF_PLAY_DEPTH_CAP
+        } else {
+            config.forcing_depth_cap
+        };
+        let budget = if config.forcing_node_budget == 0 {
+            SELF_PLAY_NODE_BUDGET
+        } else {
+            config.forcing_node_budget
+        };
+        if let forcing::Outcome::Win(w) = forcing::solve(game, cap, budget) {
             let first_move = w.first_move;
             // Defensive guard: `forcing::solve` is radius-aware, so
             // `first_move` should always be a member of `game.legal_moves()`.
@@ -394,23 +408,56 @@ where
                     .iter()
                     .position(|&c| c == first_move)
                     .expect("first_move verified legal, so it is in coords");
+
+                // Change (B): at an mr==2 root the winning turn is the
+                // attacker's ORDER-INVARIANT placement pair {pv[0], pv[1]}, so
+                // the correct policy target is TWO-HOT (0.5 on each). Fall back
+                // to one-hot on pv[0] when either guard fails:
+                //   1. pv.len() < 2  -- a single-stone completion (e.g. a win
+                //      not seen by the candidate-scoped depth-1 precheck) has
+                //      pv.len() == 1.
+                //   2. pv[1] absent from the root legal moves -- in the tight-
+                //      radius regime pv[1] may only become legal after pv[0].
+                // At mr==1 the winning turn is a single placement, so the pair
+                // logic is intentionally not applied (one-hot on pv[0]).
+                let pv1_idx = if game.moves_remaining_this_turn() == 2 && w.pv.len() >= 2 {
+                    coords.iter().position(|&c| c == w.pv[1])
+                } else {
+                    None
+                };
+
                 let mut improved_policy = vec![0.0; coords.len()];
-                improved_policy[idx] = 1.0;
                 let mut visit_counts = vec![0u32; coords.len()];
-                visit_counts[idx] = 1;
+                let mut candidate_indices = candidate_indices.clone();
+                // Preserve the `MCTSResult::candidate_indices` invariant ("the
+                // chosen action is guaranteed to lie inside it") relied on by
+                // callers such as `acting::exploration_weights`'s Q-margin gate.
+                if !candidate_indices.contains(&idx) {
+                    candidate_indices.push(idx);
+                }
+                match pv1_idx {
+                    Some(idx2) => {
+                        // Two-hot on the order-invariant attacker pair.
+                        improved_policy[idx] = 0.5;
+                        improved_policy[idx2] = 0.5;
+                        visit_counts[idx] = 1;
+                        visit_counts[idx2] = 1;
+                        if !candidate_indices.contains(&idx2) {
+                            candidate_indices.push(idx2);
+                        }
+                    }
+                    None => {
+                        improved_policy[idx] = 1.0;
+                        visit_counts[idx] = 1;
+                    }
+                }
+
                 let qctx = QContext::new(&root, &coords);
                 let per_child_q: Vec<f64> =
                     coords.iter().map(|c| qctx.completed_q[c]).collect();
                 let per_child_prior = priors_vec.clone();
-                let mut candidate_indices = candidate_indices.clone();
-                if !candidate_indices.contains(&idx) {
-                    // Preserve the `MCTSResult::candidate_indices` invariant
-                    // ("the chosen action is guaranteed to lie inside it")
-                    // relied on by callers such as
-                    // `acting::exploration_weights`'s Q-margin gate.
-                    candidate_indices.push(idx);
-                }
                 return Ok(MCTSResult {
+                    // `action` stays pv[0] in both cases (greedy determinism).
                     action: first_move,
                     improved_policy,
                     coords,
@@ -1073,11 +1120,11 @@ mod tests {
 
     /// Depth-2 forced-win shortcut: when the current player has 2 placements
     /// remaining this turn and a candidate's first placement leaves the same
-    /// player able to win on their second placement, MCTS must short-circuit
-    /// with a one-hot policy on that first placement. Mirrors the depth-1
-    /// shortcut behaviour for own_4-style 1-turn forced wins.
+    /// player able to win on their second placement, MCTS must short-circuit.
+    /// Change (B): the winning turn is the order-invariant pair {(1,0),(2,0)},
+    /// so the shortcut emits a TWO-HOT policy (0.5 on each gap), not a one-hot.
     #[test]
-    fn gumbel_mcts_two_placement_forced_win_returns_one_hot_policy() {
+    fn gumbel_mcts_two_placement_forced_win_returns_two_hot_policy() {
         // win_length = 4: P1 has stones at (0,0) and (3,0). Filling the gaps
         // at (1,0) and (2,0) (in either order) makes a 4-in-a-row along the
         // q-axis. Stones are spaced so that ONLY this specific gap pair
@@ -1134,32 +1181,46 @@ mod tests {
                 result.action
             );
 
-            let action_idx = result
+            let gap0 = result
                 .coords
                 .iter()
-                .position(|&c| c == result.action)
-                .expect("action must be in coords");
+                .position(|&c| c == (1, 0))
+                .expect("(1,0) in coords");
+            let gap1 = result
+                .coords
+                .iter()
+                .position(|&c| c == (2, 0))
+                .expect("(2,0) in coords");
 
-            assert_eq!(
-                result.improved_policy[action_idx], 1.0,
-                "seed {seed}: chosen gap should have probability 1.0"
+            // Two-hot: both gaps of the winning pair carry 0.5, all else 0.0.
+            assert!(
+                (result.improved_policy[gap0] - 0.5).abs() < 1e-9,
+                "seed {seed}: gap (1,0) should have probability 0.5, got {}",
+                result.improved_policy[gap0]
+            );
+            assert!(
+                (result.improved_policy[gap1] - 0.5).abs() < 1e-9,
+                "seed {seed}: gap (2,0) should have probability 0.5, got {}",
+                result.improved_policy[gap1]
             );
             for (i, &p) in result.improved_policy.iter().enumerate() {
-                if i != action_idx {
+                if i != gap0 && i != gap1 {
                     assert_eq!(
                         p, 0.0,
-                        "seed {seed}: non-winning move {i} should have probability 0.0"
+                        "seed {seed}: off-pair move {i} should have probability 0.0"
                     );
                 }
             }
         }
     }
 
-    /// Guard: the depth-2 shortcut must NOT fire when the current player has
-    /// only 1 placement left this turn (their next placement ends the turn,
-    /// so a "two-step forced win" is actually opp-then-self, not a forced
-    /// win). The same own_4 pattern should produce a non-one-hot policy
-    /// when the precondition fails.
+    /// Guard: on this own_4 pattern at mr==1 the shortcut must not produce a
+    /// forced-win one-hot. Under Change (A) the solver now DOES run at mr==1,
+    /// but for this fixture the single remaining placement can't force a win
+    /// (the two gaps `(1,0)`/`(2,0)` can't both be filled before the opponent's
+    /// full turn), so `forcing::solve` returns `No` and the search falls
+    /// through to a non-one-hot policy -- exactly as when the solver was gated
+    /// off at mr==1 entirely.
     #[test]
     fn gumbel_mcts_depth2_shortcut_skipped_mid_turn() {
         let config_game = GameConfig {
@@ -1939,7 +2000,7 @@ mod tests {
     /// instead of the origin, so turn 2 forks it into an unstoppable
     /// double-open-four and turn 3 completes it: depth 3 overall.
     #[test]
-    fn gumbel_mcts_depth3_forced_win_returns_one_hot_policy() {
+    fn gumbel_mcts_depth3_forced_win_returns_two_hot_policy() {
         let stones: Vec<(Coord, Player)> = [
             (0, 0), (1, 0), (2, 0),   // q-axis 3-run
             (100, 100), (100, 101),  // r-axis 2-run
@@ -1961,6 +2022,15 @@ mod tests {
         };
         assert_eq!(solved.depth, 3, "test position must be exactly depth-3");
 
+        // Change (B): mr==2 root -> the winning turn is the attacker's
+        // order-invariant pair {pv[0], pv[1]}, both legal at the root here, so
+        // the shortcut emits a TWO-HOT policy (0.5 each), not a one-hot.
+        assert!(solved.pv.len() >= 2, "depth-3 win must have a >=2-move pv");
+        let coords = game.legal_moves();
+        let idx0 = coords.iter().position(|&c| c == solved.pv[0]).expect("pv[0] legal");
+        let idx1 = coords.iter().position(|&c| c == solved.pv[1]).expect("pv[1] legal");
+        assert_ne!(idx0, idx1);
+
         let config = MCTSConfig {
             n_simulations: 64,
             m_actions: 16,
@@ -1976,25 +2046,404 @@ mod tests {
 
             assert_eq!(
                 result.action, solved.first_move,
-                "seed {seed}: action should be the solver's winning first move"
+                "seed {seed}: action should be the solver's winning first move (pv[0])"
             );
-            let action_idx = result
-                .coords
-                .iter()
-                .position(|&c| c == result.action)
-                .expect("action must be in coords");
-            assert_eq!(
-                result.improved_policy[action_idx], 1.0,
-                "seed {seed}: winning move should have probability 1.0"
+            assert!(
+                (result.improved_policy[idx0] - 0.5).abs() < 1e-9,
+                "seed {seed}: pv[0] should carry 0.5, got {}",
+                result.improved_policy[idx0]
+            );
+            assert!(
+                (result.improved_policy[idx1] - 0.5).abs() < 1e-9,
+                "seed {seed}: pv[1] should carry 0.5, got {}",
+                result.improved_policy[idx1]
             );
             for (i, &p) in result.improved_policy.iter().enumerate() {
-                if i != action_idx {
+                if i != idx0 && i != idx1 {
                     assert_eq!(
                         p, 0.0,
-                        "seed {seed}: non-winning move {i} should have probability 0.0"
+                        "seed {seed}: off-pair move {i} should have probability 0.0"
                     );
                 }
             }
         }
     }
+
+    /// Runtime toggle for the VCF forcing-solver shortcut. On the SAME
+    /// depth-3 forced-win fixture as
+    /// `gumbel_mcts_depth3_forced_win_returns_two_hot_policy` (a win ONLY
+    /// `forcing::solve` can see -- the depth-1 terminal shortcut cannot
+    /// fire), the default config (`disable_forcing_solver == false`) must
+    /// take the solver shortcut (Change (B): a two-hot on the solver's
+    /// order-invariant winning pair {pv[0], pv[1]}), while
+    /// `disable_forcing_solver == true` must skip it and fall through to
+    /// normal sequential-halving MCTS (a non-one-hot policy). This locks in
+    /// the no-op-by-default guarantee and the toggle's effect.
+    #[test]
+    fn gumbel_mcts_disable_forcing_solver_skips_shortcut() {
+        let stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0),   // q-axis 3-run
+            (100, 100), (100, 101),  // r-axis 2-run
+            (98, 104), (99, 103),    // third-axis 2-run
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+
+        // Independently confirm the fixture is a genuine forced win the
+        // solver catches (so disabling the solver is what changes behaviour).
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            forcing::Outcome::No => panic!("expected a forced win, got No"),
+            forcing::Outcome::BudgetExceeded => panic!("expected a forced win, got BudgetExceeded"),
+        };
+
+        let base = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let on_config = MCTSConfig { disable_forcing_solver: false, ..base.clone() };
+        let off_config = MCTSConfig { disable_forcing_solver: true, ..base };
+
+        // Change (B): mr==2 root -> two-hot on the order-invariant pair.
+        assert!(solved.pv.len() >= 2, "depth-3 win must have a >=2-move pv");
+        let coords = game.legal_moves();
+        let idx0 = coords.iter().position(|&c| c == solved.pv[0]).expect("pv[0] legal");
+        let idx1 = coords.iter().position(|&c| c == solved.pv[1]).expect("pv[1] legal");
+
+        for seed in 0..10 {
+            // Solver ON (default): two-hot on the solver's winning pair.
+            let mut rng_on = ChaCha8Rng::seed_from_u64(seed);
+            let on = gumbel_mcts(&game, &on_config, &mut rng_on, None, &mut dummy_eval).unwrap();
+            assert_eq!(
+                on.action, solved.first_move,
+                "seed {seed}: solver-on action should be the solver's winning first move"
+            );
+            assert!(
+                (on.improved_policy[idx0] - 0.5).abs() < 1e-9
+                    && (on.improved_policy[idx1] - 0.5).abs() < 1e-9,
+                "seed {seed}: solver-on policy should be two-hot (0.5/0.5) on the winning pair"
+            );
+
+            // Solver OFF: shortcut skipped, normal MCTS runs. With uniform
+            // priors and n=64/m=16 the visits spread, so the policy must NOT
+            // be one-hot on any move.
+            let mut rng_off = ChaCha8Rng::seed_from_u64(seed);
+            let off = gumbel_mcts(&game, &off_config, &mut rng_off, None, &mut dummy_eval).unwrap();
+            assert!(
+                off.improved_policy.iter().all(|&p| p < 0.999),
+                "seed {seed}: solver-off policy must not be one-hot (shortcut must be skipped), got {:?}",
+                off.improved_policy
+            );
+        }
+    }
+
+    /// Runtime `forcing_depth_cap` knob + the `0 = SELF_PLAY_DEPTH_CAP`
+    /// sentinel. On the SAME depth-3 forced-win fixture (a win the solver only
+    /// proves at depth 3), `forcing_depth_cap: 0` resolves to the compile-time
+    /// default (6) so the shortcut fires (two-hot on the winning pair), while
+    /// `forcing_depth_cap: 2` caps iterative deepening below the win depth so
+    /// `forcing::solve` cannot prove it and the shortcut is skipped (policy
+    /// falls through to normal MCTS, not two-hot). Proves both the sentinel and
+    /// that `config.forcing_depth_cap` is actually threaded into `forcing::solve`.
+    #[test]
+    fn gumbel_mcts_forcing_depth_cap_gates_shortcut() {
+        let stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0),   // q-axis 3-run
+            (100, 100), (100, 101),  // r-axis 2-run
+            (98, 104), (99, 103),    // third-axis 2-run
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+
+        // Independently: it is a depth-3 forced win at the default budgets, and
+        // a depth cap of 2 (< 3) cannot prove it (solve returns non-Win).
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            _ => panic!("fixture must be a forced win at the default budgets"),
+        };
+        assert_eq!(solved.depth, 3, "fixture must be exactly depth-3");
+        assert!(
+            !matches!(forcing::solve(&game, 2, SELF_PLAY_NODE_BUDGET), forcing::Outcome::Win(_)),
+            "a depth cap of 2 must not prove a depth-3 win"
+        );
+
+        let coords = game.legal_moves();
+        let idx0 = coords.iter().position(|&c| c == solved.pv[0]).expect("pv[0] legal");
+        let idx1 = coords.iter().position(|&c| c == solved.pv[1]).expect("pv[1] legal");
+
+        let base = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        // 0 == sentinel -> SELF_PLAY_DEPTH_CAP (6): shortcut fires.
+        let default_cap = MCTSConfig { forcing_depth_cap: 0, ..base.clone() };
+        // 2 < 3: shortcut cannot prove the win -> skipped.
+        let low_cap = MCTSConfig { forcing_depth_cap: 2, ..base };
+
+        let is_two_hot = |p: &[f64]| {
+            (p[idx0] - 0.5).abs() < 1e-9 && (p[idx1] - 0.5).abs() < 1e-9
+        };
+
+        for seed in 0..5 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let fired = gumbel_mcts(&game, &default_cap, &mut rng, None, &mut dummy_eval).unwrap();
+            assert!(
+                is_two_hot(&fired.improved_policy),
+                "seed {seed}: forcing_depth_cap=0 (=default 6) must fire the shortcut (two-hot)"
+            );
+
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let skipped = gumbel_mcts(&game, &low_cap, &mut rng, None, &mut dummy_eval).unwrap();
+            assert!(
+                !is_two_hot(&skipped.improved_policy),
+                "seed {seed}: forcing_depth_cap=2 must skip the shortcut (not two-hot), got {:?}",
+                skipped.improved_policy
+            );
+        }
+    }
+
+    /// Runtime `forcing_node_budget` knob + the `0 = SELF_PLAY_NODE_BUDGET`
+    /// sentinel. On the SAME depth-3 forced-win fixture, `forcing_node_budget: 0`
+    /// resolves to the compile-time default (2000) so the solve completes and
+    /// the shortcut fires (two-hot), while an absurdly low `forcing_node_budget: 1`
+    /// exhausts the budget before the win is proven so the shortcut is skipped.
+    /// Proves the node-budget sentinel + wiring, independent of the depth knob.
+    #[test]
+    fn gumbel_mcts_forcing_node_budget_gates_shortcut() {
+        let stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0),   // q-axis 3-run
+            (100, 100), (100, 101),  // r-axis 2-run
+            (98, 104), (99, 103),    // third-axis 2-run
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+
+        // Independently: full budget proves the win; a 1-node budget cannot.
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            _ => panic!("fixture must be a forced win at the default budgets"),
+        };
+        assert!(
+            !matches!(forcing::solve(&game, SELF_PLAY_DEPTH_CAP, 1), forcing::Outcome::Win(_)),
+            "a 1-node budget must not prove this win"
+        );
+
+        let coords = game.legal_moves();
+        let idx0 = coords.iter().position(|&c| c == solved.pv[0]).expect("pv[0] legal");
+        let idx1 = coords.iter().position(|&c| c == solved.pv[1]).expect("pv[1] legal");
+
+        let base = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        // 0 == sentinel -> SELF_PLAY_NODE_BUDGET (2000): shortcut fires.
+        let default_budget = MCTSConfig { forcing_node_budget: 0, ..base.clone() };
+        // 1 node: solve exhausts budget before proving -> shortcut skipped.
+        let tiny_budget = MCTSConfig { forcing_node_budget: 1, ..base };
+
+        let is_two_hot = |p: &[f64]| {
+            (p[idx0] - 0.5).abs() < 1e-9 && (p[idx1] - 0.5).abs() < 1e-9
+        };
+
+        for seed in 0..5 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let fired = gumbel_mcts(&game, &default_budget, &mut rng, None, &mut dummy_eval).unwrap();
+            assert!(
+                is_two_hot(&fired.improved_policy),
+                "seed {seed}: forcing_node_budget=0 (=default 2000) must fire the shortcut (two-hot)"
+            );
+
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let skipped = gumbel_mcts(&game, &tiny_budget, &mut rng, None, &mut dummy_eval).unwrap();
+            assert!(
+                !is_two_hot(&skipped.improved_policy),
+                "seed {seed}: forcing_node_budget=1 must skip the shortcut (not two-hot), got {:?}",
+                skipped.improved_policy
+            );
+        }
+    }
+
+    /// Change (A): the forcing-solver shortcut must also fire at an mr==1 root
+    /// (one placement left this turn), not only at start-of-turn (mr==2).
+    ///
+    /// Fixture: a "double-open-five" fork. P1 holds a q-axis 4-run
+    /// (10..=13,0) and an r-axis 4-run (9,1..=4). The empty cell (9,0) is the
+    /// shared extension: placing it makes TWO open fives at once (four
+    /// distinct completions: (8,0),(14,0),(9,-1),(9,5)). With only one
+    /// placement left this turn, the attacker plays (9,0); the defender then
+    /// gets a full 2-placement turn but can block at most 2 of the 4
+    /// completions, so the attacker completes next turn -- a genuine mr==1
+    /// forced win (solver depth-2). Crucially (9,0) is NOT an immediate
+    /// single-stone terminal win (only 5-in-a-row, win_length is 6), so the
+    /// depth-1 terminal precheck does NOT fire; only `forcing::solve` sees it.
+    /// Before Change (A) the gate was `== 2`, so at mr==1 the shortcut was
+    /// skipped and the policy came from sequential halving (never exactly
+    /// one-hot); after Change (A) it is one-hot on the single completing
+    /// placement (9,0).
+    #[test]
+    fn gumbel_mcts_forcing_solver_fires_at_mr1_one_hot() {
+        let stones: Vec<(Coord, Player)> = [
+            (10, 0), (11, 0), (12, 0), (13, 0), // q-axis 4-run
+            (9, 1), (9, 2), (9, 3), (9, 4),     // r-axis 4-run
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        // mr == 1: one placement left this turn.
+        let game = GameState::from_state(&stones, Player::P1, 1, GameConfig::FULL_HEXO);
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+
+        // Independently confirm: (a) it is a solver-only forced win whose
+        // single completing placement is (9,0), and (b) no legal move is an
+        // immediate terminal win (so the depth-1 precheck cannot fire).
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            other => panic!("fixture must be a forced win, got No={}", matches!(other, forcing::Outcome::No)),
+        };
+        assert_eq!(solved.first_move, (9, 0), "solver's single completing placement");
+        let coords = game.legal_moves();
+        assert!(coords.contains(&(9, 0)), "(9,0) must be legal");
+        let any_immediate = coords.iter().any(|&c| {
+            let mut g = game.clone();
+            g.apply_move(c).is_ok() && g.is_terminal()
+        });
+        assert!(!any_immediate, "no single-stone terminal win exists (depth-1 must not fire)");
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        for seed in 0..10 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
+
+            assert_eq!(
+                result.action, (9, 0),
+                "seed {seed}: mr==1 shortcut must return the solver's completing placement"
+            );
+            let idx = result
+                .coords
+                .iter()
+                .position(|&c| c == (9, 0))
+                .expect("(9,0) in coords");
+            assert_eq!(
+                result.improved_policy[idx], 1.0,
+                "seed {seed}: mr==1 completion must be one-hot (prob 1.0)"
+            );
+            for (i, &p) in result.improved_policy.iter().enumerate() {
+                if i != idx {
+                    assert_eq!(p, 0.0, "seed {seed}: non-completion move {i} must be 0.0");
+                }
+            }
+            // Invariant: the chosen action lies inside candidate_indices.
+            assert!(
+                result.candidate_indices.contains(&idx),
+                "seed {seed}: chosen action must be in candidate_indices"
+            );
+        }
+    }
+
+    /// Change (B): at an mr==2 root the winning turn is the attacker's
+    /// ORDER-INVARIANT placement pair {pv[0], pv[1]}, so the forcing-solver
+    /// shortcut must emit a TWO-HOT policy target (0.5 on each of pv[0]/pv[1])
+    /// rather than a one-hot on pv[0]. `action` stays pv[0] (greedy
+    /// determinism), and both indices seed visit_counts and candidate_indices.
+    ///
+    /// Fixture: the deterministic double-four fork from
+    /// `forcing::tests::futile_pv_pair_is_greedy_not_canonical_on_real_board`
+    /// (P1 3-runs on q and r sharing (0,0), plus a P2 stone at (-1,0) to break
+    /// the symmetry). Its winning first turn plays two distinct fork cells,
+    /// both legal at the root under the radius-8 config.
+    #[test]
+    fn gumbel_mcts_forcing_solver_two_hot_at_mr2() {
+        let mut stones: Vec<(Coord, Player)> = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
+            .into_iter()
+            .map(|c| (c, Player::P1))
+            .collect();
+        stones.push(((-1, 0), Player::P2));
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+        assert_eq!(game.moves_remaining_this_turn(), 2);
+
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            _ => panic!("fixture must be a forced win"),
+        };
+        assert!(solved.pv.len() >= 2, "two-hot requires a >=2-move pv");
+        let coords = game.legal_moves();
+        let idx0 = coords
+            .iter()
+            .position(|&c| c == solved.pv[0])
+            .expect("pv[0] must be legal at root");
+        let idx1 = coords
+            .iter()
+            .position(|&c| c == solved.pv[1])
+            .expect("pv[1] must be legal at root for this fixture");
+        assert_ne!(idx0, idx1, "pv[0] and pv[1] are distinct placements");
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        for seed in 0..10 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
+
+            assert_eq!(
+                result.action, solved.first_move,
+                "seed {seed}: action must stay pv[0] (greedy determinism)"
+            );
+            assert!(
+                (result.improved_policy[idx0] - 0.5).abs() < 1e-9,
+                "seed {seed}: pv[0] must carry 0.5, got {}",
+                result.improved_policy[idx0]
+            );
+            assert!(
+                (result.improved_policy[idx1] - 0.5).abs() < 1e-9,
+                "seed {seed}: pv[1] must carry 0.5, got {}",
+                result.improved_policy[idx1]
+            );
+            for (i, &p) in result.improved_policy.iter().enumerate() {
+                if i != idx0 && i != idx1 {
+                    assert_eq!(p, 0.0, "seed {seed}: off-pair move {i} must be 0.0");
+                }
+            }
+            // Two-hot visit_counts and candidate_indices membership.
+            assert_eq!(result.visit_counts[idx0], 1, "seed {seed}: pv[0] visit");
+            assert_eq!(result.visit_counts[idx1], 1, "seed {seed}: pv[1] visit");
+            assert!(
+                result.candidate_indices.contains(&idx0)
+                    && result.candidate_indices.contains(&idx1),
+                "seed {seed}: both pair indices must be in candidate_indices"
+            );
+        }
+    }
+
 }

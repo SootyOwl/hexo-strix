@@ -2190,6 +2190,24 @@ class Trainer:
                 "--root-dirichlet-fraction", str(self.mcts_config.root_dirichlet_fraction),
             ])
 
+        # VCF forcing-solver runtime knobs ([self_play.mcts] overrides [mcts]).
+        # Only emit a flag when the resolved value is non-zero (explicitly
+        # configured); 0 means "use the Rust compile-time default", so a default
+        # config produces a byte-identical command line — safe against a
+        # self_play binary that predates these flags.
+        forcing_depth_cap = (
+            sp_mcts.forcing_depth_cap if sp_mcts.forcing_depth_cap is not None
+            else self.mcts_config.forcing_depth_cap
+        )
+        if forcing_depth_cap:
+            cmd.extend(["--forcing-depth-cap", str(forcing_depth_cap)])
+        forcing_node_budget = (
+            sp_mcts.forcing_node_budget if sp_mcts.forcing_node_budget is not None
+            else self.mcts_config.forcing_node_budget
+        )
+        if forcing_node_budget:
+            cmd.extend(["--forcing-node-budget", str(forcing_node_budget)])
+
         # Python subprocess inference (torch.compile, ~2x faster forward pass)
         if rust_cfg.python_inference:
             import sys

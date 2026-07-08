@@ -62,4 +62,27 @@ pub struct MCTSConfig {
     /// self-play is unaffected. Note the improved-policy *target* never used
     /// the Gumbel noise, so this only changes which action is played.
     pub disable_gumbel_noise: bool,
+    /// If `true`, skip the VCF forcing-solver (`forcing::solve`) shortcut run
+    /// at mr=2 roots, so search falls through to normal Gumbel MCTS instead of
+    /// short-circuiting on a proven forced win. `false` (the derived default)
+    /// keeps the solver shortcut ON — bit-equivalent to prior behaviour, so
+    /// self-play is unaffected. Only gates the multi-turn `forcing::solve`
+    /// call; the depth-1 terminal-win shortcut ("if I can win this move, win")
+    /// always stays on.
+    pub disable_forcing_solver: bool,
+    /// Runtime override for the VCF forcing-solver iterative-deepening depth
+    /// cap (in attacker *turns*) used by the mr>=1 shortcut. `0` (the derived
+    /// default) is a sentinel meaning "use the compile-time
+    /// `gumbel_mcts::SELF_PLAY_DEPTH_CAP` constant" — so an unset config is
+    /// bit-identical to prior behaviour. Any non-zero value caps the search at
+    /// that depth instead. Like `n_simulations`/`m_actions`, the raw `0` is not
+    /// itself usable as a real cap at runtime; it only selects the default.
+    pub forcing_depth_cap: u8,
+    /// Runtime override for the VCF forcing-solver per-position node budget
+    /// (the hard ceiling on solve effort) used by the mr>=1 shortcut. `0` (the
+    /// derived default) is a sentinel meaning "use the compile-time
+    /// `gumbel_mcts::SELF_PLAY_NODE_BUDGET` constant" — so an unset config is
+    /// bit-identical to prior behaviour. Any non-zero value uses that budget
+    /// instead. As with `forcing_depth_cap`, raw `0` only selects the default.
+    pub forcing_node_budget: u64,
 }

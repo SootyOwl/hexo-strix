@@ -211,6 +211,11 @@ def main(argv=None):
                             help="Opening generator for the first N plies (default: alternate)")
     h2h_parser.add_argument("--opening-temperature", type=float, default=0.5,
                             help="Temperature for opening generator (default: 0.5)")
+    h2h_parser.add_argument("--disable-forcing-solver", action="store_true",
+                            help="Solver-OFF diagnostic: disable the VCF forcing-solver "
+                                 "shortcut for BOTH sides, measuring raw-network strength "
+                                 "(requires a hexo_rs extension rebuilt with the "
+                                 "disable_forcing_solver kwarg).")
     # --- serve ---
     serve_parser = subparsers.add_parser(
         "serve",
@@ -709,7 +714,8 @@ def _run_head_to_head(args):
         state_file=state_file,
         opening_plies=args.opening_plies,
         opening_temperature=args.opening_temperature,
-        opening_generator=args.opening_generator
+        opening_generator=args.opening_generator,
+        disable_forcing_solver=args.disable_forcing_solver,
     )
     # accept_h1 or reject_h1 → 0 (SPRT terminated); inconclusive → 2
     if summary["decision"] in ("accept_h1", "reject_h1"):

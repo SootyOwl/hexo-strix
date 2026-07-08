@@ -1449,6 +1449,9 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         root_dirichlet_fraction: base.root_dirichlet_fraction,
         forced_candidate_capture_k: base.forced_candidate_capture_k,
         disable_gumbel_noise: base.disable_gumbel_noise,
+        disable_forcing_solver: base.disable_forcing_solver,
+        forcing_depth_cap: base.forcing_depth_cap,
+        forcing_node_budget: base.forcing_node_budget,
     }
 }
 
@@ -1865,6 +1868,12 @@ fn main() {
     // 0.0 = disabled (serial sims, current behaviour). 0.3–1.0 enables fusion.
     let mut virtual_loss: f64 = 0.0;
 
+    // VCF forcing-solver runtime knobs. 0 = sentinel meaning "use the
+    // compile-time SELF_PLAY_DEPTH_CAP / SELF_PLAY_NODE_BUDGET default", so an
+    // unset value is bit-identical to prior self-play behaviour.
+    let mut forcing_depth_cap: u8 = 0;
+    let mut forcing_node_budget: u64 = 0;
+
     // Root Dirichlet noise (AlphaZero-style root exploration applied before
     // Gumbel-Top-k candidate sampling). Both default to 0.0 → disabled,
     // bit-equivalent to existing behaviour.
@@ -2001,6 +2010,14 @@ fn main() {
                     eprintln!("--root-dirichlet-fraction must be in [0, 1], got {}", root_dirichlet_fraction);
                     std::process::exit(1);
                 }
+                i += 2;
+            }
+            "--forcing-depth-cap" => {
+                forcing_depth_cap = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--forcing-node-budget" => {
+                forcing_node_budget = args[i + 1].parse().unwrap();
                 i += 2;
             }
             "--warmup-games" => {
@@ -2153,6 +2170,15 @@ fn main() {
         forced_candidate_capture_k: 0,
         // Self-play keeps Gumbel noise on; only eval/play disable it.
         disable_gumbel_noise: false,
+        // Self-play keeps the VCF forcing-solver shortcut on; only the
+        // eval/play path may toggle it off. Default (false) preserves the
+        // current bit-identical self-play behaviour.
+        disable_forcing_solver: false,
+        // Runtime overrides for the forcing-solver depth cap / node budget.
+        // 0 (the sentinel) resolves to SELF_PLAY_DEPTH_CAP / SELF_PLAY_NODE_BUDGET
+        // inside the shortcut, so an unconfigured run is bit-identical.
+        forcing_depth_cap,
+        forcing_node_budget,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {

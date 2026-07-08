@@ -273,6 +273,9 @@ impl PyMCTSConfig {
         root_dirichlet_fraction=0.0,
         forced_candidate_capture_k=0,
         disable_gumbel_noise=false,
+        disable_forcing_solver=false,
+        forcing_depth_cap=0,
+        forcing_node_budget=0,
     ))]
     fn new(
         n_simulations: u32,
@@ -284,6 +287,9 @@ impl PyMCTSConfig {
         root_dirichlet_fraction: f64,
         forced_candidate_capture_k: usize,
         disable_gumbel_noise: bool,
+        disable_forcing_solver: bool,
+        forcing_depth_cap: u8,
+        forcing_node_budget: u64,
     ) -> PyResult<Self> {
         if m_actions < 1 {
             return Err(PyValueError::new_err("m_actions must be >= 1"));
@@ -319,6 +325,9 @@ impl PyMCTSConfig {
                 root_dirichlet_fraction,
                 forced_candidate_capture_k,
                 disable_gumbel_noise,
+                disable_forcing_solver,
+                forcing_depth_cap,
+                forcing_node_budget,
             },
         })
     }
