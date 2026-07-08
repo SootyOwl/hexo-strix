@@ -346,12 +346,21 @@ class AxisRelationalLayer(nn.Module):
         # SUMMED (each summand carries its own (1+eps)*x self term); the global
         # bucket runs the untied global GINE. Reaches into the sub-convs'
         # eps/mlp_0/mlp_1 params so the eager weights map straight across.
+        #
+        # FUSED: because the axis GINE is tied (same mlp_0/mlp_1 for every axis)
+        # and nn.Linear is row-wise, applying it once per axis and summing is
+        # mathematically identical to stacking the 3 axis buckets, running the
+        # MLP once over the stack, and summing the axis dimension:
+        #   Σ_k mlp(z_k) == mlp(stack(z_0,z_1,z_2)).sum(axis=k)
+        # This turns 6 matmuls + 3 relus per layer into 2 matmuls + 1 relu
+        # (saves ~4 kernel launches/layer). Bit-identical to the per-axis loop
+        # at float precision (the sum order is the same k=0,1,2 reduction).
         one_plus_eps = 1.0 + self.axis_conv.eps
-        agg = torch.zeros(N, self.out_dim, device=x.device, dtype=x.dtype)
-        for k in range(self.num_axes):
-            z = one_plus_eps * x + buckets.select(1, k)
-            a = self.axis_conv.mlp_1(F.relu(self.axis_conv.mlp_0(z)))
-            agg = agg + a
+        axis_buckets = buckets[:, : self.num_axes, :]              # (N, K, out_dim)
+        z = one_plus_eps * x.unsqueeze(1) + axis_buckets           # (N, K, out_dim)
+        z_flat = z.reshape(N * self.num_axes, self.out_dim)        # (N*K, out_dim)
+        a_flat = self.axis_conv.mlp_1(F.relu(self.axis_conv.mlp_0(z_flat)))
+        agg = a_flat.reshape(N, self.num_axes, self.out_dim).sum(dim=1)  # (N, out_dim)
 
         if self.use_global:
             zg = (1.0 + self.global_conv.eps) * x + buckets.select(1, self.num_axes)
