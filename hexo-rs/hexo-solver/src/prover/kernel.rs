@@ -1,4 +1,4 @@
-//! `pub(crate)` facade over the validated VCF kernel in `crate::mcts::forcing`.
+//! `pub(crate)` facade over the validated VCF kernel in `crate::forcing`.
 //!
 //! Every driver (df-pn, PDS-PN, hybrid) evaluates node terminal status and
 //! generates children **only** through this facade, so cross-driver agreement is
@@ -34,7 +34,7 @@
 //! path-independent. Plain transposition-table reuse keyed on `(hash, kind,
 //! placements)` is therefore sound with no graph-history-interaction handling.
 
-use crate::mcts::forcing::{
+use crate::forcing::{
     CellSet2, SolverBoard, attacker_turns_with, completions, futile_defender_pair, min_covers2,
     MAX_WL,
 };

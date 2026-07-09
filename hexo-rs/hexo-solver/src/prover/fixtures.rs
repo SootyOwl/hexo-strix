@@ -1,5 +1,5 @@
 //! Cross-driver parity fixtures (real HDS puzzle positions) and the parity /
-//! micro tests. Stone arrays are copied verbatim from `mcts::forcing`'s validated
+//! micro tests. Stone arrays are copied verbatim from `hexo_solver::forcing`'s validated
 //! parity fixtures so the prover proves the *same* positions the kernel's own
 //! parity suite pins — no HDS-codec conversion in the test path.
 

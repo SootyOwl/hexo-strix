@@ -805,6 +805,7 @@ version = "0.1.0"
 dependencies = [
  "hexo-engine",
  "rustc-hash",
+ "serde",
  "serde_json",
 ]
 

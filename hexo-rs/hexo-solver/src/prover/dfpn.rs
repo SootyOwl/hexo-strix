@@ -25,7 +25,7 @@ use super::io::{Stats, Verdict};
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
 use super::pn::{INF, PnSearch, ProofTt, node_key, one_plus_eps, sat_add};
 use super::{Ctl, DriverResult, ProverConfig};
-use crate::mcts::forcing::CellSet2;
+use crate::forcing::CellSet2;
 use hexo_engine::types::Coord;
 use rustc_hash::FxHashSet;
 use std::time::Instant;
@@ -545,7 +545,7 @@ fn pv_replays_win(pos: &super::io::Position, pv: &[Coord]) -> bool {
 /// the caller's `Ctl` deadline/cancel so the fallback can never run past
 /// `--time-limit` even under a very large `--node-budget`.
 fn kernel_pv(pos: &super::io::Position, cfg: &ProverConfig, ctl: &Ctl) -> Option<(Vec<Coord>, u8)> {
-    use crate::mcts::forcing::{Outcome, solve_limited};
+    use crate::forcing::{Outcome, solve_limited};
     let game = pos.to_game();
     match solve_limited(&game, cfg.depth_cap, cfg.node_budget, cfg.wide, ctl.forcing_limits()) {
         Outcome::Win(w) => Some((w.pv, w.depth)),

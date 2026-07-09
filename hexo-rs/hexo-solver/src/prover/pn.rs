@@ -9,7 +9,7 @@
 //! node `(INF, 0)`, an unexpanded unknown `(1, 1)`.
 
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
-use crate::mcts::forcing::CellSet2;
+use crate::forcing::CellSet2;
 use rustc_hash::FxHashSet;
 
 /// The proof/disproof "infinity". Kept well below `u32::MAX` so saturating sums of

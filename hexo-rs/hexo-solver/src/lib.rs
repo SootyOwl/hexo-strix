@@ -3,3 +3,4 @@
 //! Pure combinatorial search with no neural-net, MCTS, or PyO3 dependencies.
 
 pub mod forcing;
+pub mod prover;

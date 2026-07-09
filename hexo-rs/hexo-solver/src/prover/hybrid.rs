@@ -25,7 +25,7 @@
 use super::io::{Line, Position, Stats, UnverifiedBranch, Verdict};
 use super::kernel::{AndEval, KernelCtx};
 use super::{Ctl, DriverResult, ProverConfig};
-use crate::mcts::forcing::{CellSet2, Outcome, solve_limited};
+use crate::forcing::{CellSet2, Outcome, solve_limited};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::FxHashSet;
 use std::time::Instant;
