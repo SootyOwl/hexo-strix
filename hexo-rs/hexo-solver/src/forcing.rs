@@ -43,10 +43,10 @@ const STRIP: usize = 2 * MAX_WL - 1;
 /// Grid border padding kept around every stone. Must be >= any tight-regime
 /// radius (which is < win_length - 1 <= MAX_WL - 1) so that reach-count updates
 /// for a just-placed stone never fall outside the grid.
-const GRID_PAD: i32 = 16;
+pub(crate) const GRID_PAD: i32 = 16;
 /// Hard cap on grid area — fails loudly on pathological coordinate spreads
 /// instead of attempting a multi-GB allocation.
-const MAX_GRID_CELLS: i64 = 64 * 1024 * 1024;
+pub(crate) const MAX_GRID_CELLS: i64 = 64 * 1024 * 1024;
 
 #[inline]
 fn splitmix64(mut z: u64) -> u64 {
@@ -1142,8 +1142,16 @@ fn solve_from_ex(board: &mut SolverBoard, attacker: Player, defender: Player,
 
 use hexo_engine::game::GameState;
 
+#[derive(Debug)]
 pub struct ForcingWin { pub depth: u8, pub first_move: Coord, pub pv: Vec<Coord> }
+#[derive(Debug)]
 pub enum Outcome { Win(ForcingWin), No, BudgetExceeded }
+
+impl Outcome {
+    /// True iff this is a proven forced win for the side to move.
+    #[inline]
+    pub fn is_win(&self) -> bool { matches!(self, Outcome::Win(_)) }
+}
 
 pub fn solve(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     solve_ex(game, depth_cap, node_budget, false, Limits::default())
@@ -1232,6 +1240,44 @@ fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool, limit
                 Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
                 // Should be impossible for a proven win, but never panic: fall back to
                 // treating it as no forcing win found; the MCTS caller just runs normal search.
+                None => Outcome::No,
+            }
+        }
+    }
+}
+
+/// Board-level entry point: solve from a pre-built `SolverBoard` (the same path
+/// `solve`/`solve_ex` take after building the board from a `GameState`). This is the
+/// public way to solve an *arbitrary* board that could not arise in a real game
+/// (e.g. one missing the `(0,0,P1)` origin stone `GameState::from_state` requires):
+/// the caller constructs the board directly via `SolverBoard::place` (and
+/// `reserve`/`enable_reach` for the tight regime) and passes it here.
+///
+/// `solve_from_ex` is the actual search; this wrapper runs it, then reconstructs the
+/// principal variation and first winning move exactly as `solve_ex` does. `wide`
+/// gates the experimental wide-partner generator; pass `false` for the production
+/// search. `limits` carries optional deadline/cancel cutoffs
+/// (`Limits::default()` = no cutoff = the `solve` behaviour).
+pub fn solve_from_board(
+    board: &mut SolverBoard,
+    attacker: Player,
+    placements: u8,
+    wl: u8,
+    radius: i32,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+) -> Outcome {
+    let defender = attacker.opponent();
+    match solve_from_ex(board, attacker, defender, placements, wl, radius, depth_cap, node_budget, wide, limits) {
+        SolveResult::No => Outcome::No,
+        SolveResult::BudgetExceeded => Outcome::BudgetExceeded,
+        SolveResult::Win { depth } => {
+            let fm = first_winning_move(board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
+            let pv = extract_pv(board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
+            match fm.or_else(|| pv.first().copied()) {
+                Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
                 None => Outcome::No,
             }
         }
