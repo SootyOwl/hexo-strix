@@ -13,7 +13,8 @@
 use hexo_engine::types::{Coord, Player as EnginePlayer};
 use hexo_solver::forcing::{ForcingWin, Outcome};
 use hexo_solver::{
-    solve_from_position, solve_wide_from_position, SolverEngine, SolverPosition,
+    is_game_valid_board, solve_defense_from_position, solve_from_position,
+    solve_wide_from_position, SolverEngine, SolverPosition,
 };
 use wasm_bindgen::prelude::*;
 
@@ -82,7 +83,7 @@ pub struct Turn {
 }
 
 #[wasm_bindgen(getter_with_clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SolveOutcome {
     pub kind: SolveKind,
     pub depth: u8,
@@ -91,17 +92,18 @@ pub struct SolveOutcome {
     pub pv: Vec<Turn>,
 }
 
-// --- Task 6 stub types (surface complete; implementation deferred) ---
+// --- Task 6: defense analysis export ---
 
 #[wasm_bindgen]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefenseKind {
-    /// A single placement that refutes the threat (or ends the game).
-    Killer = 0,
-    /// A pair of placements that jointly refute the threat.
-    Pair = 1,
-    /// Max-delay fallback: the surviving candidate with the longest re-proven PV.
-    Delay = 2,
+    /// The opponent has a proven forcing threat (the mover has a defense to find).
+    ThreatFound = 0,
+    /// No proven opponent threat — nothing to defend. NOTE: this conflates "no
+    /// threat" with "budget exceeded during the threat check" (`solve_defense`
+    /// returns `None` for both); the caller cannot distinguish them from this
+    /// enum alone. A larger `node_budget` disambiguates on re-query.
+    NoThreat = 1,
 }
 
 #[wasm_bindgen]
@@ -114,10 +116,30 @@ pub struct PairAnchor {
 #[wasm_bindgen(getter_with_clone)]
 #[derive(Debug)]
 pub struct DefenseOutcome {
+    /// `ThreatFound` if the opponent has a proven threat, else `NoThreat`.
     pub kind: DefenseKind,
-    pub threat_pv: Vec<CoordW>,
+    /// Total search nodes across the threat solve + all candidate re-solves.
+    /// `DefenseAnalysis` does not currently aggregate node counts, so this is 0
+    /// (a future enhancement could propagate the sum).
+    pub nodes: u64,
+    /// Wall-clock time of the whole analysis (ms). `0.0` on wasm (no monotonic
+    /// clock — see the module-level `Instant::now()` note).
+    pub time_ms: f64,
+    /// The opponent's threat as a `SolveOutcome` (`kind: Win`), chunked into
+    /// turns the same way as `solve`: the threat is a fresh 2-placement turn
+    /// for the opponent, so the first turn has 2 cells. `None` when there is no
+    /// proven threat. `depth` is the real threat depth (captured in
+    /// `DefenseAnalysis::threat_depth`); `nodes` is 0 (the sub-solve's node
+    /// count is not surfaced by `solve_defense`).
+    pub threat: Option<SolveOutcome>,
+    /// Single placements after which the threat is no longer provable (or which
+    /// end the game outright).
     pub killers: Vec<CoordW>,
+    /// `(first, second)` placement pairs that jointly refute the threat.
+    /// Searched only when the mover has 2 placements left and `killers` is empty.
     pub pair_anchors: Vec<PairAnchor>,
+    /// Max-delay fallback: the surviving candidate whose re-proven threat PV is
+    /// longest. `None` when the threat PV offers no legal candidate.
     pub best_delay: Option<CoordW>,
 }
 
@@ -163,13 +185,96 @@ impl StrixSolver {
         Self::solve_inner(&flipped, limits, false)
     }
 
-    /// Task 6 fills this in; the types are defined so the WASM surface is stable.
+    /// Defensive analysis for the side to move: detects the opponent's
+    /// flipped-perspective forcing threat and reports which placements refute it
+    /// (killers / pair anchors / best-delay fallback). Wraps
+    /// `hexo_solver::solve_defense_from_position`, which delegates to the
+    /// battle-tested `forcing::solve_defense`.
+    ///
+    /// `limits.engine` is INERT for defense: the analysis always uses the forcing
+    /// (idtt) solver internally (the candidate-verification pattern is
+    /// forcing-only). `depth_cap` and `node_budget` are honored. The time limit
+    /// is a fixed 10s default on native (the `SolverLimits` surface has no time
+    /// field); on wasm the deadline is skipped and `node_budget` is the sole
+    /// bound.
+    ///
+    /// Requires a GAME-VALID position (the `(0,0,P1)` origin present, no
+    /// duplicate/contradictory coords — `GameState::from_state` seeds the origin
+    /// and panics otherwise). For an invalid position returns `Err(JsError)`
+    /// with a clear message; defense analysis is inherently about a game
+    /// position's turn, so requiring game-validity is consistent with the deep
+    /// provers (Task 4).
     pub fn solve_defense(
         &self,
-        _position: &Position,
-        _limits: &SolverLimits,
+        position: &Position,
+        limits: &SolverLimits,
     ) -> Result<DefenseOutcome, JsError> {
-        Err(JsError::new("solve_defense not yet implemented (Task 6)"))
+        let t0 = instant_now();
+        let pos = convert_position(position)?;
+        if !is_game_valid_board(&pos.stones) {
+            return Err(JsError::new(
+                "solve_defense requires a game-valid position: the (0,0,P1) origin \
+                 stone must be present, with no duplicate or contradictory coords",
+            ));
+        }
+        let analysis = solve_defense_from_position(
+            &pos,
+            limits.depth_cap,
+            limits.node_budget,
+            std::time::Duration::from_secs(10),
+        );
+        let time_ms = elapsed_ms(t0);
+        // `solve_defense` returns None for BOTH "no threat" and "budget exceeded
+        // during the threat check" — there is no distinct BudgetExceeded case
+        // (see forcing.rs: Outcome::No | Outcome::BudgetExceeded => return None).
+        // Map None → NoThreat (documented conflation).
+        match analysis {
+            None => Ok(DefenseOutcome {
+                kind: DefenseKind::NoThreat,
+                nodes: 0,
+                time_ms,
+                threat: None,
+                killers: Vec::new(),
+                pair_anchors: Vec::new(),
+                best_delay: None,
+            }),
+            Some(a) => {
+                // The threat is the opponent's fresh 2-placement turn: chunk with
+                // moves_remaining=2, attacker = opponent of `to_move`.
+                let threat_attacker = opponent(position.to_move);
+                let threat = if a.threat_pv.is_empty() {
+                    None
+                } else {
+                    Some(SolveOutcome {
+                        kind: SolveKind::Win,
+                        depth: a.threat_depth,
+                        nodes: 0, // solve_defense does not surface sub-solve node counts
+                        time_ms: 0.0, // the threat sub-solve's own time is not isolated
+                        pv: chunk_pv(&a.threat_pv, 2, threat_attacker),
+                    })
+                };
+                Ok(DefenseOutcome {
+                    kind: if threat.is_some() {
+                        DefenseKind::ThreatFound
+                    } else {
+                        DefenseKind::NoThreat
+                    },
+                    nodes: 0,
+                    time_ms,
+                    threat,
+                    killers: a.killers.iter().map(|&(q, r)| CoordW { q, r }).collect(),
+                    pair_anchors: a
+                        .pair_anchors
+                        .iter()
+                        .map(|&(a, b)| PairAnchor {
+                            first: CoordW { q: a.0, r: a.1 },
+                            second: CoordW { q: b.0, r: b.1 },
+                        })
+                        .collect(),
+                    best_delay: a.best_delay.map(|(q, r)| CoordW { q, r }),
+                })
+            }
+        }
     }
 }
 
@@ -493,21 +598,119 @@ mod tests {
         assert!(matches!(out.kind, SolveKind::Win), "wide should also find the win, got {:?}", out.kind);
     }
 
-    /// `solve_defense` is a Task 6 stub: must return an error, not panic.
-    /// Gated to wasm32 because JsError::new() is a wasm-bindgen imported
-    /// function that panics on non-wasm targets.
+    /// `solve_defense` on a position where the opponent (P1) has a proven
+    /// forcing threat against the mover (P2) reports `ThreatFound` with a
+    /// chunked threat PV. Uses the three-in-a-row-at-win_length-4 shape: P1
+    /// has three along the q-axis, P2 to move — P1's flipped fresh-turn solve is
+    /// a win, so the defense finds a threat. Killers/pairs/best_delay are
+    /// whatever the analysis reports (not asserted beyond non-panic + kind).
+    #[test]
+    fn solve_defense_finds_threat() {
+        let solver = StrixSolver::new();
+        let pos = Position {
+            win_length: 4,
+            placement_radius: 8,
+            max_moves: 200,
+            to_move: Player::P2,
+            moves_remaining: 2,
+            stones: vec![
+                Stone { coord: CoordW { q: 0, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 1, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 2, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 5, r: 5 }, player: Player::P2 },
+            ],
+        };
+        let out = solver.solve_defense(&pos, &limits_idtt(6, 20_000)).unwrap();
+        assert_eq!(out.kind, DefenseKind::ThreatFound, "P1's three-in-a-row is a threat");
+        let threat = out.threat.as_ref().expect("ThreatFound must carry a threat");
+        assert!(matches!(threat.kind, SolveKind::Win), "threat must be a Win");
+        assert!(threat.depth >= 1, "threat depth must be positive");
+        assert!(!threat.pv.is_empty(), "threat must carry a chunked pv");
+        // The threat is P1's fresh 2-placement turn: first turn is P1 with 2 cells.
+        assert_eq!(threat.pv[0].turn, 0);
+        assert_eq!(threat.pv[0].player, Player::P1, "threat attacker is P1 (opponent)");
+        assert!(threat.pv[0].cells.len() <= 2);
+    }
+
+    /// `solve_defense` on a position with no opponent threat reports `NoThreat`
+    /// (a single P1 stone and a single P2 stone far apart, win_length 6, tight
+    /// radius — no forcing line for either side).
+    #[test]
+    fn solve_defense_no_threat() {
+        let solver = StrixSolver::new();
+        let pos = Position {
+            win_length: 6,
+            placement_radius: 2,
+            max_moves: 200,
+            to_move: Player::P1,
+            moves_remaining: 2,
+            stones: vec![
+                Stone { coord: CoordW { q: 0, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 10, r: 10 }, player: Player::P2 },
+            ],
+        };
+        let out = solver.solve_defense(&pos, &limits_idtt(6, 20_000)).unwrap();
+        assert_eq!(out.kind, DefenseKind::NoThreat, "no opponent threat expected");
+        assert!(out.threat.is_none(), "NoThreat carries no threat");
+        assert!(out.killers.is_empty(), "no threat → no killers");
+        assert!(out.pair_anchors.is_empty(), "no threat → no pair anchors");
+        assert!(out.best_delay.is_none(), "no threat → no best_delay");
+    }
+
+    /// `solve_defense` rejects a non-game-valid position (missing the (0,0,P1)
+    /// origin). On native the `Err(JsError)` path can't be exercised directly
+    /// (`JsError::new` is a wasm-bindgen imported function that panics on
+    /// non-wasm targets), so this test verifies the gate the WASM layer relies
+    /// on: `is_game_valid_board` returns false for the no-origin board. The
+    /// actual `Err` return is covered by the wasm32-gated test below.
+    #[test]
+    fn solve_defense_rejects_invalid_position() {
+        let pos = Position {
+            win_length: 4,
+            placement_radius: 8,
+            max_moves: 200,
+            to_move: Player::P1,
+            moves_remaining: 2,
+            // No (0,0,P1) origin — not game-valid.
+            stones: vec![
+                Stone { coord: CoordW { q: 3, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 4, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 8, r: 8 }, player: Player::P2 },
+            ],
+        };
+        let solver_pos = convert_position(&pos).unwrap();
+        assert!(
+            !is_game_valid_board(&solver_pos.stones),
+            "no-origin board must fail the game-validity gate"
+        );
+    }
+
+    /// On wasm32, `solve_defense` returns a clear `Err` for a non-game-valid
+    /// position (the gate fires before any `GameState::from_state` panic). Gated
+    /// to wasm32 because `JsError::new()` is a wasm-bindgen imported function
+    /// that panics on non-wasm targets.
     #[cfg(target_arch = "wasm32")]
     #[test]
-    fn solve_defense_returns_not_implemented() {
+    fn solve_defense_returns_err_on_invalid_position() {
         let solver = StrixSolver::new();
-        let pos = empty_position();
+        let pos = Position {
+            win_length: 4,
+            placement_radius: 8,
+            max_moves: 200,
+            to_move: Player::P1,
+            moves_remaining: 2,
+            stones: vec![
+                Stone { coord: CoordW { q: 3, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 4, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 8, r: 8 }, player: Player::P2 },
+            ],
+        };
         let res = solver.solve_defense(&pos, &limits_idtt(6, 5_000));
-        assert!(res.is_err(), "solve_defense must return Err (Task 6 stub)");
-        // JsError doesn't impl Display in wasm-bindgen 0.2; inspect via Debug.
+        assert!(res.is_err(), "non-game-valid position must return Err");
         let dbg = format!("{:?}", res.unwrap_err());
         assert!(
-            dbg.contains("not yet implemented"),
-            "error must mention not-yet-implemented, got {dbg:?}"
+            dbg.contains("game-valid"),
+            "error must mention game-validity, got {dbg:?}"
         );
     }
 

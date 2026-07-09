@@ -1406,6 +1406,11 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
 /// `BudgetExceeded` counts as killed (parity with the old loop; an honest
 /// "couldn't re-prove" stands down to MCTS rather than panicking the defense).
 pub struct DefenseAnalysis {
+    /// The depth of the opponent's proven threat (from the flipped fresh-turn
+    /// `solve`). Captured so WASM/PyO3 callers can reconstruct a `SolveOutcome`
+    /// with the real depth rather than a sentinel. The threat PV is a fresh
+    /// 2-placement turn, so chunk with `moves_remaining = 2`.
+    pub threat_depth: u8,
     /// The opponent's proven threat line (flipped fresh-turn solve).
     pub threat_pv: Vec<Coord>,
     /// Single placements after which the threat is no longer provable, or
@@ -1463,11 +1468,20 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
                      time_limit: std::time::Duration) -> Option<DefenseAnalysis> {
     let mover = game.current_player()?;
     let opp = mover.opponent();
+    // `Instant::now()` panics at runtime on wasm32-unknown-unknown (no monotonic
+    // clock in std for that target). On wasm the deadline is skipped entirely —
+    // `node_budget` is the sole bound (the partial-result-on-expiry semantics
+    // are lost, but every sub-solve is still budget-bound). Native behavior is
+    // unchanged: the deadline still honors `time_limit`.
+    #[cfg(not(target_arch = "wasm32"))]
     let t0 = Instant::now();
+    #[cfg(target_arch = "wasm32")]
+    let _ = time_limit;
     let threat = match solve(&flipped_fresh_turn(game, opp), depth_cap, node_budget) {
         Outcome::Win(w) => w,
         Outcome::No | Outcome::BudgetExceeded => return None,
     };
+    let threat_depth = threat.depth;
     let legal = game.legal_moves_set();
     let mut candidates: Vec<Coord> = Vec::new();
     for &c in &threat.pv {
@@ -1481,6 +1495,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
     // metric, its cells are the second-placement candidates in the pair pass.
     let mut survivors: Vec<(Coord, Vec<Coord>)> = Vec::new();
     for &c in &candidates {
+        #[cfg(not(target_arch = "wasm32"))]
         if t0.elapsed() > time_limit { break; }
         let mut trial = game.clone();
         if trial.apply_move(c).is_err() { continue; }
@@ -1497,6 +1512,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
     let mut pair_anchors: Vec<(Coord, Coord)> = Vec::new();
     if killers.is_empty() && game.moves_remaining_this_turn() == 2 {
         'anchors: for (c1, pv2) in &survivors {
+            #[cfg(not(target_arch = "wasm32"))]
             if t0.elapsed() > time_limit { break; }
             let mut trial = game.clone();
             if trial.apply_move(*c1).is_err() { continue; }
@@ -1508,6 +1524,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
                 }
             }
             for c2 in seconds {
+                #[cfg(not(target_arch = "wasm32"))]
                 if t0.elapsed() > time_limit { break 'anchors; }
                 let mut trial2 = trial.clone();
                 if trial2.apply_move(c2).is_err() { continue; }
@@ -1535,6 +1552,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
     }
 
     Some(DefenseAnalysis {
+        threat_depth,
         threat_pv: threat.pv,
         killers,
         pair_anchors,

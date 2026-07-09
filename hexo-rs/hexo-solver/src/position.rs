@@ -22,8 +22,9 @@
 //!   game-valid they return [`Outcome::BudgetExceeded`] — an honest give-up, never
 //!   a bogus verdict. Use Idtt for arbitrary boards.
 
-use crate::forcing::{self, Limits, Outcome, SolverBoard, MAX_WL};
+use crate::forcing::{self, DefenseAnalysis, Limits, Outcome, SolverBoard, MAX_WL};
 use crate::prover;
+use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::{Coord, Player};
 
 /// An arbitrary board state for the solver. Not required to be a reachable game
@@ -108,7 +109,7 @@ impl SolverPosition {
 /// 2. No coord appears more than once (uniqueness — `Board::place` panics on
 ///    duplicates, e.g. `((5,5),P1)` + `((5,5),P2)`).
 /// 3. No `(0,0,P2)` present (the contradictory origin — `(0,0)` may only be P1).
-fn is_game_valid_board(stones: &[(Coord, Player)]) -> bool {
+pub fn is_game_valid_board(stones: &[(Coord, Player)]) -> bool {
     use std::collections::HashSet;
     let mut has_origin = false;
     let mut coords: HashSet<Coord> = HashSet::with_capacity(stones.len());
@@ -182,6 +183,51 @@ pub fn solve_wide_from_position(
     node_budget: u64,
 ) -> Outcome {
     dispatch(position, engine, depth_cap, node_budget, true)
+}
+
+/// Defensive analysis for the side to move (see [`forcing::solve_defense`]):
+/// detects the opponent's flipped-perspective forcing threat and reports which
+/// placements refute it (killers / pair anchors / best-delay fallback).
+///
+/// Unlike [`solve_from_position`] (which dispatches across engines), defense
+/// analysis always uses the forcing `solve` (idtt) internally — the real
+/// `forcing::solve_defense` stacks many budget-bound sub-solves and the forcing
+/// solver is the only engine that supports the candidate-verification pattern.
+/// The `engine` selection from the caller is therefore inert for defense.
+///
+/// Requires a **game-valid** position: the analysis builds a `GameState` via
+/// `GameState::from_state` (which seeds the `(0,0,P1)` origin and panics on
+/// duplicate/contradictory coords — see [`is_game_valid_board`]). For a position
+/// that is not game-valid, returns `None` (an honest give-up that conflates with
+/// "no threat found"; the WASM layer gates with [`is_game_valid_board`] and
+/// returns a clear `Err` for invalid positions, so the WASM API never conflates).
+///
+/// `time_limit` bounds the whole analysis on native (partial results on expiry);
+/// on wasm32 the deadline is skipped (`Instant::now()` panics there) and
+/// `node_budget` is the sole bound.
+pub fn solve_defense_from_position(
+    position: &SolverPosition,
+    depth_cap: u8,
+    node_budget: u64,
+    time_limit: std::time::Duration,
+) -> Option<DefenseAnalysis> {
+    // Defense builds a GameState (GameState::from_state seeds (0,0,P1) and panics
+    // on duplicate/contradictory coords). Gate on game-validity; invalid → None.
+    if !is_game_valid_board(&position.stones) {
+        return None;
+    }
+    let cfg = GameConfig {
+        win_length: position.win_length,
+        placement_radius: position.placement_radius,
+        max_moves: position.max_moves,
+    };
+    let game = GameState::from_state(
+        &position.stones,
+        position.to_move,
+        position.moves_remaining,
+        cfg,
+    );
+    forcing::solve_defense(&game, depth_cap, node_budget, time_limit)
 }
 
 fn dispatch(
