@@ -799,6 +799,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexo-solver"
+version = "0.1.0"
+dependencies = [
+ "hexo-engine",
+ "rustc-hash",
+]
+
+[[package]]
 name = "hexo-wasm"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "hexo-solver"
+version = "0.1.0"
+edition = "2024"
+authors = ["SootyOwl"]
+description = "Fully-forcing (VCF) threat-space solver for HeXO + deep prover drivers"
+license = "MIT"
+
+[lib]
+name = "hexo_solver"
+crate-type = ["rlib"]
+
+[dependencies]
+hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
+rustc-hash = "2"
+
+[dev-dependencies]
+hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
