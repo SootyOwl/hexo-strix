@@ -378,9 +378,16 @@ fn pns_solve(pos: &prover::io::Position, cfg: &prover::ProverConfig, ctl: &prove
     };
     let root = Node::Or { placements: pos.placements_remaining };
     let mut search = PnSearch::new(cfg.pn2_nodes);
+    // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
+    // clock in std for that target). The elapsed value is only used for the
+    // `stats.elapsed_s` report (not correctness), so on wasm we report 0.0.
+    #[cfg(not(target_arch = "wasm32"))]
     let t = std::time::Instant::now();
     let (pn, dn) = search.search(&mut k, root);
+    #[cfg(not(target_arch = "wasm32"))]
     let elapsed = t.elapsed().as_secs_f64();
+    #[cfg(target_arch = "wasm32")]
+    let elapsed: f64 = 0.0;
 
     // Verdict discipline mirrors dfpn: only a genuinely resolved root is WIN/NO.
     let verdict = if pn == 0 {

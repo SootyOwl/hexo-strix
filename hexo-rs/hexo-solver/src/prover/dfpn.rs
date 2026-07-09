@@ -28,6 +28,7 @@ use super::{Ctl, DriverResult, ProverConfig};
 use crate::forcing::CellSet2;
 use hexo_engine::types::Coord;
 use rustc_hash::FxHashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 const EPS: f64 = 0.25;
@@ -468,9 +469,17 @@ pub(crate) fn solve_mode(
     };
     let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode);
     let root = Node::Or { placements: pos.placements_remaining };
+    // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
+    // clock in std for that target). The elapsed value is only used for the
+    // `stats.elapsed_s` report (not correctness), so on wasm we report 0.0.
+    // This covers both Dfpn and Pdspn (Pdspn delegates to `solve_mode`).
+    #[cfg(not(target_arch = "wasm32"))]
     let t = Instant::now();
     let (pn, dn) = d.mid(root, INF, INF, 0);
+    #[cfg(not(target_arch = "wasm32"))]
     let elapsed = t.elapsed().as_secs_f64();
+    #[cfg(target_arch = "wasm32")]
+    let elapsed: f64 = 0.0;
     if std::env::var("DFPN_DEBUG").is_ok() {
         eprintln!(
             "[dfpn] nodes={} pn={pn} dn={dn} max_depth={} tt_hits={} elapsed={elapsed:.2}s",
