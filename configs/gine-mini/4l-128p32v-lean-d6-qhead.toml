@@ -108,6 +108,8 @@ exploration_window = 2000
 exploration_exponent = 1.0
 exploration_distribution = "visit_counts"
 truncate_delta = 0.25
+forcing_depth_cap = 16
+forcing_node_budget = 25000
 
 [training]
 batch_size = 512
