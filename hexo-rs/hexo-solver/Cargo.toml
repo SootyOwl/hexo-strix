@@ -16,3 +16,4 @@ rustc-hash = "2"
 
 [dev-dependencies]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
+serde_json = "1"

@@ -31,6 +31,7 @@ dedup_skip = ["dedup_count"]
 
 [dependencies]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
+hexo-solver = { version = "0.1.0", path = "../hexo-solver" }
 pyo3 = { version = "0.28", optional = true }
 tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main", optional = true }
 serde = { version = "1", features = ["derive"] }
