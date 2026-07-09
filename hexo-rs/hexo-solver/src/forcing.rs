@@ -2312,7 +2312,7 @@ mod tests {
     // The two largest/deepest fixtures live in a separate #[ignore]d test since they
     // are still the slowest (~hundreds of ms release, seconds in debug):
     // jnzzmcm (67 stones -> depth 7), hu01jk4 (149 stones -> depth 6).
-    // run manually: cargo test -p hexo-mcts forcing::tests::parity_win_depths_match_python_slow -- --ignored --nocapture
+    // run manually: cargo test -p hexo-solver forcing::tests::parity_win_depths_match_python_slow -- --ignored --nocapture
     #[allow(clippy::type_complexity)]
     const SLOW_FIXTURES: &[(&[(Coord, Player)], Player, u8, Option<u8>)] = &[
         // jnzzmcm: 67 stones, attacker=P1
@@ -2358,7 +2358,7 @@ mod tests {
         }
     }
 
-    // run manually: cargo test -p hexo-mcts forcing::tests::parity_win_depths_match_python_slow -- --ignored --nocapture
+    // run manually: cargo test -p hexo-solver forcing::tests::parity_win_depths_match_python_slow -- --ignored --nocapture
     #[test]
     #[ignore]
     fn parity_win_depths_match_python_slow() {
@@ -2405,7 +2405,7 @@ mod tests {
 
     // Ad-hoc benchmarking fixtures: three hard puzzle positions that were very slow
     // in the Python prototype. run manually:
-    // cargo test --release -p hexo-mcts forcing::tests::hard_puzzles_timing -- --ignored --nocapture
+    // cargo test --release -p hexo-solver forcing::tests::hard_puzzles_timing -- --ignored --nocapture
     #[allow(clippy::type_complexity)]
     const HARD_FIXTURES: &[(&str, &[(Coord, Player)], Player, u8)] = &[
         ("zrugh2x", &[((0,0), Player::P1), ((1,0), Player::P2), ((2,-2), Player::P2), ((0,1), Player::P1), ((1,1), Player::P1), ((-1,1), Player::P2), ((0,2), Player::P2), ((4,1), Player::P1), ((4,0), Player::P1), ((5,1), Player::P2), ((4,2), Player::P2), ((6,0), Player::P1), ((0,-2), Player::P1), ((5,0), Player::P2), ((0,-4), Player::P2), ((5,-1), Player::P1), ((2,2), Player::P1), ((3,1), Player::P2), ((2,-4), Player::P2), ((2,-6), Player::P1), ((4,-4), Player::P1), ((4,-6), Player::P2), ((3,-5), Player::P2), ((4,-1), Player::P1), ((6,-1), Player::P1), ((4,-3), Player::P2), ((2,-1), Player::P2), ((3,-2), Player::P1), ((5,-7), Player::P1), ((7,-1), Player::P2), ((6,-2), Player::P2), ((5,-9), Player::P1), ((6,-9), Player::P1), ((5,-8), Player::P2), ((4,-8), Player::P2), ((7,-9), Player::P1), ((8,-9), Player::P1), ((9,-9), Player::P2), ((4,-9), Player::P2), ((4,-10), Player::P1), ((8,-10), Player::P1), ((8,-11), Player::P2), ((9,-11), Player::P2), ((7,-8), Player::P1), ((7,-7), Player::P1)], Player::P2, 2),
@@ -2437,7 +2437,7 @@ mod tests {
     /// generator can't reach); no-win is also a valid, consistent result. Escalates
     /// the node budget (1M, then 10M) and stops there.
     /// run manually (release; this is compute-heavy):
-    /// cargo test --release -p hexo-mcts forcing::tests::wide_0l4291i_experiment -- --ignored --nocapture
+    /// cargo test --release -p hexo-solver forcing::tests::wide_0l4291i_experiment -- --ignored --nocapture
     #[test]
     #[ignore]
     fn wide_0l4291i_experiment() {
@@ -2503,7 +2503,7 @@ mod tests {
     // Component-level cost decomposition on real fixture boards, in both the wide
     // (radius 8, puzzles) and tight (radius 2, production self-play) regimes.
     // run manually:
-    // cargo test --release -p hexo-mcts forcing::tests::component_micro_bench -- --ignored --nocapture
+    // cargo test --release -p hexo-solver forcing::tests::component_micro_bench -- --ignored --nocapture
     #[test]
     #[ignore]
     fn component_micro_bench() {

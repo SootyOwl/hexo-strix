@@ -104,6 +104,12 @@ pub enum DefenseKind {
     /// returns `None` for both); the caller cannot distinguish them from this
     /// enum alone. A larger `node_budget` disambiguates on re-query.
     NoThreat = 1,
+    /// Budget exceeded during the threat check. Currently UNREACHABLE: the
+    /// `solve_defense` mapping produces only `ThreatFound`/`NoThreat` (the
+    /// underlying `solve_defense` returns `None` for both no-threat and
+    /// budget-exceeded, which maps to `NoThreat`). Reserved for a future revision
+    /// where `solve_defense` distinguishes budget-exceeded from no-threat.
+    BudgetExceeded = 2,
 }
 
 #[wasm_bindgen]
