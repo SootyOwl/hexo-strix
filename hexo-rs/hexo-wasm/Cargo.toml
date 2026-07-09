@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
 hexo-mcts = { version = "0.1.0", path = "../hexo-mcts" }
 hexo-infer = { version = "0.1.0", path = "../hexo-infer" }
+hexo-solver = { version = "0.1.0", path = "../hexo-solver" }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

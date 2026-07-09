@@ -10,6 +10,7 @@
 //! strategy is unwind; do NOT set panic=abort).
 
 pub mod position;
+pub mod solver;
 
 use hexo_infer::{InferError, InferModel};
 use std::panic::{catch_unwind, AssertUnwindSafe};
