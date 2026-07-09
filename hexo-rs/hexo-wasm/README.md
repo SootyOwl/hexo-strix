@@ -84,6 +84,77 @@ Rules enforced by validation (clean errors, never a wasm abort):
   numbers — not interchangeable. Sorted descending by `p`, ties broken by
   coord ascending.
 
+## StrixSolver — standalone forced-win solver (no weights)
+
+`StrixSolver` is a second export in the same `pkg/`: the fully-forcing (VCF)
+threat-space solver from `hexo-solver`, exposed via typed `wasm-bindgen`
+structs/enums (no JSON, no model weights). Use it to answer "does the side to
+move have a forced win, and what's the line?" in a web UI. `idtt` (the
+production iterative-deepening solver) is the default and the only engine
+that returns a principal variation.
+
+```js
+import init, { StrixSolver, Position, SolverLimits, Player, SolverEngineEnum } from "./pkg/hexo_wasm.js";
+await init();
+const solver = new StrixSolver();
+const pos = new Position(
+  6,         // win_length
+  8,         // placement_radius
+  300,       // max_moves
+  Player.P1, // to_move (the attacker / side to move)
+  2,         // moves_remaining (1 or 2)
+  [ /* stones: {coord: {q,r}, player: Player} ... */ ],
+);
+const limits = new SolverLimits(10, 20000n, SolverEngineEnum.Idtt); // depth_cap, node_budget, engine
+const outcome = solver.solve(pos, limits);
+```
+
+Methods: `solve`, `solve_wide` (experimental wide-partner generator — a
+superset, so a `solve` win is never lost), `solve_threat` (flips `to_move`:
+the *opponent's* forcing win if left unblocked — a threat, not a proven loss),
+`solve_defense` (the opponent threat plus the placements that refute it).
+
+### Return types
+
+`SolveOutcome` has `kind` (`SolveKind::Win` / `No` / `BudgetExceeded`),
+`depth` ("winning move in N"), `nodes`, `time_ms`, and `pv` — a
+turn-grouped `Vec<Turn>` where each `Turn` is `{turn, player, cells: Vec<Coord>}`.
+The first turn is the attacker with `moves_remaining` cells; subsequent turns
+are 2 cells each, alternating players. `Coord` is `{q, r}`. `DefenseOutcome`
+adds `threat: Option<SolveOutcome>`, `killers: Vec<Coord>`,
+`pair_anchors: Vec<PairAnchor>` (`{first, second}`), and `best_delay`.
+
+### Engines
+
+`SolverEngineEnum`: `Idtt` (default), `Pns`, `Dfpn`, `Pdspn`. `idtt` takes a
+board-level path and is the only engine that returns a PV; `Pns` returns a
+verdict only (empty `pv`, `depth` 0). `Dfpn`/`Pdspn`/`Pns` are deep
+proof-search drivers.
+
+### Arbitrary boards
+
+`Position.stones` may be **any arrangement** — positions need not be
+reachable in a real game. `idtt` handles fully arbitrary boards (no origin
+requirement). The deep provers (`Pns`/`Dfpn`/`Pdspn`) require a **game-valid
+position** (origin `{q:0,r:0,player:P1}` present, no duplicate or
+contradictory `{q:0,r:0,player:P2}` stones) because their PV reconstruction
+builds a `GameState`; invalid boards return `BudgetExceeded` rather than
+panicking. `solve_defense` likewise requires a game-valid position (returns
+an error otherwise). Pathological coordinate spreads return `BudgetExceeded`.
+
+### Caveats
+
+- `time_ms` is **0.0 on wasm** — `std::time::Instant` has no monotonic clock
+  on `wasm32-unknown-unknown`, so timing is reported only on native. `node_budget`
+  bounds the search on all targets.
+- `nodes` is 0 for `idtt` (the production solver does not expose a node count);
+  the deep provers report search stats internally.
+- `solve_defense` returns `NoThreat` for both "no opponent threat" and
+  "budget exceeded during the threat check" (`BudgetExceeded` variant is
+  reserved for when the two are distinguished). `limits.engine` is inert for
+  defense (always uses the forcing solver internally).
+
+
 ## WebWorker demo
 
 `demo/` is a minimal module-worker integration (no framework, no build step):

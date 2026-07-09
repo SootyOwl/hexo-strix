@@ -18,7 +18,7 @@ The default configuration (`GameConfig::FULL_HEXO`) is 6-in-a-row, placement rad
 
 ## Crates
 
-This is a Cargo workspace with five crates:
+This is a Cargo workspace with six crates:
 
 ### `hexo-engine`
 
@@ -42,6 +42,16 @@ Gumbel AlphaZero MCTS plus the graph construction used to feed a GNN, and the Py
   - `axis_graph.rs` — axis-window edges (up to `win_length - 1` along the 3 win axes), 5-dim edge features, a global dummy node, and stop-at-opponent traversal.
 - **PyO3 registration** (`python.rs`, behind the `python` feature) — the `hexo_rs` module contents. Not built directly; the `hexo-py` crate re-exports it (see below).
 - **Native `self_play` binary** — generates games via MCTS with neural evaluation. Three inference paths: in-process libtorch (`--features torch`), a spawned Python inference subprocess (`--python-inference`), or a spawned native Rust server (`--inference-bin`, see `hexo-infer` below). See [Native self-play binary](#native-self-play-binary).
+- **Forcing solver + deep prover re-exports** — `mcts/forcing.rs` and `prover/mod.rs` are thin `pub use hexo_solver::*;` shims; the VCF solver and the `idtt`/`dfpn`/`pdspn`/`pns`/`hybrid` deep-prover drivers live in [`hexo-solver`](#hexo-solver) (this crate keeps the PyO3 `solve_forcing`/`solve_defense` bindings and the MCTS depth-N shortcut, which resolve through the shims).
+
+### `hexo-solver`
+
+The fully-forcing (VCF) threat-space solver plus the deep proof-search prover drivers — pure combinatorial search with **no neural-net, MCTS, or PyO3 dependencies** (only `hexo-engine`).
+
+- **`forcing` module** — the production iterative-deepening + persistent-TT solver (`solve`, `solve_wide`, `solve_threat`, `solve_defense`), the `SolverBoard` kernel, and the `Outcome`/`ForcingWin` types. Proves "winning move in N" (the depth convention).
+- **`prover` module** — the deep-prover research drivers: `idtt` (the production solver, baseline), `dfpn` (Nagai depth-first proof-number search), `pdspn` (Winands et al. two-level PDS-PN), `pns` (basic PN search), and `hybrid` (line-guided verification), plus a `race` portfolio. Powers the `prove` binary (in `hexo-mcts`).
+- **`SolverPosition` + `solve_from_position`** — an arbitrary-board loader (positions need not be reachable in a real game) with engine dispatch across `Idtt`/`Pns`/`Dfpn`/`Pdspn`. The `idtt` engine takes a board-level path and handles fully arbitrary boards; the deep provers require a game-valid position (origin `(0,0,P1)` + no duplicate/contradictory stones) and return `BudgetExceeded` otherwise.
+- **Consumed by** `hexo-mcts` (re-exported for the PyO3 bindings + MCTS shortcut + `prove` binary) and `hexo-wasm` (the `StrixSolver` browser export).
 
 ### `hexo-infer`
 
