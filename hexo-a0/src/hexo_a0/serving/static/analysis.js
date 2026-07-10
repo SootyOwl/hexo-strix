@@ -894,6 +894,16 @@ function updateForcingBanner(forcing) {
   banner.textContent = forcing.attacker_is_mover
     ? `${forcing.winner} has a forced win (${forcing.pv_len}-move line)`
     : `${forcing.winner} threatens a forced win — ${defender} must answer`;
+  if (forcing.wide) {
+    // Verdict came from the wide generator (threat + quiet-builder turns) —
+    // lines the tight live-play solver cannot see. Absent on results from an
+    // extension predating the wide kwarg, or on old cached analyses.
+    const tag = document.createElement("span");
+    tag.className = "forcing-wide-tag";
+    tag.textContent = "wide";
+    tag.title = "Found by the wide solver: the winning line includes quiet build placements, not just direct threats";
+    banner.appendChild(tag);
+  }
   // "win"/"threat" classes carry the colour (observatory.css).
   banner.classList.toggle("win", forcing.attacker_is_mover);
   banner.classList.toggle("threat", !forcing.attacker_is_mover);
@@ -1199,3 +1209,129 @@ analysisSvg.addEventListener("wheel", e => {
   updateAnalysisTransform();
 }, {passive:false});
 window.addEventListener("resize", updateAnalysisTransform);
+
+// --- Responsive helpers (phone UI) ------------------------------------------
+// On phones (≤768px) the analysis sidebar is a bottom sheet; clicking the
+// handle or swiping the body toggles it. On desktop (>768px) the handle is
+// display:none and these calls are harmless no-ops.
+function analysisSheetIsOpen() {
+  const c = document.getElementById("analysis-controls");
+  return c && c.classList.contains("sheet-open");
+}
+function setAnalysisSheetOpen(open) {
+  const c = document.getElementById("analysis-controls");
+  if (!c) return;
+  c.classList.toggle("sheet-open", open);
+  const handle = document.getElementById("analysis-sheet-handle");
+  if (handle) handle.setAttribute("data-label", open ? "Hide" : "Controls");
+  // The board's available height changes when the sheet opens/closes on
+  // phone layouts. The transform-origin / center recompute on the next frame.
+  requestAnimationFrame(updateAnalysisTransform);
+}
+function toggleAnalysisSheet(event) {
+  if (event) event.stopPropagation();
+  setAnalysisSheetOpen(!analysisSheetIsOpen());
+}
+// Close the sheet with Escape — common mobile pattern when a keyboard's
+// open or a deep link scrolls.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && analysisSheetIsOpen()) setAnalysisSheetOpen(false);
+});
+// On resize across the 768px breakpoint, snap the sheet to its closed state
+// (transform no longer applies on desktop, but the .sheet-open class would
+// otherwise linger and look weird if the user resizes back down).
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 768) setAnalysisSheetOpen(false);
+});
+
+// --- Auto-open the sheet on first visit (no position loaded) ---------------
+// On phones, if the user opens the analysis screen with no position loaded,
+// there's nothing on the board to look at — the controls ARE the interesting
+// content. Auto-expand the bottom sheet so they're immediately useful, and
+// collapse it once a position loads (the board becomes the focus).
+window.addEventListener("hexo:view-changed", (e) => {
+  if (e.detail && e.detail.view === "analysis" && window.innerWidth <= 768) {
+    if (!analysisTree) setAnalysisSheetOpen(true);
+  }
+});
+// When a position finishes loading, the board becomes the point — collapse
+// the sheet so the user sees the board. Only on phones. We hook the
+// `#analysis-info` element (populated by renderNode once data arrives) via
+// MutationObserver rather than wrapping renderNode itself.
+const _infoEl = document.getElementById("analysis-info");
+if (_infoEl) {
+  new MutationObserver(() => {
+    const info = document.getElementById("analysis-info");
+    if (info && info.textContent.trim() && analysisTree && window.innerWidth <= 768) {
+      setAnalysisSheetOpen(false);
+    }
+  }).observe(_infoEl, { childList: true, characterData: true, subtree: true });
+}
+
+// --- Responsive hex size ---------------------------------------------------
+// shared.js dispatches "hexo:hex-size-changed" when the viewport crosses a
+// breakpoint. Redraw the board with the new hex scale so stones sit at the
+// right cell pitch.
+window.addEventListener("hexo:hex-size-changed", () => {
+  if (analysisCurrent && typeof renderNode === "function") {
+    renderNode(analysisCurrent);
+    // Re-fit: the previous pan/zoom was calibrated to the old hex size, so
+    // recenter the view to the new container.
+    analysisView = { x: 0, y: 0, scale: 1 };
+    updateAnalysisTransform();
+  }
+});
+
+// --- Pinch-to-zoom (touch) -------------------------------------------------
+// Two-finger pinch on touch devices. Matches the wheel-zoom math: factor is
+// the ratio of current-to-previous finger distance, and the zoom is anchored
+// at the midpoint of the two fingers (so the gesture zooms toward where the
+// user's fingers are, not the board center). The single-finger pan handler
+// is gated on `e.touches.length === 1`, so adding the second finger is enough
+// to "promote" the gesture from pan to pinch.
+let _analysisPinchStartDist = 0;
+let _analysisPinchStartScale = 1;
+let _analysisPinchStartView = null;
+let _analysisPinchMid = null;
+analysisSvg.addEventListener("touchstart", e => {
+  if (e.touches.length !== 2) return;
+  e.preventDefault();
+  const [t1, t2] = e.touches;
+  const dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
+  _analysisPinchStartDist = Math.hypot(dx, dy);
+  _analysisPinchStartScale = analysisView.scale;
+  _analysisPinchStartView = { x: analysisView.x, y: analysisView.y };
+  const c = document.getElementById("analysis-board-container");
+  const rect = c.getBoundingClientRect();
+  _analysisPinchMid = { x: ((t1.clientX + t2.clientX) / 2) - rect.left,
+                        y: ((t1.clientY + t2.clientY) / 2) - rect.top };
+  analysisSvg.classList.add("panning");
+}, {passive: false});
+analysisSvg.addEventListener("touchmove", e => {
+  if (e.touches.length !== 2 || !_analysisPinchStartDist) return;
+  e.preventDefault();
+  const [t1, t2] = e.touches;
+  const dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
+  const dist = Math.hypot(dx, dy);
+  const factor = dist / _analysisPinchStartDist;
+  const newScale = Math.max(0.3, Math.min(4, _analysisPinchStartScale * factor));
+  // Anchor the zoom at the gesture midpoint: keep the midpoint's world coord
+  // fixed under the fingers, recompute view.x/y accordingly. Mirrors the
+  // wheel-zoom math in observatory.css's CSS file (see updateAnalysisTransform).
+  const c = document.getElementById("analysis-board-container");
+  const cx = c.clientWidth / 2, cy = c.clientHeight / 2;
+  const mx = _analysisPinchMid.x, my = _analysisPinchMid.y;
+  const scaleRatio = newScale / _analysisPinchStartScale;
+  analysisView.scale = newScale;
+  analysisView.x = mx - scaleRatio * (mx - _analysisPinchStartView.x - cx) - cx;
+  analysisView.y = my - scaleRatio * (my - _analysisPinchStartView.y - cy) - cy;
+  updateAnalysisTransform();
+}, {passive: false});
+const _endAnalysisPinch = () => {
+  _analysisPinchStartDist = 0;
+  _analysisPinchStartView = null;
+  _analysisPinchMid = null;
+  analysisSvg.classList.remove("panning");
+};
+analysisSvg.addEventListener("touchend", _endAnalysisPinch);
+analysisSvg.addEventListener("touchcancel", _endAnalysisPinch);

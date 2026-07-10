@@ -80,7 +80,9 @@ class AnalysisResult:
     # pairs-of-2 cadence (the first chunk is however many placements the
     # analyzed side has left THIS turn, and the final chunk can be a single
     # cell that ends the game), so ownership can't be inferred from position
-    # alone. See _solve_forcing.
+    # alone. "wide" records whether the wide (threat + quiet-builder)
+    # generator produced the verdict (False = tight fallback on an extension
+    # predating the kwarg). See _solve_forcing.
     forcing: dict | None = None
 
     def to_json(self) -> dict:
@@ -291,6 +293,24 @@ def _scan_threats_from_state(state, legal_coords, probs, *, current_player, rela
     return _threats_from_stone_sets(stone_sets, legal_coords, probs)
 
 
+def _solve_wide_or_tight(fn, state, depth_cap, node_budget):
+    """Call a ``hexo_rs`` solver with the wide (threat + quiet-builder)
+    generator, falling back to the tight generator when the installed
+    extension predates the ``wide`` kwarg. Returns ``(result, wide_used)``
+    so callers can label which generator produced the verdict.
+
+    The fallback fires only on the specific signature error ("unexpected
+    keyword argument 'wide'") — any other TypeError is a real bug and must
+    propagate rather than silently rerun tight with a wrong provenance label.
+    """
+    try:
+        return fn(state, depth_cap, node_budget, wide=True), True
+    except TypeError as e:
+        if "wide" not in str(e):
+            raise
+        return fn(state, depth_cap, node_budget), False
+
+
 def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
                    node_budget=ANALYSIS_NODE_BUDGET):
     """Both-side VCF solve for the analysis display.
@@ -303,14 +323,23 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
     raises: any solver failure or absence of a forced win on either side is
     reported as ``None`` — analysis must never crash because the display
     solve had trouble.
+
+    Analysis always asks for the WIDE generator (it also sees turns pairing a
+    forcing stone with a quiet build stone; strict superset of tight, slower
+    per node — acceptable at analysis latencies, which is why live play and
+    self-play stay tight). ``wide`` in the result records whether the
+    installed extension actually honored that (False = tight fallback on an
+    extension predating the kwarg).
     """
     try:
         import hexo_rs as hr
-        res = hr.solve_forcing(state, depth_cap, node_budget)
+        res, wide = _solve_wide_or_tight(
+            hr.solve_forcing, state, depth_cap, node_budget)
         attacker_is_mover = True
         winner, solved_state = state.current_player(), state
         if res is None:
-            res = hr.solve_threat(state, depth_cap, node_budget)
+            res, wide = _solve_wide_or_tight(
+                hr.solve_threat, state, depth_cap, node_budget)
             if res is None:
                 return None
             attacker_is_mover = False
@@ -342,6 +371,7 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
             "pv": pv,
             "pv_len": len(pv),
             "pv_owners": pv_owners,
+            "wide": wide,
         }
     except Exception:
         return None

@@ -242,6 +242,66 @@ window.addEventListener("touchmove", e => {
 }, {passive: false});
 window.addEventListener("touchend", () => { isPanning = false; });
 
+// --- Pinch-to-zoom (touch) -------------------------------------------------
+// Two-finger pinch on touch devices. The single-finger pan handler above
+// already checks `e.touches.length !== 1`, so 2-finger touches fall through
+// to this handler cleanly.
+let _pinchStartDist = 0;
+let _pinchStartScale = 1;
+let _pinchStartView = null;
+let _pinchMid = null;
+svgEl.addEventListener("touchstart", e => {
+  if (e.touches.length !== 2) return;
+  e.preventDefault();
+  const [t1, t2] = e.touches;
+  const dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
+  _pinchStartDist = Math.hypot(dx, dy);
+  _pinchStartScale = viewScale;
+  _pinchStartView = { x: viewX, y: viewY };
+  const c = document.getElementById("board-container");
+  const rect = c.getBoundingClientRect();
+  _pinchMid = { x: ((t1.clientX + t2.clientX) / 2) - rect.left,
+                y: ((t1.clientY + t2.clientY) / 2) - rect.top };
+  svgEl.classList.add("panning");
+}, {passive: false});
+svgEl.addEventListener("touchmove", e => {
+  if (e.touches.length !== 2 || !_pinchStartDist) return;
+  e.preventDefault();
+  const [t1, t2] = e.touches;
+  const dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
+  const dist = Math.hypot(dx, dy);
+  const factor = dist / _pinchStartDist;
+  const newScale = Math.max(0.3, Math.min(4, _pinchStartScale * factor));
+  // Anchor the zoom at the gesture midpoint (same math as the wheel handler
+  // above — keeps the world-coord under the fingers fixed as the pinch grows).
+  const c = document.getElementById("board-container");
+  const cx = c.clientWidth / 2, cy = c.clientHeight / 2;
+  const mx = _pinchMid.x, my = _pinchMid.y;
+  const scaleRatio = newScale / _pinchStartScale;
+  viewScale = newScale;
+  viewX = mx - scaleRatio * (mx - _pinchStartView.x - cx) - cx;
+  viewY = my - scaleRatio * (my - _pinchStartView.y - cy) - cy;
+  updateTransform();
+}, {passive: false});
+const _endPinch = () => {
+  _pinchStartDist = 0;
+  _pinchStartView = null;
+  _pinchMid = null;
+  svgEl.classList.remove("panning");
+};
+svgEl.addEventListener("touchend", _endPinch);
+svgEl.addEventListener("touchcancel", _endPinch);
+
+// --- Responsive hex size ---------------------------------------------------
+// shared.js dispatches "hexo:hex-size-changed" when the viewport crosses a
+// breakpoint (e.g. rotate-to-portrait). Redraw the board and recenter the
+// view so the new hex scale doesn't sit at a stale pan offset.
+window.addEventListener("hexo:hex-size-changed", () => {
+  if (gameState) drawBoard();
+  viewX = 0; viewY = 0; viewScale = 1;
+  updateTransform();
+});
+
 document.getElementById("modal-bg").addEventListener("click", e => {
   if (e.target === e.currentTarget) closeModal();
 });

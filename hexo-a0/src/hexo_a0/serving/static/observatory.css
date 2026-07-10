@@ -155,7 +155,15 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 #analysis-panel[hidden] { display: none; }
 #analysis-controls { width: 340px; padding: 16px; background: var(--panel);
                      display: flex; flex-direction: column; gap: 10px;
-                     overflow-y: auto; flex-shrink: 0; }
+                     overflow: hidden; flex-shrink: 0; }
+/* The controls body wraps the actual scrollable content. On desktop it's the
+   scroll region (controls itself is overflow:hidden so the body fills the
+   remaining height and scrolls internally). On small screens the body is
+   inside the bottom sheet and also handles its own scroll. Without flex:1
+   here the body's height collapses to its content and the parent controls'
+   overflow-y can't help — items just stack and clip each other. */
+#analysis-controls-body{display:flex; flex-direction:column; gap:10px;
+                        flex:1 1 auto; min-height:0; overflow-y:auto;}
 #analysis-controls textarea { width: 100%; background: var(--panel-2); color: #f4efe5; border: 1px solid var(--line);
                                border-radius: 4px; padding: 8px; font-family: var(--mono); font-size: 12px; }
 #analysis-controls button { padding: 8px 12px; background: var(--brass); color: var(--ink);
@@ -209,7 +217,13 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 
 /* staggered entrance */
 @keyframes obs-rise{from{opacity:0; transform:translateY(9px)} to{opacity:1; transform:none}}
-#topbar,#board-container,#analysis-controls,#analysis-board-container{animation:obs-rise .55s cubic-bezier(.16,1,.3,1) both;}
+/* The entrance animation only applies to elements that don't have their own
+   transform on small screens. #analysis-controls gets a translateY for the
+   bottom-sheet collapse, and the animation's `to { transform: none }` with
+   `animation-fill-mode: both` would override it permanently after the
+   animation finishes, leaving the sheet permanently expanded. So we scope
+   the animation to the topbar and board containers only. */
+#topbar,#board-container,#analysis-board-container{animation:obs-rise .55s cubic-bezier(.16,1,.3,1) both;}
 #board-container,#analysis-board-container{animation-delay:.1s;}
 
 /* honeycomb watermark behind both boards */
@@ -295,6 +309,9 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 .forcing-pv-banner[hidden]{display:none;}
 .forcing-pv-banner.win{color:var(--good);}
 .forcing-pv-banner.threat{color:var(--warn, #e0a23a);}
+.forcing-wide-tag{margin-left:.5em; padding:0 .4em; border:1px solid currentColor;
+  border-radius:3px; font-size:.75em; opacity:.75; vertical-align:middle;
+  cursor:help;}
 
 /* "Missed win!" badge (Task 3) — a per-PLACEMENT marker on the move list for
    a squandered forced win. Must read as a bigger event than the mv-q ★✓?✗
@@ -327,3 +344,193 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
   background:#1a2422; color:#a9b0a4;}
 .pv-chip-attacker{background:color-mix(in srgb, var(--phos) 20%, #1a2422); color:var(--text); font-weight:600;}
 .pv-chip-defender{opacity:.6;}
+
+/* ============================================================= *
+ *  Responsive — phone and small-screen layouts                    *
+ * ============================================================= *
+ *  Breakpoint strategy:
+ *    ≤ 480px   phones (portrait): topbar overflow menu, full-width modal,
+ *                                  analysis bottom sheet, smaller hex.
+ *    481–768px tablets/landscape phones: topbar tighter, analysis sheet
+ *                                  starts collapsing (≥769px still side-by-side).
+ *    > 768px   desktop: unchanged.
+ *  The topbar's overflow-menu button is a desktop-affordance too, but it's
+ *  hidden until the small breakpoint activates it (otherwise it would dangle
+ *  uselessly on the side). */
+
+/* --- Topbar overflow menu toggle (hidden by default, shown ≤ 480px) ------- */
+/* Styled with the brass accent so it reads as an actionable button, not a
+   blank grey box. The SVG inside is 3 horizontal lines (a "burger" / "menu"
+   icon — the conventional "open menu" affordance on phones). */
+#topbar-menu-btn{display:none;
+  width:34px; height:34px; align-items:center; justify-content:center;
+  background:transparent; color:var(--brass);
+  border:1px solid var(--brass); border-radius:4px; cursor:pointer; padding:0;
+  flex-shrink:0; position:relative;}
+#topbar-menu-btn:hover{background:rgba(201,163,94,0.15); color:var(--phos);
+  border-color:var(--phos);}
+/* Reset the global `svg{position:absolute;width/height:100%}` rule (intended
+   for the board SVGs) so the icon stays centered inside the button instead
+   of escaping to the topbar's top-left corner at 100% size. */
+#topbar-menu-btn svg{position:static; width:18px; height:18px;
+  display:block; margin:auto;}
+
+/* --- Analysis bottom sheet handle (hidden on desktop) --------------------- */
+#analysis-sheet-handle{display:none;}
+
+/* ---------- ≤ 768px : analysis panel becomes vertical --------------------- */
+@media (max-width: 768px){
+  /* column-reverse puts the board on TOP and the controls at the BOTTOM of
+     the screen, which is the standard bottom-sheet layout. The sheet's
+     bottom edge is then flush with the panel's bottom edge, and a
+     translateY(calc(100% - handle_height)) slides the sheet down so only
+     the handle peeks above the bottom — exactly what a phone user expects. */
+  #analysis-panel{flex-direction:column-reverse;}
+  #analysis-controls{
+    width:100%;
+    flex:none;
+    max-height:75%;
+    min-height:0;
+    padding:0;
+    /* The controls' own overflow-y: auto (set in the base rule) would scroll
+       the whole sheet including the handle, defeating the "pinned handle"
+       affordance. The body handles its own scroll, so disable on the parent. */
+    overflow:visible;
+    transform:translateY(calc(100% - 40px));
+    transition:transform .28s cubic-bezier(.16,1,.3,1);
+    box-shadow:0 -8px 24px rgba(0,0,0,0.4);
+  }
+  #analysis-controls.sheet-open{transform:translateY(0);}
+  #analysis-controls-body{flex:1; min-height:0; padding:14px; overflow-y:auto;}
+  #analysis-sheet-handle{
+    display:flex; align-items:center; justify-content:center;
+    height:40px; flex-shrink:0; cursor:pointer;
+    background:var(--panel-2); border-bottom:1px solid var(--line);
+    position:relative; user-select:none; gap:8px;
+    /* Subtle hover so users know it's tappable. */
+    transition:background .15s;
+  }
+  #analysis-sheet-handle:hover{background:var(--line);}
+  #analysis-sheet-handle::before{
+    content:""; width:36px; height:3px; border-radius:2px;
+    background:var(--line-bright);
+  }
+  #analysis-sheet-handle::after{
+    content:attr(data-label);
+    font-family:var(--mono); font-size:9px; letter-spacing:1.5px;
+    text-transform:uppercase; color:var(--muted);
+  }
+  /* Eval bar canvas was hardcoded 320px wide — let it fill the row instead. */
+  #analysis-eval-bar{width:100%;}
+}
+
+/* ---------- ≤ 480px : topbar overflow menu, full-width modal ------------- */
+@media (max-width: 480px){
+  /* Single-row topbar: shrink padding, hide the view-label (the title +
+     back-button already convey which screen you're on), and prevent wrap.
+     On the play screen the visible row is: logo + status + New game + burger.
+     On the analysis screen: logo + status + ← Play + burger. Everything else
+     (Resign, Copy HTTTX, Analyze this game, Analysis, GitHub, difficulty
+     badge) lives inside the overflow menu. */
+  #topbar{gap:5px; padding:4px 8px; flex-wrap:nowrap;}
+  #topbar h1{font-size:15px; gap:5px; flex-shrink:0;}
+  #topbar .mark-tag{font-size:6.5px; letter-spacing:1px; padding:1px 3px;}
+  #status{font-size:13px; min-width:0; flex:1 1 0; overflow:hidden;
+          text-overflow:ellipsis; white-space:nowrap;}
+  #view-label{display:none;}
+
+  /* Buttons in the topbar shrink so two fit beside the title. */
+  #topbar button{padding:4px 8px; font-size:12px; flex-shrink:0;}
+
+  /* The overflow menu button is the only always-visible extra on this row. */
+  #topbar-menu-btn{display:inline-flex;}
+
+  /* Everything not in the single-row list above goes into the overflow menu. */
+  #resign-btn,
+  #copy-htttx-btn,
+  #analyze-game-btn,
+  #analysis-btn,
+  #gh-link,
+  #difficulty-badge{display:none;}
+
+  /* The overflow menu pops below the topbar as a small panel. Anchored under
+     the topbar's right edge so it doesn't cover the title. The topbar is the
+     positioning context (position:relative set below). z-index:50 lifts the
+     topbar's own stacking context above the board container so the menu
+     isn't covered by the SVG (z-index:1 inside the board's own context). */
+  #topbar{position:relative; z-index:50;}
+  #topbar-menu{
+    position:absolute; top:100%; right:4px;
+    background:var(--panel); border:1px solid var(--line-bright);
+    border-radius:6px; box-shadow:0 8px 24px rgba(0,0,0,0.5);
+    padding:6px; display:none; flex-direction:column; gap:4px;
+    min-width:200px; z-index:50;
+  }
+  #topbar-menu.open{display:flex;}
+  #topbar-menu button{
+    width:100%; text-align:left; padding:8px 12px;
+    background:var(--panel-2); color:var(--text);
+    border:1px solid transparent; border-radius:4px;
+    font-size:13px; cursor:pointer;
+  }
+  #topbar-menu button:hover{border-color:var(--brass); color:var(--phos);}
+  #topbar-menu a{
+    display:flex; align-items:center; gap:8px;
+    width:100%; padding:8px 12px;
+    background:var(--panel-2); color:var(--muted);
+    border:1px solid transparent; border-radius:4px;
+    font-family:var(--mono); font-size:11px; letter-spacing:1.5px;
+    text-transform:uppercase; text-decoration:none;
+  }
+  #topbar-menu a:hover{border-color:var(--brass); color:var(--phos);}
+
+  /* New-game modal: drop the fixed min/max and go nearly full-screen on phones
+     so the form fields are usable with a thumb. */
+  #modal{min-width:0; max-width:none; width:calc(100vw - 24px);
+         margin:12px; max-height:calc(100vh - 24px); overflow-y:auto;}
+  #modal h2{font-size:20px;}
+
+  /* The bot-stats panel is the noisiest thing in the modal on a small screen —
+     allow it to wrap and shrink gracefully. */
+  #bot-stats{font-size:12px;}
+
+  /* Analysis: give the handle a bit more vertical room so the burger bar +
+     "Controls" label fit comfortably on a 360px-wide screen. */
+  #analysis-controls{transform:translateY(calc(100% - 48px));}
+}
+
+/* ---------- 481–768px : tablet / landscape phone ------------------------- */
+@media (min-width: 481px) and (max-width: 768px){
+  #topbar{gap:10px; padding:6px 12px;}
+  #topbar h1{font-size:20px;}
+  #status{font-size:16px;}
+  #view-label{font-size:18px;}
+  #topbar button{padding:5px 10px; font-size:12px;}
+  #topbar-menu-btn{display:inline-flex;}
+  #resign-btn,
+  #copy-htttx-btn,
+  #analyze-game-btn,
+  #gh-link{display:none;}
+  #topbar{position:relative;}
+  #topbar-menu{
+    position:absolute; top:100%; right:6px;
+    background:var(--panel); border:1px solid var(--line-bright);
+    border-radius:6px; box-shadow:0 8px 24px rgba(0,0,0,0.5);
+    padding:6px; display:none; flex-direction:column; gap:4px;
+    min-width:200px; z-index:50;
+  }
+  #topbar-menu.open{display:flex;}
+  #topbar-menu button{
+    width:100%; text-align:left; padding:8px 12px;
+    background:var(--panel-2); color:var(--text);
+    border:1px solid transparent; border-radius:4px;
+    font-size:13px; cursor:pointer;
+  }
+  #topbar-menu button:hover{border-color:var(--brass); color:var(--phos);}
+}
+
+/* ---------- safety: never let the board collapse below 200px tall -------- */
+@media (max-width: 768px){
+  #board-container{min-height:200px;}
+  #analysis-board-container{min-height:200px;}
+}

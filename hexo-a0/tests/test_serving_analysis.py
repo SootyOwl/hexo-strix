@@ -681,6 +681,100 @@ def test_analyze_position_defaults_to_analysis_budget(monkeypatch):
     assert seen and seen[0] == (ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET)
 
 
+def test_solve_forcing_requests_wide_and_labels_result(monkeypatch):
+    # Analysis always asks for the wide (threat + quiet-builder) generator;
+    # the result records which generator actually ran.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P1")
+    seen = []
+
+    def _spy(st, depth_cap, node_budget, wide=False):
+        seen.append(wide)
+        return ((9, 0), [(9, 0), (10, -1)])
+
+    monkeypatch.setattr(hr, "solve_forcing", _spy)
+    out = _solve_forcing(state)
+    assert seen == [True]
+    assert out is not None and out["wide"] is True
+
+
+def test_solve_forcing_tight_fallback_on_old_extension(monkeypatch):
+    # An extension predating the `wide` kwarg raises TypeError at call time;
+    # _solve_forcing must fall back to the tight signature (same budgets) and
+    # label the result wide=False instead of failing the whole analysis.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P1")
+    calls = []
+
+    def _old_ext(st, depth_cap, node_budget):
+        calls.append((depth_cap, node_budget))
+        return ((9, 0), [(9, 0), (10, -1)])
+
+    monkeypatch.setattr(hr, "solve_forcing", _old_ext)
+    out = _solve_forcing(state)
+    assert calls == [(ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET)]
+    assert out is not None and out["wide"] is False
+
+
+def test_solve_threat_tight_fallback_on_old_extension(monkeypatch):
+    # The threat branch has the same old-extension fallback as the forcing
+    # branch; the flipped-solve semantics (winner = opponent) must survive it.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P2")
+
+    monkeypatch.setattr(hr, "solve_forcing", lambda st, d, n: None)
+    monkeypatch.setattr(
+        hr, "solve_threat", lambda st, d, n: ((9, 0), [(9, 0), (10, -1)]))
+    out = _solve_forcing(state)
+    assert out is not None
+    assert out["wide"] is False
+    assert out["attacker_is_mover"] is False
+    assert out["winner"] == "P1"  # the flipped-perspective attacker
+
+
+def test_solve_forcing_internal_typeerror_is_not_misread_as_old_extension(monkeypatch):
+    # A TypeError raised INSIDE a wide-capable solver (message unrelated to the
+    # 'wide' kwarg) must NOT trigger the tight fallback with a wrong provenance
+    # label — it propagates to _solve_forcing's crash guard and yields None.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P1")
+    calls = []
+
+    def _buggy(st, depth_cap, node_budget, wide=False):
+        calls.append(wide)
+        raise TypeError("expected GraphTensor, got str")
+
+    monkeypatch.setattr(hr, "solve_forcing", _buggy)
+    monkeypatch.setattr(hr, "solve_threat", lambda *a, **k: None)
+    out = _solve_forcing(state)
+    assert out is None
+    assert calls == [True], "must not re-call tight after an internal TypeError"
+
+
+def test_solve_threat_also_requests_wide(monkeypatch):
+    # The perspective-flipped threat check gets the same wide request.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P2")
+    threat_wides = []
+
+    def _threat_spy(st, depth_cap, node_budget, wide=False):
+        threat_wides.append(wide)
+        return ((9, 0), [(9, 0), (10, -1)])
+
+    monkeypatch.setattr(hr, "solve_forcing", lambda st, d, n, wide=False: None)
+    monkeypatch.setattr(hr, "solve_threat", _threat_spy)
+    out = _solve_forcing(state)
+    assert threat_wides == [True]
+    assert out is not None
+    assert out["wide"] is True
+    assert out["attacker_is_mover"] is False
+
+
 def test_analyze_game_full_default_run_mcts_fn_uses_trajectory_budget(monkeypatch):
     # analyze_game_full's own default run_mcts_fn (no override) must use the
     # tighter TRAJECTORY_* budget, not the single-position ANALYSIS_* default
