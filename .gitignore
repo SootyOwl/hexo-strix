@@ -66,3 +66,6 @@ hexo-rs/hexo-infer/tests/fixtures/real_*.json
 hexo-rs/hexo-wasm/demo/weights.safetensors
 hexo-rs/hexo-wasm/pkg/
 hexo-rs/hexo-wasm/pkg-node/
+
+# tournament
+tournament/
