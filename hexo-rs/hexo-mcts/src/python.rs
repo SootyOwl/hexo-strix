@@ -33,6 +33,12 @@ impl PyGameConfig {
         if placement_radius < 1 {
             return Err(PyValueError::new_err("placement_radius must be >= 1"));
         }
+        // Every GameState construction materializes hex_offsets(radius) — an
+        // O(radius²) allocation. Production radii are single digits; 64 is far
+        // beyond any real game, so cap rather than let a typo OOM the process.
+        if placement_radius > 64 {
+            return Err(PyValueError::new_err("placement_radius must be <= 64"));
+        }
         if max_moves < 1 {
             return Err(PyValueError::new_err("max_moves must be >= 1"));
         }
@@ -110,7 +116,8 @@ impl PyGameState {
     /// Bypasses turn-order and placement-radius enforcement, so the caller can
     /// build arbitrary positions for puzzle / setup workflows. The board is
     /// always seeded with P1 at (0,0); a redundant (0,0)=P1 entry in `stones`
-    /// is silently ignored.
+    /// is silently ignored. Duplicate coordinates or a (0,0)=P2 stone raise
+    /// ValueError.
     ///
     /// Args:
     ///     stones: list of ((q, r), "P1"|"P2") pairs.
@@ -141,6 +148,24 @@ impl PyGameState {
         let mut typed_stones: Vec<(Coord, Player)> = Vec::with_capacity(stones.len());
         for (coord, p) in stones {
             typed_stones.push((coord, parse_player(&p)?));
+        }
+        // GameState::from_state seeds (0,0)=P1 and panics (`expect`) on any
+        // colliding placement — validate here and raise ValueError instead of
+        // letting a duplicate coord or a (0,0)=P2 stone panic across the FFI
+        // boundary.
+        let mut seen: std::collections::HashSet<Coord> =
+            std::collections::HashSet::with_capacity(typed_stones.len());
+        for &(coord, player) in &typed_stones {
+            if coord == (0, 0) && player == Player::P2 {
+                return Err(PyValueError::new_err(
+                    "(0,0) is the seeded P1 origin and cannot be P2",
+                ));
+            }
+            if !seen.insert(coord) {
+                return Err(PyValueError::new_err(format!(
+                    "duplicate stone at {coord:?}"
+                )));
+            }
         }
         let cfg = config.map(|c| c.inner).unwrap_or(GameConfig::FULL_HEXO);
         let inner = GameState::from_state(&typed_stones, cur, moves_remaining, cfg);
@@ -1634,54 +1659,73 @@ fn py_augment_axis_states_to_batch_bytes(
 ///     state: hexo_rs.GameState (non-terminal)
 ///     depth_cap: maximum search depth, counted in attacker turns (default 40)
 ///     node_budget: cap on the number of search nodes expanded (default 20_000_000)
+///     wide: admit threat + quiet-builder attacker turns (default False). A
+///         strict superset of the default generator — finds wins whose turns
+///         pair a forcing stone with a quiet build stone — but slower per
+///         node; meant for analysis, not live play or self-play.
 ///
 /// Returns:
 ///     `(first_move, pv)` — the first move of the forced win and its full
 ///     principal variation (both attacker and defender replies), or `None` if
 ///     no forced win was found within `depth_cap` / `node_budget`.
 #[pyfunction]
-#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000))]
+#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, wide=false))]
 fn solve_forcing(
     py: Python<'_>,
     state: &PyGameState,
     depth_cap: u8,
     node_budget: u64,
+    wide: bool,
 ) -> Option<((i32, i32), Vec<(i32, i32)>)> {
     // Clone the state and release the GIL: a budget-bound solve runs for
     // seconds, and holding the GIL would freeze every other Python thread in
     // the process (the play server calls this from HTTP handler threads).
     let inner = state.inner.clone();
-    py.detach(
-        move || match crate::mcts::forcing::solve(&inner, depth_cap, node_budget) {
+    py.detach(move || {
+        // `wide` admits threat + quiet-builder attacker turns (a strict superset
+        // of the tight generator, slower per node) — analysis-screen callers pass
+        // true; live-play/self-play callers keep the tight default.
+        let solve = if wide {
+            crate::mcts::forcing::solve_wide
+        } else {
+            crate::mcts::forcing::solve
+        };
+        match solve(&inner, depth_cap, node_budget) {
             crate::mcts::forcing::Outcome::Win(w) => Some((w.first_move, w.pv)),
             crate::mcts::forcing::Outcome::No | crate::mcts::forcing::Outcome::BudgetExceeded => {
                 None
             }
-        },
-    )
+        }
+    })
 }
 
 /// Forcing win for the OPPONENT of the side to move, as if it were their
 /// turn (fresh 2 placements) — a THREAT the mover may still break, not a
 /// proven loss. Same return shape as `solve_forcing`.
 #[pyfunction]
-#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000))]
+#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, wide=false))]
 fn solve_threat(
     py: Python<'_>,
     state: &PyGameState,
     depth_cap: u8,
     node_budget: u64,
+    wide: bool,
 ) -> Option<((i32, i32), Vec<(i32, i32)>)> {
-    // Clone + detach, same as solve_forcing.
+    // Clone + detach, same as solve_forcing (which also documents `wide`).
     let inner = state.inner.clone();
-    py.detach(
-        move || match crate::mcts::forcing::solve_threat(&inner, depth_cap, node_budget) {
+    py.detach(move || {
+        let solve_threat = if wide {
+            crate::mcts::forcing::solve_threat_wide
+        } else {
+            crate::mcts::forcing::solve_threat
+        };
+        match solve_threat(&inner, depth_cap, node_budget) {
             crate::mcts::forcing::Outcome::Win(w) => Some((w.first_move, w.pv)),
             crate::mcts::forcing::Outcome::No | crate::mcts::forcing::Outcome::BudgetExceeded => {
                 None
             }
-        },
-    )
+        }
+    })
 }
 
 /// Pair-aware defensive solve for the side to move (see

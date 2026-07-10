@@ -1117,6 +1117,147 @@ fn run_forcing_bench(
     stats
 }
 
+// --- tight vs wide generator A/B (analysis-screen wide-by-default sizing) ---
+
+#[derive(Default)]
+struct WideAbStats {
+    n: usize,
+    tight_win: usize,
+    tight_no: usize,
+    tight_be: usize,
+    wide_win: usize,
+    wide_no: usize,
+    wide_be: usize,
+    /// Wins only the wide generator sees (threat + quiet-builder turns) — the
+    /// coverage the analysis screen gains.
+    wide_only_wins: usize,
+    /// Tight wins the wide run did NOT prove at the same node budget — the
+    /// budget-starvation risk of a bigger tree at a fixed budget; the wide
+    /// generator itself is a strict superset, so any count here is budget, not
+    /// generation.
+    tight_only_wins: usize,
+    tight_us: Vec<f64>,
+    wide_us: Vec<f64>,
+    wide_win_us: Vec<f64>,
+    wide_no_us: Vec<f64>,
+    tight_no_us: Vec<f64>,
+    wide_win_depth_hist: HashMap<u8, usize>,
+}
+
+fn run_wide_ab_bench(
+    positions: &[Position],
+    config: GameConfig,
+    depth_cap: u8,
+    node_budget: u64,
+) -> WideAbStats {
+    let mut stats = WideAbStats::default();
+    for pos in positions {
+        if pos.moves_remaining != 2 {
+            continue;
+        }
+        let game = GameState::from_state(&pos.stones, pos.current_player, pos.moves_remaining, config);
+        if game.is_terminal() {
+            continue;
+        }
+        stats.n += 1;
+
+        let t = Instant::now();
+        let tight = forcing::solve(&game, depth_cap, node_budget);
+        let tight_us = t.elapsed().as_nanos() as f64 / 1000.0;
+        stats.tight_us.push(tight_us);
+
+        let t = Instant::now();
+        let wide = forcing::solve_wide(&game, depth_cap, node_budget);
+        let wide_us = t.elapsed().as_nanos() as f64 / 1000.0;
+        stats.wide_us.push(wide_us);
+
+        match &tight {
+            forcing::Outcome::Win(_) => stats.tight_win += 1,
+            forcing::Outcome::No => {
+                stats.tight_no += 1;
+                stats.tight_no_us.push(tight_us);
+            }
+            forcing::Outcome::BudgetExceeded => {
+                stats.tight_be += 1;
+                stats.tight_no_us.push(tight_us);
+            }
+        }
+        match &wide {
+            forcing::Outcome::Win(w) => {
+                stats.wide_win += 1;
+                stats.wide_win_us.push(wide_us);
+                *stats.wide_win_depth_hist.entry(w.depth).or_insert(0) += 1;
+                if !tight.is_win() {
+                    stats.wide_only_wins += 1;
+                }
+            }
+            forcing::Outcome::No => {
+                stats.wide_no += 1;
+                stats.wide_no_us.push(wide_us);
+            }
+            forcing::Outcome::BudgetExceeded => {
+                stats.wide_be += 1;
+                stats.wide_no_us.push(wide_us);
+            }
+        }
+        if tight.is_win() && !wide.is_win() {
+            stats.tight_only_wins += 1;
+        }
+    }
+    stats
+}
+
+fn print_wide_ab_report(stats: &WideAbStats, depth_cap: u8, node_budget: u64) {
+    let dist = |v: &mut Vec<f64>| -> (f64, f64, f64, f64) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+        (mean, percentile(v, 0.5), percentile(v, 0.99), v.last().copied().unwrap_or(0.0))
+    };
+    let mut s = WideAbStats {
+        tight_us: stats.tight_us.clone(),
+        wide_us: stats.wide_us.clone(),
+        wide_win_us: stats.wide_win_us.clone(),
+        wide_no_us: stats.wide_no_us.clone(),
+        tight_no_us: stats.tight_no_us.clone(),
+        ..Default::default()
+    };
+    println!();
+    println!("=== tight vs wide forcing::solve A/B ===");
+    println!(
+        "depth_cap={depth_cap}  node_budget={node_budget}  positions (mr==2, non-terminal): {}",
+        stats.n
+    );
+    println!(
+        "  tight: Win={} No={} BudgetExceeded={}",
+        stats.tight_win, stats.tight_no, stats.tight_be
+    );
+    println!(
+        "  wide:  Win={} No={} BudgetExceeded={}",
+        stats.wide_win, stats.wide_no, stats.wide_be
+    );
+    println!(
+        "  wide-only wins: {}   tight-only wins (budget starvation at equal budget): {}",
+        stats.wide_only_wins, stats.tight_only_wins
+    );
+    let (m, p50, p99, max) = dist(&mut s.tight_us);
+    println!("  tight all:  mean={m:.0}us p50={p50:.0}us p99={p99:.0}us max={max:.0}us");
+    let (m, p50, p99, max) = dist(&mut s.wide_us);
+    println!("  wide all:   mean={m:.0}us p50={p50:.0}us p99={p99:.0}us max={max:.0}us");
+    let (m, p50, p99, max) = dist(&mut s.tight_no_us);
+    println!("  tight no:   mean={m:.0}us p50={p50:.0}us p99={p99:.0}us max={max:.0}us");
+    let (m, p50, p99, max) = dist(&mut s.wide_no_us);
+    println!("  wide no:    mean={m:.0}us p50={p50:.0}us p99={p99:.0}us max={max:.0}us");
+    let (m, p50, p99, max) = dist(&mut s.wide_win_us);
+    println!("  wide win:   mean={m:.0}us p50={p50:.0}us p99={p99:.0}us max={max:.0}us");
+    let mut depths: Vec<&u8> = stats.wide_win_depth_hist.keys().collect();
+    depths.sort();
+    print!("  wide win depth histogram: ");
+    for d in depths {
+        print!("depth={}:{}  ", d, stats.wide_win_depth_hist[d]);
+    }
+    println!();
+}
+
 fn print_forcing_report(stats: &ForcingBenchStats, depth_cap: u8, node_budget: u64) {
     println!();
     println!("=== forcing::solve vs. exhaustive depth-1/2 scan ===");
@@ -1233,6 +1374,7 @@ fn main() {
     let mut virtual_loss: f64 = 1.0;
     let mut depth_cap: u8 = SELF_PLAY_DEPTH_CAP;
     let mut node_budget: u64 = SELF_PLAY_NODE_BUDGET;
+    let mut wide_ab = false;
     for a in &args[1..] {
         if let Some(v) = a.strip_prefix("--corpus=") {
             path = Some(v.to_string());
@@ -1252,6 +1394,8 @@ fn main() {
             };
         } else if a == "--mcts" {
             do_mcts = true;
+        } else if a == "--wide-ab" {
+            wide_ab = true;
         } else if let Some(v) = a.strip_prefix("--sims=") {
             n_simulations = v.parse().expect("--sims value");
         } else if let Some(v) = a.strip_prefix("--vl=") {
@@ -1326,6 +1470,15 @@ fn main() {
 
     if do_mcts {
         run_mcts_bench(&positions, config, n_simulations, virtual_loss);
+        return;
+    }
+
+    // Tight vs wide generator A/B (analysis-screen wide-by-default sizing):
+    // run with the budget under consideration, e.g.
+    //   --wide-ab --depth-cap=10 --node-budget=20000 --max=2000 (trajectory tier)
+    if wide_ab {
+        let stats = run_wide_ab_bench(&positions, config, depth_cap, node_budget);
+        print_wide_ab_report(&stats, depth_cap, node_budget);
         return;
     }
 

@@ -448,8 +448,8 @@ pub fn completions(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> 
 }
 
 /// A near-complete window's gap cells (3..=4 of them) plus its stone count.
-#[derive(Clone, Copy, Debug)]
-struct ThreatEntry {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThreatEntry {
     pc: u8,
     len: u8,
     cells: [Coord; 4],
@@ -462,7 +462,7 @@ impl ThreatEntry {
     }
 }
 
-type ThreatIndex = FxHashMap<Coord, Vec<ThreatEntry>>;
+pub(crate) type ThreatIndex = FxHashMap<Coord, Vec<ThreatEntry>>;
 
 /// Near-complete lines (enemy-free windows with wl-4..wl-3 stones), indexed by gap
 /// cell — so a move's B is a table lookup, not a rescan.
@@ -485,6 +485,58 @@ fn threat_table(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> Thr
         false
     });
     index
+}
+
+/// True iff `player` already has a completed winning line on the board. The
+/// VCF kernel never looks at full windows (its scans want gaps to fill), so a
+/// caller assembling arbitrary positions (e.g. the VCT probe placing defender
+/// replies) must guard with this before asking the solver about a board where
+/// the game is in fact already over.
+pub(crate) fn has_full_line(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> bool {
+    let l = wl as i32;
+    let mut found = false;
+    scan_windows(board, player, wl, radius, l, l, &mut |_, _, _, _| {
+        found = true;
+        true
+    });
+    found
+}
+
+/// One-pass fusion of `threat_table` and the wide builder-score scan: a single
+/// strip walk over enemy-free windows with pc in `[1, wl-1]` accumulates the
+/// builder score of every gap cell (+pc per visit = `pc²` per window — see
+/// `wide_partner_cells` for why that ordering is right), and inserts
+/// `ThreatEntry`s for windows in the threat band `[wl-4, wl-3]` exactly as
+/// `threat_table` does. The wider pc filter only ADDS callback invocations
+/// (every visited window contains the strip's center stone, so pc >= 1
+/// always); the threat-band windows are visited in the same order with the
+/// same dedup, so the index is identical to `threat_table`'s. Wide-mode only:
+/// tight callers keep the narrower scan and pay nothing for scoring.
+pub(crate) fn threat_table_scored(
+    board: &SolverBoard,
+    player: Player,
+    wl: u8,
+    radius: i32,
+) -> (ThreatIndex, FxHashMap<Coord, u32>) {
+    let l = wl as i32;
+    let mut index: ThreatIndex = FxHashMap::default();
+    let mut scores: FxHashMap<Coord, u32> = FxHashMap::default();
+    let mut seen: FxHashSet<(Coord, u8)> = FxHashSet::default();
+    scan_windows(board, player, wl, radius, 1, l - 1, &mut |start, ai, pc, empties| {
+        for &e in empties {
+            *scores.entry(e).or_insert(0) += pc as u32;
+        }
+        if (l - 4..=l - 3).contains(&(pc as i32)) && seen.insert((start, ai as u8)) {
+            debug_assert!(empties.len() <= 4 && empties.windows(2).all(|w| w[0] < w[1]));
+            let mut e = ThreatEntry { pc, len: empties.len() as u8, cells: [(0, 0); 4] };
+            e.cells[..empties.len()].copy_from_slice(empties);
+            for &c in empties {
+                index.entry(c).or_default().push(e);
+            }
+        }
+        false
+    });
+    (index, scores)
 }
 
 /// B after playing `mv` (exact up to 4; 4 means ">= 4"), read from the threat
@@ -771,22 +823,44 @@ fn any_four_gate(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> 
 }
 
 /// EXPERIMENTAL (off by default): empty cells within `wl-1` steps along a WIN_AXES
-/// direction (either sign) of any attacker stone. A superset of the hot cells that
-/// also admits quiet build stones one step off an existing line — needed for "force
-/// with one stone, quietly build with the other" attacker turns (a fresh threat that
-/// only pays off a move or two later). Port of the Python prototype's
-/// `_wide_partners` (scripts/forcing_search_prototype.py:21-34). Respects the same
-/// radius-legality filtering as other generated cells (`scan_windows`'s `enforce`
-/// gate), so a wide cell the attacker could not legally play never reaches the
-/// partner set.
-fn wide_partner_cells(board: &SolverBoard, attacker: Player, wl: u8, radius: i32) -> Vec<Coord> {
+/// direction (either sign) of any attacker stone, ordered most-threatening-first.
+/// A superset of the hot cells that also admits quiet build stones one step off an
+/// existing line — needed for "force with one stone, quietly build with the other"
+/// attacker turns (a fresh threat that only pays off a move or two later). Cell set
+/// ports the Python prototype's `_wide_partners`
+/// (scripts/forcing_search_prototype.py:21-34); the ordering is new (the prototype
+/// searched them in coordinate order). Respects the same radius-legality filtering
+/// as other generated cells (`scan_windows`'s `enforce` gate), so a wide cell the
+/// attacker could not legally play never reaches the partner set.
+///
+/// Score = sum of `pc(w)^2` over enemy-free windows `w` containing the cell with
+/// `pc >= 1` attacker stones, precomputed by `threat_table_scored`'s fused strip
+/// walk and passed in as `scores`. Superlinear in line strength, and cells nearer
+/// a stone (or aligned with stones on several axes) share more windows — so
+/// proximity and multi-axis alignment both raise the score. Equal scores break by
+/// hex distance to the nearest own stone (window count only sees axis-aligned
+/// proximity; a cell can be hex-close to a stone it shares no axis with), then by
+/// coord for determinism. A builder never changes a move's B (it joins no
+/// near-complete window), so B ordering alone leaves all (hot, builder) pairs
+/// tied; this ordering puts the most threatening builders first in the search.
+/// Returns `(cell, score, nearest-own-stone dist)`.
+pub(crate) fn wide_partner_cells(
+    board: &SolverBoard,
+    attacker: Player,
+    wl: u8,
+    radius: i32,
+    scores: &FxHashMap<Coord, u32>,
+) -> Vec<(Coord, u32, i32)> {
     let l = wl as i32;
     let enforce = radius < l - 1;
+    let own: Vec<Coord> = board
+        .stones
+        .iter()
+        .filter(|&&(_, o)| o == attacker)
+        .map(|&(c, _)| c)
+        .collect();
     let mut cells: Vec<Coord> = Vec::new();
-    for &(s, owner) in &board.stones {
-        if owner != attacker {
-            continue;
-        }
+    for &s in &own {
         for &(dq, dr) in WIN_AXES.iter() {
             for k in 1..l {
                 for c in [(s.0 + k * dq, s.1 + k * dr), (s.0 - k * dq, s.1 - k * dr)] {
@@ -799,7 +873,17 @@ fn wide_partner_cells(board: &SolverBoard, attacker: Player, wl: u8, radius: i32
     }
     cells.sort_unstable();
     cells.dedup();
-    cells
+    let mut scored: Vec<(Coord, u32, i32)> = cells
+        .into_iter()
+        .map(|c| {
+            let dist = own.iter().map(|&s| hex_dist(c, s)).min().unwrap_or(i32::MAX);
+            (c, scores.get(&c).copied().unwrap_or(0), dist)
+        })
+        .collect();
+    // Most-threatening-first, then closest-to-own-stones; coord ascending last
+    // keeps search order deterministic (never let scan order into tie-breaking).
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+    scored
 }
 
 /// Forcing attacker turns (B >= 2 after the move), best-first by B. `wide` gates the
@@ -829,7 +913,13 @@ pub fn attacker_turns_with(
     wide: bool,
 ) -> Vec<CellSet2> {
     let enforce = radius < wl as i32 - 1;
-    let index = threat_table(board, attacker, wl, radius);
+    // Wide mode fuses the builder-score accumulation into the threat-table
+    // strip walk (one scan instead of two); tight keeps the narrower scan.
+    let (index, wide_scores) = if wide {
+        threat_table_scored(board, attacker, wl, radius)
+    } else {
+        (threat_table(board, attacker, wl, radius), FxHashMap::default())
+    };
     let mut hot: Vec<Coord> = index.keys().copied().collect();
     hot.sort_unstable();
     // Per-hot-cell forcing potential, used to skip candidates that provably
@@ -846,7 +936,9 @@ pub fn attacker_turns_with(
             (strong, entries.len() as u32 - strong)
         })
         .collect();
-    let mut scored: Vec<(u8, CellSet2)> = Vec::new();
+    // (B, h_strong, move): h_strong rides along as a wide-mode-only secondary
+    // sort key — see the final sort below.
+    let mut scored: Vec<(u8, u32, CellSet2)> = Vec::new();
     let mut scratch: Vec<CellSet2> = Vec::new();
     if placements == 1 {
         for (hi, &c) in hot.iter().enumerate() {
@@ -860,7 +952,7 @@ pub fn attacker_turns_with(
             }
             let b = move_b_with(&index, &[c], wl, &mut scratch);
             if b >= 2 {
-                scored.push((b, CellSet2::one(c)));
+                scored.push((b, potential[hi].0, CellSet2::one(c)));
             }
         }
     } else {
@@ -883,6 +975,13 @@ pub fn attacker_turns_with(
             blocks.retain(|c| hot.binary_search(c).is_err());
             partners.extend(blocks.into_iter().map(|c| (c, false, 0, 0)));
         }
+        // Sort hot/block partners BEFORE appending wide cells: wide cells carry
+        // their own most-threatening-first order (see `wide_partner_cells`),
+        // which a coord re-sort would destroy. Tight is byte-identical (nothing
+        // is appended after the sort), and hot/block partners staying ahead of
+        // quiet builders is itself the right priority — they add completions,
+        // builders never do.
+        partners.sort_unstable();
         // EXPERIMENTAL wide partners (off by default; zero cost when `wide` is
         // false — the generator below never runs). Tagged is_hot=false with (0, 0)
         // potential, exactly like block-only cells: a non-hot cell is never a key
@@ -896,13 +995,13 @@ pub fn attacker_turns_with(
         // a_strong = a_weak = 0 — the prefilter already admits wide pairs exactly,
         // no gating or exemption needed.
         if wide {
-            let mut existing: Vec<Coord> = partners.iter().map(|p| p.0).collect();
-            existing.sort_unstable();
-            let mut wide_cells = wide_partner_cells(board, attacker, wl, radius);
-            wide_cells.retain(|c| existing.binary_search(c).is_err());
-            partners.extend(wide_cells.into_iter().map(|c| (c, false, 0, 0)));
+            // partners is coord-sorted (coord is the tuple's leading key, coords
+            // are unique), so `existing` is sorted for the binary_search dedup.
+            let existing: Vec<Coord> = partners.iter().map(|p| p.0).collect();
+            let mut wide_cells = wide_partner_cells(board, attacker, wl, radius, &wide_scores);
+            wide_cells.retain(|(c, _, _)| existing.binary_search(c).is_err());
+            partners.extend(wide_cells.into_iter().map(|(c, _, _)| (c, false, 0, 0)));
         }
-        partners.sort_unstable();
         for (hi, &h) in hot.iter().enumerate() {
             let (h_strong, h_weak) = potential[hi];
             for &(a, a_hot, a_strong, a_weak) in partners.iter() {
@@ -935,13 +1034,23 @@ pub fn attacker_turns_with(
                 }
                 let b = move_b_with(&index, mv.cells(), wl, &mut scratch);
                 if b >= 2 {
-                    scored.push((b, mv));
+                    scored.push((b, h_strong, mv));
                 }
             }
         }
     }
-    scored.sort_by(|x, y| y.0.cmp(&x.0)); // best-first (higher B), stable
-    scored.into_iter().map(|(_, m)| m).collect()
+    if wide {
+        // Wide: best-first by B, then strongest hot cell first — the h-outer
+        // emission loop groups pairs by hot cell in coordinate order, and with
+        // builders in the mix a group is large, so refuting every pair of a
+        // weak hot cell before reaching a strong one is expensive. Stable, so
+        // within a (B, h_strong) tie the emission order survives: hot/block
+        // partners (coord asc), then builders most-threatening-first.
+        scored.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)));
+    } else {
+        scored.sort_by(|x, y| y.0.cmp(&x.0)); // best-first (higher B), stable
+    }
+    scored.into_iter().map(|(_, _, m)| m).collect()
 }
 
 #[derive(Debug)]
@@ -972,6 +1081,17 @@ struct SearchState {
     /// Research-only wall-clock deadline + cooperative cancel (see `Limits`). The
     /// production default is empty, making `tick` byte-identical to before.
     limits: Limits,
+    /// EXPERIMENTAL proof-support capture (None in production = zero cost).
+    /// For every node proven WON, records the sorted, deduped set of cells its
+    /// proof relied on — completion gap cells, played attacker/cover cells —
+    /// unioned over the proven sub-DAG. Keyed (hash, is_or, placements; 0 for
+    /// defender nodes). By threat monotonicity (opponent stones only REMOVE the
+    /// attacker's windows and only ADD the defender's), a later defender
+    /// placement outside this set cannot invalidate the proof PROVIDED it also
+    /// creates no new defender completion (the "wins first" checks relied on
+    /// their absence) — the caller must pair the support test with that check.
+    /// See `vct_probe` for the consumer and the full soundness argument.
+    support: Option<FxHashMap<(u64, bool, u8), Rc<Vec<Coord>>>>,
 }
 
 impl SearchState {
@@ -989,6 +1109,25 @@ impl SearchState {
             dfn,
             wide,
             limits: Limits::default(),
+            support: None,
+        }
+    }
+
+    /// Fresh node budget for a follow-up run (PV probes) that KEEPS the warm
+    /// tt/gencache/comps. Cached verdicts are position truths, so a warm cache
+    /// changes which probes complete within budget — never what they conclude.
+    fn reset_run(&mut self) {
+        self.nodes = 0;
+        self.exceeded = false;
+    }
+
+    /// Record a proven-won node's support set (sorted + deduped). No-op unless
+    /// support capture is enabled.
+    fn record_support(&mut self, key: (u64, bool, u8), mut cells: Vec<Coord>) {
+        if let Some(map) = &mut self.support {
+            cells.sort_unstable();
+            cells.dedup();
+            map.insert(key, Rc::new(cells));
         }
     }
 }
@@ -1050,17 +1189,39 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
     if s.exceeded || tick(s) { return (false, false); }
     let comps = node_comps(board, s);
     let (atk_comps, dfn_comps) = (&comps.0, &comps.1);
-    if atk_comps.iter().any(|c| c.len() as u8 <= placements) { return (true, false); }
+    if let Some(win) = atk_comps.iter().find(|c| c.len() as u8 <= placements) {
+        // Immediate completion: the proof relies only on this window's gap cells
+        // (its stones are the attacker's own — the opponent cannot remove them).
+        s.record_support((board.hash, true, placements), win.cells().to_vec());
+        return (true, false);
+    }
     if budget < 2 { return (false, true); }
     let key = (board.hash, true, placements, budget);
     if let Some(&v) = s.tt.get(&key) { return v; }
     let (mut won, mut cut) = (false, false);
+    // (winning move, its proven child's support) when capture is enabled.
+    let mut won_support: Option<Vec<Coord>> = None;
     for &mv in attacker_turns_memo(board, placements, dfn_comps, s).iter() {
         for &c in mv.cells() { board.place(c, s.atk); }
         let (w, subcut) = def_within(board, budget - 1, s);
+        if w && s.support.is_some() {
+            // Child support must be read while mv is still on the board (the
+            // child is keyed by the post-move hash). A missing child entry
+            // poisons this node's support (stays None → callers fall back to
+            // full re-verification; never an unsound partial set).
+            let child = s.support.as_ref().and_then(|m| m.get(&(board.hash, false, 0))).cloned();
+            if let Some(child) = child {
+                let mut cells = child.as_ref().clone();
+                cells.extend_from_slice(mv.cells());
+                won_support = Some(cells);
+            }
+        }
         for &c in mv.cells() { board.remove(c); }
         cut |= subcut;
         if w { won = true; break; }
+    }
+    if won && let Some(cells) = won_support {
+        s.record_support((board.hash, true, placements), cells);
     }
     let res = if won { (true, false) } else { (false, cut) };
     if !s.exceeded { s.tt.insert(key, res); }
@@ -1074,9 +1235,28 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
     if dfn_comps.iter().any(|c| c.len() as u8 <= 2) { return (false, false); } // defender wins first
     let (bnum, covers) = min_covers2(atk_comps);
     if bnum < 2 { return (false, false); }
-    if bnum >= 3 { return if budget >= 1 { (true, false) } else { (false, true) }; }
+    if bnum >= 3 {
+        return if budget >= 1 {
+            // B >= 3 win: the verdict relies on the full completion set (an
+            // opponent stone in any gap removes a completion and can drop B
+            // below 3), so the support is every completion's gap cells. The
+            // reliance on the defender NOT holding a completion (the check
+            // above) is the support consumer's separate obligation.
+            let cells: Vec<Coord> =
+                atk_comps.iter().flat_map(|c| c.cells().iter().copied()).collect();
+            s.record_support((board.hash, false, 0), cells);
+            (true, false)
+        } else {
+            (false, true)
+        };
+    }
     let key = (board.hash, false, 0, budget);
     if let Some(&v) = s.tt.get(&key) { return v; }
+    // The all-covers-fail loop below defaults to a win; that is only sound if
+    // B == 2 guarantees at least one enumerable cover (a size-2 hitting set
+    // implies one) — make the cross-function dependency on min_covers2
+    // explicit rather than implicit.
+    debug_assert!(!covers.is_empty(), "bnum == 2 must come with covers");
     // Defender covers are single cells the defender plays to block; each must be a
     // legal placement. Covers are drawn only from the cells of `atk_comps`, which
     // `scan_windows` has already filtered to within-radius gaps in the tight regime,
@@ -1091,11 +1271,30 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
         }
     }
     let mut result = (true, false);
+    // Support accumulator: the completion set (the covers derive from it — an
+    // opponent stone in any gap changes which min-covers exist) plus, per
+    // cover, its cells and the proven child's support. Any missing child
+    // support poisons the node (None → no entry → consumers re-verify fully).
+    let mut support_acc: Option<Vec<Coord>> = s.support.is_some().then(|| {
+        atk_comps.iter().flat_map(|c| c.cells().iter().copied()).collect()
+    });
     for cover in covers {
         for &c in cover.cells() { board.place(c, s.dfn); }
         let (w, subcut) = atk_within(board, 2, budget, s);
+        if w && let Some(acc) = &mut support_acc {
+            match s.support.as_ref().and_then(|m| m.get(&(board.hash, true, 2))).cloned() {
+                Some(child) => {
+                    acc.extend_from_slice(cover.cells());
+                    acc.extend_from_slice(&child);
+                }
+                None => support_acc = None,
+            }
+        }
         for &c in cover.cells() { board.remove(c); }
         if !w { result = (false, subcut); break; }
+    }
+    if result.0 && let Some(cells) = support_acc {
+        s.record_support((board.hash, false, 0), cells);
     }
     if !s.exceeded { s.tt.insert(key, result); }
     result
@@ -1116,6 +1315,25 @@ fn solve_from(board: &mut SolverBoard, attacker: Player, defender: Player,
 fn solve_from_ex(board: &mut SolverBoard, attacker: Player, defender: Player,
                   placements_remaining: u8, wl: u8, radius: i32, depth_cap: u8, node_budget: u64,
                   wide: bool, limits: Limits) -> SolveResult {
+    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
+    s.limits = limits;
+    solve_from_state(board, placements_remaining, depth_cap, &mut s)
+}
+
+/// The actual ID driver, on a caller-owned `SearchState`. Callers that need the
+/// PV afterwards keep `s` and hand its warm tt/gencache/comps to
+/// `first_winning_move`/`extract_pv` — the probes then run mostly on cache hits
+/// instead of repeating the whole winning search from cold (the old
+/// "double-search": a fresh state per probe made PV extraction cost as much as
+/// the solve itself, and could even starve under `node_budget` and return an
+/// empty PV for a proven win).
+fn solve_from_state(
+    board: &mut SolverBoard,
+    placements_remaining: u8,
+    depth_cap: u8,
+    s: &mut SearchState,
+) -> SolveResult {
+    let (wl, radius) = (s.wl, s.radius);
     // The strip-scan buffers are stack-sized for win_length in 1..=MAX_WL; any
     // other config cannot be analyzed — report an honest give-up, never a bogus `No`.
     if !(1..=MAX_WL).contains(&(wl as usize)) {
@@ -1126,13 +1344,11 @@ fn solve_from_ex(board: &mut SolverBoard, attacker: Player, defender: Player,
         board.enable_reach(radius);
     }
     // sound gate
-    if !any_four_gate(board, attacker, wl, radius) && !has_completion(board, attacker, wl, placements_remaining, radius) {
+    if !any_four_gate(board, s.atk, wl, radius) && !has_completion(board, s.atk, wl, placements_remaining, radius) {
         return SolveResult::No;
     }
-    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
-    s.limits = limits;
     for depth in 1..=depth_cap {
-        let (won, cut) = atk_within(board, placements_remaining, depth, &mut s);
+        let (won, cut) = atk_within(board, placements_remaining, depth, s);
         if won { return SolveResult::Win { depth }; }
         if s.exceeded { return SolveResult::BudgetExceeded; }
         if !cut { return SolveResult::No; }
@@ -1170,11 +1386,13 @@ pub fn solve_limited(
     solve_ex(game, depth_cap, node_budget, wide, limits)
 }
 
-/// EXPERIMENTAL: `solve` with the wide-partner-width knob (see `wide_partner_cells`)
-/// turned on — a superset generator, so a `solve` win is never lost, only possibly
+/// `solve` with the wide-partner-width knob (see `wide_partner_cells`) turned
+/// on — a superset generator, so a `solve` win is never lost, only possibly
 /// found at the same or a different (never longer, since the search is best-first
 /// and iterative-deepening) depth, and previously-No/BudgetExceeded positions may
-/// newly resolve to Win. Not used by any production caller; for diagnostics only.
+/// newly resolve to Win. Production callers: the analysis screen (via the PyO3
+/// `wide` kwarg), the WASM `StrixSolver::solve_wide`, and the VCT probe.
+/// Live-play and self-play stay on tight `solve` (throughput).
 pub fn solve_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     solve_ex(game, depth_cap, node_budget, true, Limits::default())
 }
@@ -1183,13 +1401,37 @@ pub fn solve_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome 
 /// reproduces `solve` exactly. `limits` are research-only cutoffs
 /// (`Limits::default()` for all production callers — identical behaviour).
 fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool, limits: Limits) -> Outcome {
-    let attacker = match game.current_player() { Some(p) => p, None => return Outcome::No };
+    solve_ex_support(game, depth_cap, node_budget, wide, limits, false).0
+}
+
+/// EXPERIMENTAL: `solve_wide` + proof-support capture. On `Win`, additionally
+/// returns the root proof's support set — the cells the proof relied on (see
+/// `SearchState::support` for semantics and the consumer's obligations). `None`
+/// support on a `Win` means capture was poisoned somewhere in the DAG (rare);
+/// consumers must then fall back to full re-verification.
+pub(crate) fn solve_wide_with_support(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+) -> (Outcome, Option<Rc<Vec<Coord>>>) {
+    solve_ex_support(game, depth_cap, node_budget, true, Limits::default(), true)
+}
+
+fn solve_ex_support(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+    capture: bool,
+) -> (Outcome, Option<Rc<Vec<Coord>>>) {
+    let attacker = match game.current_player() { Some(p) => p, None => return (Outcome::No, None) };
     let defender = attacker.opponent();
     let wl = game.config().win_length;
     let radius = game.config().placement_radius;
     let placements = game.moves_remaining_this_turn();
     if !(1..=MAX_WL).contains(&(wl as usize)) {
-        return Outcome::BudgetExceeded; // see solve_from
+        return (Outcome::BudgetExceeded, None); // see solve_from
     }
     let mut board = SolverBoard::new();
     // Pre-size once over the position's bounding box (avoids incremental regrowth),
@@ -1208,14 +1450,14 @@ fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool, limit
         // trips, give up honestly instead of aborting the engine.
         const MAX_COORD: i32 = 1 << 30;
         if lo.0 < -MAX_COORD || lo.1 < -MAX_COORD || hi.0 > MAX_COORD || hi.1 > MAX_COORD {
-            return Outcome::BudgetExceeded;
+            return (Outcome::BudgetExceeded, None);
         }
         let (span_q, span_r) = (
             hi.0 as i64 - lo.0 as i64 + 6 * GRID_PAD as i64,
             hi.1 as i64 - lo.1 as i64 + 6 * GRID_PAD as i64,
         );
         if span_q.saturating_mul(span_r) > MAX_GRID_CELLS {
-            return Outcome::BudgetExceeded;
+            return (Outcome::BudgetExceeded, None);
         }
         board.reserve(lo, hi);
     }
@@ -1227,20 +1469,38 @@ fn solve_ex(game: &GameState, depth_cap: u8, node_budget: u64, wide: bool, limit
     // derived list (completions, hot cells, partners, moves) being sorted —
     // do not let stone/scan order leak into tie-breaking.
     for (&c, &p) in game.stones() { board.place(c, p); }
-    match solve_from_ex(&mut board, attacker, defender, placements, wl, radius, depth_cap, node_budget, wide, limits) {
-        SolveResult::No => Outcome::No,
-        SolveResult::BudgetExceeded => Outcome::BudgetExceeded,
+    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
+    s.limits = limits;
+    if capture {
+        s.support = Some(FxHashMap::default());
+    }
+    match solve_from_state(&mut board, placements, depth_cap, &mut s) {
+        SolveResult::No => (Outcome::No, None),
+        SolveResult::BudgetExceeded => (Outcome::BudgetExceeded, None),
         SolveResult::Win { depth } => {
+            // Root support must be read while the board is pristine (the PV
+            // probes below re-prove sub-positions and extract_pv permanently
+            // mutates the board).
+            let support = s
+                .support
+                .as_ref()
+                .and_then(|m| m.get(&(board.hash, true, placements)))
+                .cloned();
+            // PV probes run on the winning search's warm state, but without its
+            // research-only deadline/cancel cutoffs — the pre-refactor probes
+            // always used cutoff-free fresh states, and a deadline that expired
+            // mid-solve must not blank the PV of an already-proven win.
+            s.limits = Limits::default();
             // Compute on the pristine (post-solve_from, pre-extract_pv) board: extract_pv
             // permanently applies the winning line to `board`, so first_winning_move must
             // run first or it would be probing an already-won position.
-            let fm = first_winning_move(&mut board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
-            let pv = extract_pv(&mut board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
+            let fm = first_winning_move(&mut board, placements, depth, &mut s);
+            let pv = extract_pv(&mut board, placements, depth, &mut s);
             match fm.or_else(|| pv.first().copied()) {
-                Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
+                Some(first) => (Outcome::Win(ForcingWin { depth, first_move: first, pv }), support),
                 // Should be impossible for a proven win, but never panic: fall back to
                 // treating it as no forcing win found; the MCTS caller just runs normal search.
-                None => Outcome::No,
+                None => (Outcome::No, None),
             }
         }
     }
@@ -1270,12 +1530,16 @@ pub fn solve_from_board(
     limits: Limits,
 ) -> Outcome {
     let defender = attacker.opponent();
-    match solve_from_ex(board, attacker, defender, placements, wl, radius, depth_cap, node_budget, wide, limits) {
+    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
+    s.limits = limits;
+    match solve_from_state(board, placements, depth_cap, &mut s) {
         SolveResult::No => Outcome::No,
         SolveResult::BudgetExceeded => Outcome::BudgetExceeded,
         SolveResult::Win { depth } => {
-            let fm = first_winning_move(board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
-            let pv = extract_pv(board, attacker, defender, placements, wl, radius, depth, node_budget, wide);
+            // Warm-state PV probes, cutoffs cleared — see `solve_ex`.
+            s.limits = Limits::default();
+            let fm = first_winning_move(board, placements, depth, &mut s);
+            let pv = extract_pv(board, placements, depth, &mut s);
             match fm.or_else(|| pv.first().copied()) {
                 Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
                 None => Outcome::No,
@@ -1286,20 +1550,21 @@ pub fn solve_from_board(
 
 /// The attacker's first winning placement for a proven `Win{depth}`: an immediately
 /// executable completion's first cell, else the first `attacker_turns` move whose
-/// `def_within(depth-1, ..)` (fresh full-budget state) holds. Never panics; `None` only
-/// if no such move exists (shouldn't happen for a proven win).
-fn first_winning_move(board: &mut SolverBoard, attacker: Player, defender: Player,
-                       placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64,
-                       wide: bool) -> Option<Coord> {
-    for c in completions(board, attacker, wl, radius) {
+/// `def_within(depth-1, ..)` holds. Runs on the winning search's own state — each
+/// probe gets a fresh node budget (`reset_run`) but keeps the warm caches, so the
+/// re-searches are mostly TT hits. Never panics; `None` only if no such move
+/// exists (shouldn't happen for a proven win).
+fn first_winning_move(board: &mut SolverBoard, placements: u8, depth: u8,
+                       s: &mut SearchState) -> Option<Coord> {
+    for c in completions(board, s.atk, s.wl, s.radius) {
         if c.len() as u8 <= placements {
             return c.first();
         }
     }
-    for mv in attacker_turns(board, attacker, defender, placements, wl, radius, wide) {
-        for &c in mv.cells() { board.place(c, attacker); }
-        let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
-        let (w, _) = def_within(board, depth.saturating_sub(1), &mut s);
+    for mv in attacker_turns(board, s.atk, s.dfn, placements, s.wl, s.radius, s.wide) {
+        for &c in mv.cells() { board.place(c, s.atk); }
+        s.reset_run();
+        let (w, _) = def_within(board, depth.saturating_sub(1), s);
         for &c in mv.cells() { board.remove(c); }
         if w { return mv.first(); }
     }
@@ -1336,9 +1601,12 @@ pub fn futile_defender_pair(comps: &[CellSet2]) -> CellSet2 {
 
 /// Port of principal_variation: returns the flat placement sequence of one winning line
 /// (attacker turns interleaved with prolonging defender covers), ending in six-in-a-row.
-fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
-              mut placements: u8, wl: u8, radius: i32, depth: u8, node_budget: u64,
-              wide: bool) -> Vec<Coord> {
+/// Runs on the winning search's own state (fresh node budget per probe, warm caches —
+/// see `first_winning_move`), so the line walk is mostly TT hits instead of a second
+/// full search.
+fn extract_pv(board: &mut SolverBoard, mut placements: u8, depth: u8,
+              s: &mut SearchState) -> Vec<Coord> {
+    let (attacker, defender, wl, radius, wide) = (s.atk, s.dfn, s.wl, s.radius, s.wide);
     let mut pv: Vec<Coord> = Vec::new();
     let mut remaining = depth;
     loop {
@@ -1355,8 +1623,8 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
         let mut chosen: Option<CellSet2> = None;
         for mv in attacker_turns(board, attacker, defender, placements, wl, radius, wide) {
             for &c in mv.cells() { board.place(c, attacker); }
-            let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
-            let (w, _) = def_within(board, remaining.saturating_sub(1), &mut s);
+            s.reset_run();
+            let (w, _) = def_within(board, remaining.saturating_sub(1), s);
             for &c in mv.cells() { board.remove(c); }
             if w { chosen = Some(mv); break; }
         }
@@ -1379,8 +1647,8 @@ fn extract_pv(board: &mut SolverBoard, attacker: Player, defender: Player,
             for &c in cover.cells() { board.place(c, defender); }
             let mut sub: Option<u8> = None;
             for d in 1..remaining {
-                let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
-                let (w, _) = atk_within(board, 2, d, &mut s);
+                s.reset_run();
+                let (w, _) = atk_within(board, 2, d, s);
                 if w { sub = Some(d); break; }
             }
             for &c in cover.cells() { board.remove(c); }
@@ -1447,6 +1715,16 @@ fn flipped_fresh_turn(game: &GameState, side: Player) -> GameState {
 pub fn solve_threat(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     match game.current_player() {
         Some(mover) => solve(&flipped_fresh_turn(game, mover.opponent()), depth_cap, node_budget),
+        None => Outcome::No,
+    }
+}
+
+/// `solve_threat` with the experimental wide-partner generator (see `solve_wide`):
+/// the flipped-perspective threat check, but able to see "force with one stone,
+/// quietly build with the other" attacker turns.
+pub fn solve_threat_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
+    match game.current_player() {
+        Some(mover) => solve_wide(&flipped_fresh_turn(game, mover.opponent()), depth_cap, node_budget),
         None => Outcome::No,
     }
 }
@@ -2541,6 +2819,197 @@ mod tests {
                 let mc_us = t.elapsed().as_micros() as f64 / n as f64;
                 eprintln!("{name} r={radius}: threat_table={tt_us:.1}us comps_atk={ca_us:.1}us comps_dfn={cd_us:.1}us attacker_turns={at_us:.1}us min_covers={mc_us:.2}us  (hot={hot} moves={moves} comps={})", comps.len());
             }
+        }
+    }
+
+    /// The 2026-07-10 user-reported miss: P1 has a bare 3-run and a forced win
+    /// whose first turn pairs an open-four maker with a QUIET builder — a shape
+    /// only the wide generator can emit. P2's stones are scattered noise.
+    fn quiet_builder_win_stones() -> Vec<(Coord, Player)> {
+        let mut stones: Vec<(Coord, Player)> = [(0, 0), (1, 0), (2, 0)]
+            .into_iter().map(|c| (c, Player::P1)).collect();
+        stones.extend([(0, -8), (-1, -15), (7, -22), (3, -26)]
+            .into_iter().map(|c| (c, Player::P2)));
+        stones
+    }
+
+    /// Wide partner cells come back ordered most-threatening-first: a builder
+    /// adjacent to attacker stones on TWO axes (e.g. (0,1): one step up the
+    /// vertical of (0,0) AND one step up the diagonal of (1,0)) must outscore a
+    /// lone-axis cell at maximum range (e.g. (0,5), five steps from (0,0) with
+    /// a single shared window), and the list must be sorted (score desc,
+    /// nearest-own-stone dist asc, coord asc) so search order is deterministic.
+    #[test]
+    fn wide_partners_are_scored_most_threatening_first() {
+        let mut b = SolverBoard::new();
+        for &(c, p) in &quiet_builder_win_stones() { b.place(c, p); }
+        let (_, scores) = threat_table_scored(&b, Player::P1, 6, 8);
+        let scored = wide_partner_cells(&b, Player::P1, 6, 8, &scores);
+        let score_of = |cell: Coord| -> u32 {
+            scored.iter().find(|(c, _, _)| *c == cell).map(|&(_, s, _)| s)
+                .unwrap_or_else(|| panic!("{cell:?} missing from wide partners"))
+        };
+        assert!(
+            score_of((0, 1)) > score_of((0, 5)),
+            "two-axis adjacent builder must outscore a lone-axis max-range cell: \
+             (0,1)={} vs (0,5)={}",
+            score_of((0, 1)), score_of((0, 5))
+        );
+        for w in scored.windows(2) {
+            let ((c1, s1, d1), (c2, s2, d2)) = (w[0], w[1]);
+            assert!(
+                s1 > s2 || (s1 == s2 && (d1 < d2 || (d1 == d2 && c1 < c2))),
+                "wide partners must be sorted (score desc, dist asc, coord asc): \
+                 {c1:?}(s{s1},d{d1}) before {c2:?}(s{s2},d{d2})"
+            );
+        }
+    }
+
+    /// On equal window score, the builder hex-closer to an own stone wins. The
+    /// board is built so the closer cell also has the LARGER coordinate — pinning
+    /// that proximity (not coordinate order) is what breaks the tie: (20,2) sits
+    /// 2 steps from the lone stone (20,0) (4 shared vertical windows); (0,4) sits
+    /// 4 steps from both (0,0) (2 vertical windows) and (4,0) (2 diagonal
+    /// windows) — same score 4, but distance 2 vs 4.
+    #[test]
+    fn wide_partners_prefer_closer_builders_on_equal_threat() {
+        let mut b = SolverBoard::new();
+        for c in [(0, 0), (4, 0), (20, 0)] { b.place(c, Player::P1); }
+        let (_, scores) = threat_table_scored(&b, Player::P1, 6, 8);
+        let scored = wide_partner_cells(&b, Player::P1, 6, 8, &scores);
+        let entry = |cell: Coord| -> (u32, i32) {
+            scored.iter().find(|(c, _, _)| *c == cell).map(|&(_, s, d)| (s, d))
+                .unwrap_or_else(|| panic!("{cell:?} missing from wide partners"))
+        };
+        let (near_s, near_d) = entry((20, 2));
+        let (far_s, far_d) = entry((0, 4));
+        assert_eq!(near_s, far_s, "fixture requires equal window scores");
+        assert_eq!((near_d, far_d), (2, 4), "distances must be measured to the nearest own stone");
+        let pos = |cell: Coord| scored.iter().position(|(c, _, _)| *c == cell).unwrap();
+        assert!(
+            pos((20, 2)) < pos((0, 4)),
+            "equal-score builders must order by stone proximity, not coordinate"
+        );
+    }
+
+    /// Root move ordering on the quiet-builder board: every early root move
+    /// must pair the strongest hot cell (h_strong=3 ties break to (-1,0) by
+    /// coord), with its hot partners first and then builders
+    /// most-threatening-first — so the user-reported winning shape
+    /// ((-1,0), (0,1)) sits in the first handful of 129 root moves instead of
+    /// wherever coordinate order dropped it.
+    #[test]
+    fn wide_root_moves_lead_with_strongest_hot_group() {
+        let mut b = SolverBoard::new();
+        for &(c, p) in &quiet_builder_win_stones() { b.place(c, p); }
+        let dfn_comps = completions(&b, Player::P2, 6, 8);
+        let moves = attacker_turns_with(&b, Player::P1, 2, 6, 8, &dfn_comps, true);
+        assert!(moves.len() > 100, "wide root list should be large, got {}", moves.len());
+        for (i, mv) in moves.iter().take(5).enumerate() {
+            assert!(
+                mv.cells().contains(&(-1, 0)),
+                "root move {i} must belong to the strongest hot cell's group, got {mv:?}"
+            );
+        }
+        let pos_of = |pair: CellSet2| moves.iter().position(|m| *m == pair)
+            .unwrap_or_else(|| panic!("{pair:?} not generated"));
+        assert!(
+            pos_of(CellSet2::two((-1, 0), (0, 1))) < 8,
+            "the open-four + adjacent-builder pair must be tried within the first 8 moves"
+        );
+    }
+
+    /// Solve-level completeness pin on the 2026-07-10 user-reported position:
+    /// the quiet-builder forced win must resolve at ANALYSIS-scale budgets
+    /// (knee measured at ~15k nodes — the floor is the depth-6 verification
+    /// tree, not move ordering). Tight `solve` returns No here at ANY budget
+    /// (the winning turn shape needs a builder partner it cannot generate).
+    #[test]
+    fn wide_solves_quiet_builder_win_at_analysis_budget() {
+        use hexo_engine::game::{GameConfig, GameState};
+        let game = GameState::from_state(
+            &quiet_builder_win_stones(), Player::P1, 2, GameConfig::FULL_HEXO);
+        match solve_wide(&game, 12, 20_000) {
+            Outcome::Win(w) => {
+                assert_eq!(w.depth, 6, "known winning-move-in-6");
+                assert_eq!(w.first_move, (-1, 0), "win starts from the open-four maker");
+            }
+            other => panic!("expected wide Win within 20k nodes, got {other:?}"),
+        }
+        match solve(&game, 24, 5_000_000) {
+            Outcome::No => {}
+            other => panic!("tight generator finding this win means the fixture rotted: {other:?}"),
+        }
+    }
+
+    /// The fused single-pass scan must reproduce BOTH of its parents exactly:
+    /// the threat index byte-for-byte (same windows, same dedup, same entry
+    /// order — the wider pc filter only adds callback invocations, never
+    /// reorders the threat-band ones) and the builder scores against a
+    /// straight two-pass oracle (Σ pc per visit = Σ pc² per window).
+    #[test]
+    fn fused_scan_matches_plain_threat_table_and_score_oracle() {
+        let mut dense = SolverBoard::new();
+        for i in 0..25i32 {
+            let c = ((i % 5) * 2 - 4, (i / 5) * 2 - 4);
+            dense.place(c, if i % 3 == 0 { Player::P2 } else { Player::P1 });
+        }
+        let mut quiet = SolverBoard::new();
+        for &(c, p) in &quiet_builder_win_stones() { quiet.place(c, p); }
+        for b in [&quiet, &dense] {
+            let (index, scores) = threat_table_scored(b, Player::P1, 6, 8);
+            let plain = threat_table(b, Player::P1, 6, 8);
+            assert_eq!(index, plain, "fused threat index must equal plain threat_table");
+            // Independent oracle: dedup to UNIQUE windows (start, axis) and add
+            // pc² exactly once per window — the production code instead relies
+            // on the strip scan visiting each window pc times and adding pc per
+            // visit, so agreement here verifies that multiplicity trick rather
+            // than restating it.
+            let mut oracle: FxHashMap<Coord, u32> = FxHashMap::default();
+            let mut seen: FxHashSet<(Coord, u8)> = FxHashSet::default();
+            scan_windows(b, Player::P1, 6, 8, 1, 5, &mut |start, ai, pc, empties| {
+                if seen.insert((start, ai as u8)) {
+                    for &e in empties {
+                        *oracle.entry(e).or_insert(0) += (pc as u32) * (pc as u32);
+                    }
+                }
+                false
+            });
+            assert_eq!(scores, oracle, "fused scores must equal Σ pc² per unique window");
+        }
+    }
+
+    /// Pin the score and distance VALUES, not just relative order: (0,1) sits
+    /// one step from (0,0) on the vertical (5 shared windows, pc=1) and one
+    /// step from (1,0) on the diagonal (5 more) → score 10, dist 1; (0,5) sits
+    /// five steps from (0,0) with a single shared window → score 1, dist 5.
+    #[test]
+    fn wide_partner_scores_have_exact_values() {
+        let mut b = SolverBoard::new();
+        for &(c, p) in &quiet_builder_win_stones() { b.place(c, p); }
+        let (_, scores) = threat_table_scored(&b, Player::P1, 6, 8);
+        let scored = wide_partner_cells(&b, Player::P1, 6, 8, &scores);
+        let entry = |cell: Coord| scored.iter().find(|(c, _, _)| *c == cell)
+            .map(|&(_, s, d)| (s, d)).unwrap();
+        assert_eq!(entry((0, 1)), (10, 1));
+        assert_eq!(entry((0, 5)), (1, 5));
+    }
+
+    /// The flipped-perspective threat solve gets the same wide knob: with P2 to
+    /// move on the quiet-builder board, P1's forcing win is a THREAT that only
+    /// the wide generator can see.
+    #[test]
+    fn wide_threat_sees_quiet_builder_threat() {
+        use hexo_engine::game::{GameConfig, GameState};
+        let game = GameState::from_state(
+            &quiet_builder_win_stones(), Player::P2, 2, GameConfig::FULL_HEXO);
+        match solve_threat_wide(&game, 12, 20_000) {
+            Outcome::Win(w) => assert_eq!(w.depth, 6),
+            other => panic!("expected wide threat Win, got {other:?}"),
+        }
+        match solve_threat(&game, 12, 250_000) {
+            Outcome::No => {}
+            other => panic!("tight threat solve should not see it: {other:?}"),
         }
     }
 }

@@ -187,9 +187,12 @@ pub struct DefenseOutcome {
     /// The opponent's threat as a `SolveOutcome` (`kind: Win`), chunked into
     /// turns the same way as `solve`: the threat is a fresh 2-placement turn
     /// for the opponent, so the first turn has 2 cells. `None` when there is no
-    /// proven threat. `depth` is the real threat depth (captured in
-    /// `DefenseAnalysis::threat_depth`); `nodes` is 0 (the sub-solve's node
-    /// count is not surfaced by `solve_defense`).
+    /// proven threat; always present under `ThreatFound`, but its `pv` may be
+    /// EMPTY when the PV re-derivation starved under `node_budget` (the win and
+    /// its `depth` are still proven — retry with a larger budget to recover the
+    /// line; killers/pair_anchors/best_delay are empty in that case too, since
+    /// defense candidates are drawn from the PV cells). `nodes` is 0 (the
+    /// sub-solve's node count is not surfaced by `solve_defense`).
     pub threat: Option<SolveOutcome>,
     /// Single placements after which the threat is no longer provable (or which
     /// end the game outright).
@@ -276,6 +279,16 @@ impl StrixSolver {
                  stone must be present, with no duplicate or contradictory coords",
             ));
         }
+        // Unlike the solve/solve_wide/solve_threat entries (whose Idtt path
+        // never builds a GameState), defense constructs a real GameState whose
+        // legal-move set materializes hex_offsets(placement_radius) — an
+        // O(radius²) allocation an untrusted caller could turn into an OOM.
+        // Production radii are single digits; 64 is far beyond any real game.
+        if !(1..=64).contains(&pos.placement_radius) {
+            return Err(JsError::new(
+                "solve_defense requires 1 <= placement_radius <= 64",
+            ));
+        }
         let analysis = solve_defense_from_position(
             &pos,
             limits.depth_cap,
@@ -300,24 +313,28 @@ impl StrixSolver {
             Some(a) => {
                 // The threat is the opponent's fresh 2-placement turn: chunk with
                 // moves_remaining=2, attacker = opponent of `to_move`.
+                //
+                // `a.threat_pv` CAN be empty even though the threat is proven:
+                // the underlying solve re-derives its PV through budget-bound
+                // re-searches (first_winning_move + extract_pv), and the line
+                // walk can starve under `node_budget` while the win itself (and
+                // its depth) stand. On wasm this is likelier than native — the
+                // wall-clock deadline is compiled out, so the node budget is the
+                // only bound. A proven threat with no line is still a proven
+                // threat: report ThreatFound with `threat.pv` empty (retry with
+                // a larger node_budget to recover the line), never NoThreat —
+                // and note killers/pair_anchors/best_delay are necessarily
+                // empty too (defense candidates are drawn from the PV cells).
                 let threat_attacker = opponent(position.to_move);
-                let threat = if a.threat_pv.is_empty() {
-                    None
-                } else {
-                    Some(SolveOutcome {
-                        kind: SolveKind::Win,
-                        depth: a.threat_depth,
-                        nodes: 0, // solve_defense does not surface sub-solve node counts
-                        time_ms: 0.0, // the threat sub-solve's own time is not isolated
-                        pv: chunk_pv(&a.threat_pv, 2, threat_attacker),
-                    })
-                };
+                let threat = Some(SolveOutcome {
+                    kind: SolveKind::Win,
+                    depth: a.threat_depth,
+                    nodes: 0, // solve_defense does not surface sub-solve node counts
+                    time_ms: 0.0, // the threat sub-solve's own time is not isolated
+                    pv: chunk_pv(&a.threat_pv, 2, threat_attacker),
+                });
                 Ok(DefenseOutcome {
-                    kind: if threat.is_some() {
-                        DefenseKind::ThreatFound
-                    } else {
-                        DefenseKind::NoThreat
-                    },
+                    kind: DefenseKind::ThreatFound,
                     nodes: 0,
                     time_ms,
                     threat,
@@ -430,8 +447,9 @@ fn chunk_pv(pv: &[Coord], moves_remaining: u8, attacker: Player) -> Vec<Turn> {
     let mut idx = 0;
     let mut turn_num = 0u32;
     let mut current_player = attacker;
-    // First attacker turn: moves_remaining cells.
-    let first_len = moves_remaining.min(pv.len() as u8) as usize;
+    // First attacker turn: moves_remaining cells. Compare in usize — casting
+    // pv.len() to u8 would wrap for PVs past 255 cells and mis-chunk the line.
+    let first_len = (moves_remaining as usize).min(pv.len());
     turns.push(Turn {
         turn: turn_num,
         player: current_player,
