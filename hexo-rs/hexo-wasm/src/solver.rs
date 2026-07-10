@@ -41,11 +41,27 @@ pub struct CoordW {
     pub r: i32,
 }
 
+#[wasm_bindgen]
+impl CoordW {
+    #[wasm_bindgen(constructor)]
+    pub fn new(q: i32, r: i32) -> Self {
+        CoordW { q, r }
+    }
+}
+
 #[wasm_bindgen(getter_with_clone)]
 #[derive(Clone, Debug)]
 pub struct Stone {
     pub coord: CoordW,
     pub player: Player,
+}
+
+#[wasm_bindgen]
+impl Stone {
+    #[wasm_bindgen(constructor)]
+    pub fn new(coord: CoordW, player: Player) -> Self {
+        Stone { coord, player }
+    }
 }
 
 #[wasm_bindgen(getter_with_clone)]
@@ -60,10 +76,47 @@ pub struct Position {
 }
 
 #[wasm_bindgen]
+impl Position {
+    /// Construct a position. `stones_flat` is a flat `[q, r, player, q, r, player, ...]`
+    /// array (player = 1 for P1, 2 for P2); any trailing partial triple is ignored.
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        win_length: u8,
+        placement_radius: i32,
+        max_moves: u32,
+        to_move: Player,
+        moves_remaining: u8,
+        stones_flat: &[i32],
+    ) -> Self {
+        let mut stones = Vec::with_capacity(stones_flat.len() / 3);
+        let mut i = 0;
+        while i + 2 < stones_flat.len() {
+            let q = stones_flat[i];
+            let r = stones_flat[i + 1];
+            let player = match stones_flat[i + 2] {
+                1 => Player::P1,
+                _ => Player::P2,
+            };
+            stones.push(Stone { coord: CoordW { q, r }, player });
+            i += 3;
+        }
+        Position { win_length, placement_radius, max_moves, to_move, moves_remaining, stones }
+    }
+}
+
+#[wasm_bindgen]
 pub struct SolverLimits {
     pub depth_cap: u8,
     pub node_budget: u64,
     pub engine: SolverEngineEnum,
+}
+
+#[wasm_bindgen]
+impl SolverLimits {
+    #[wasm_bindgen(constructor)]
+    pub fn new(depth_cap: u8, node_budget: u64, engine: SolverEngineEnum) -> Self {
+        SolverLimits { depth_cap, node_budget, engine }
+    }
 }
 
 #[wasm_bindgen]
