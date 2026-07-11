@@ -23,7 +23,8 @@ from urllib.parse import parse_qs, urlparse
 
 from hexo_a0.serving.analysis import (
     analyze_game_full, analyze_position, analyze_trajectory, build_state,
-    end_of_turn_indices, TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET)
+    end_of_turn_indices, ANALYSIS_PIPELINE_VERSION,
+    TRAJECTORY_DEPTH_CAP, TRAJECTORY_NODE_BUDGET)
 from hexo_a0.serving.dbmigrate import apply_migrations
 from hexo_a0.serving import hds
 from hexo_a0.serving.game import DEFAULT_DIFFICULTY, DEFAULT_DIFFICULTY_SIMS, DIFFICULTY_ORDER, GameError, GameManager, ServerBusyError, UnknownGameError, make_bot_turn_fn
@@ -373,7 +374,14 @@ class AnalyzeContext:
         self._store = None
         if cache_db_path and model_id and cache_size > 0:
             try:
-                self._store = _PositionStore(cache_db_path, model_id, mcts_sims, m_actions)
+                # The analysis-pipeline version rides in the store's model key:
+                # cached entries embed solver verdicts, and a capability bump
+                # (e.g. the wide generator) must not re-serve pre-upgrade
+                # entries whose forcing=None the new pipeline would prove Win.
+                # Old-version rows are kept but never match; the size cap ages
+                # them out.
+                versioned_id = f"{model_id}::a{ANALYSIS_PIPELINE_VERSION}"
+                self._store = _PositionStore(cache_db_path, versioned_id, mcts_sims, m_actions)
                 for pt, entry in self._store.load_recent(cache_size):
                     self._cache[(pt, mcts_sims, m_actions)] = entry
                 logger.info("analysis cache: %d positions warmed from %s",

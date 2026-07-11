@@ -312,6 +312,8 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 .forcing-wide-tag{margin-left:.5em; padding:0 .4em; border:1px solid currentColor;
   border-radius:3px; font-size:.75em; opacity:.75; vertical-align:middle;
   cursor:help;}
+.forcing-defense-line{font-size:.85em; opacity:.85; margin-top:.15em;
+  cursor:help;}
 
 /* "Missed win!" badge (Task 3) — a per-PLACEMENT marker on the move list for
    a squandered forced win. Must read as a bigger event than the mv-q ★✓?✗

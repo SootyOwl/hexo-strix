@@ -851,6 +851,49 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
       }
     });
   }
+  // Defense read-out overlay (threat banners from single-position analysis):
+  // killers as check-marked rings in the DEFENDER's stone colour, pair
+  // defenses as dashed anchor rings linked to a faded follow-up cell, the
+  // max-delay fallback as a lone dotted ring. Board markers instead of raw
+  // coordinates — the board has no coordinate labels.
+  if (forcing && forcing.defense) {
+    const d = forcing.defense;
+    // The defender is the side to move (opponent of forcing.winner).
+    const dColor = forcing.winner === "P2" ? "#f08a3c" : "#3fb6d9";
+    // Corner BADGE, not a cell-sized ring: a small dark disc with a
+    // defender-colour rim tucked toward the hex's top-right vertex (the -30°
+    // corner of the pointy-top cell), so the cell's face stays readable and —
+    // critically — clickable: hit-testing is confined to the badge itself.
+    const bd = S * 0.66; // badge center: 2/3 of the way to the -30° vertex
+    const badgeAt = (cell) => {
+      const p = axialToPixel(cell[0], cell[1]);
+      return { x: p.x + bd * Math.cos(-Math.PI / 6), y: p.y + bd * Math.sin(-Math.PI / 6) };
+    };
+    const badge = (cell, dash, glyph, opacity, tip) => {
+      const b = badgeAt(cell);
+      let g = `<g class="defense-badge" opacity="${opacity}" pointer-events="all">`;
+      g += `<title>${tip}</title>`;
+      g += `<circle cx="${b.x}" cy="${b.y}" r="${S * 0.26}" fill="#0d0f0e" stroke="${dColor}" stroke-width="${S * 0.055}"${dash ? ` stroke-dasharray="${S * 0.11} ${S * 0.08}"` : ""}/>`;
+      g += `<text x="${b.x}" y="${b.y + 0.5}" font-size="${Math.round(S * 0.34)}" fill="${dColor}" text-anchor="middle" dominant-baseline="middle" font-weight="bold" pointer-events="none">${glyph}</text>`;
+      return g + "</g>";
+    };
+    if (d.killers.length) {
+      for (const c of d.killers) {
+        body += badge(c, false, "✓", 0.95, "Defends: the threat is no longer provable after this placement");
+      }
+    } else if (d.pair_anchors.length) {
+      // Multiple verified pairs would clutter the board; show only the best
+      // one. The solver emits anchors in threat-PV order (most direct
+      // refutation first), so the first pair is the natural pick.
+      const [a, b] = d.pair_anchors[0];
+      const ba = badgeAt(a), bb = badgeAt(b);
+      body += `<line class="defense-badge" x1="${ba.x}" y1="${ba.y}" x2="${bb.x}" y2="${bb.y}" stroke="${dColor}" stroke-width="${S * 0.045}" stroke-dasharray="${S * 0.11} ${S * 0.11}" opacity="0.35" pointer-events="none"/>`;
+      body += badge(a, true, "1", 0.95, "Pair defense: play this first — it only refutes together with the linked follow-up");
+      body += badge(b, true, "2", 0.6, "Pair defense follow-up (re-checked after the first placement)");
+    } else if (d.best_delay) {
+      body += badge(d.best_delay, true, "…", 0.75, "No refutation found at analysis budgets — this placement delays the threat longest");
+    }
+  }
   // Move-quality icon: mark EVERY placement of the verdict's turn (not just the
   // last stone), so a 2-placement blunder shows the whole turn. Falls back to
   // the single current move for side-line nodes with no turn context.
@@ -903,6 +946,32 @@ function updateForcingBanner(forcing) {
     tag.textContent = "wide";
     tag.title = "Found by the wide solver: the winning line includes quiet build placements, not just direct threats";
     banner.appendChild(tag);
+  }
+  // Threat banners from single-position analysis may carry the defense
+  // read-out: which placements refute the threat. Advisory (verified at
+  // analysis budgets, time-boxed) — absent on wins, old extensions, or when
+  // the defense sub-analysis had trouble.
+  const d = forcing.defense;
+  if (d && (d.killers.length || d.pair_anchors.length || d.best_delay)) {
+    // The cells themselves are marked on the board (rings in the defender's
+    // colour — see drawAnalysisBoard's defense overlay); the banner only
+    // summarizes what kind of defense exists.
+    let text;
+    if (d.killers.length) {
+      text = d.killers.length === 1
+        ? "1 defending placement marked ✓ on the board"
+        : `${d.killers.length} defending placements marked ✓ on the board`;
+    } else if (d.pair_anchors.length) {
+      text = "defense needs a pair — play 1, then 2 (best pair marked on the board)"
+        + (d.pair_anchors.length > 1 ? ` — ${d.pair_anchors.length - 1} alternative${d.pair_anchors.length > 2 ? "s" : ""} exist` : "");
+    } else {
+      text = "no refutation found — the longest-delay placement is marked … on the board";
+    }
+    const line = document.createElement("div");
+    line.className = "forcing-defense-line";
+    line.textContent = text;
+    line.title = "Defense candidates verified at analysis budgets (advisory, time-boxed)";
+    banner.appendChild(line);
   }
   // "win"/"threat" classes carry the colour (observatory.css).
   banner.classList.toggle("win", forcing.attacker_is_mover);

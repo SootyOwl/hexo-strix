@@ -211,10 +211,34 @@ pub fn solve_defense_from_position(
     node_budget: u64,
     time_limit: std::time::Duration,
 ) -> Option<DefenseAnalysis> {
+    match solve_defense_verdict_from_position(position, depth_cap, node_budget, time_limit, false) {
+        forcing::DefenseVerdict::Threat(a) => Some(a),
+        _ => None,
+    }
+}
+
+/// Like [`solve_defense_from_position`], but returns the full
+/// [`forcing::DefenseVerdict`] (distinguishing a proven `NoThreat` from a
+/// starved `BudgetExceeded`) and takes the `wide` generator knob. An invalid
+/// position (game-validity, turn shape, coordinate spread) reports
+/// `BudgetExceeded` — an honest "cannot analyze", never a safety verdict.
+pub fn solve_defense_verdict_from_position(
+    position: &SolverPosition,
+    depth_cap: u8,
+    node_budget: u64,
+    time_limit: std::time::Duration,
+    wide: bool,
+) -> forcing::DefenseVerdict {
     // Defense builds a GameState (GameState::from_state seeds (0,0,P1) and panics
-    // on duplicate/contradictory coords). Gate on game-validity; invalid → None.
-    if !is_game_valid_board(&position.stones) {
-        return None;
+    // on duplicate/contradictory coords, and asserts moves_remaining in {1,2}).
+    // Gate on game-validity, turn shape, and coordinate spread.
+    // (solve/solve_wide/solve_threat get the same guards from `dispatch`; this
+    // path bypasses dispatch, so it must carry its own.)
+    if !is_game_valid_board(&position.stones)
+        || !(1..=2).contains(&position.moves_remaining)
+        || !spread_is_valid(&position.stones)
+    {
+        return forcing::DefenseVerdict::BudgetExceeded;
     }
     let cfg = GameConfig {
         win_length: position.win_length,
@@ -227,7 +251,7 @@ pub fn solve_defense_from_position(
         position.moves_remaining,
         cfg,
     );
-    forcing::solve_defense(&game, depth_cap, node_budget, time_limit)
+    forcing::solve_defense_ex(&game, depth_cap, node_budget, time_limit, wide)
 }
 
 fn dispatch(

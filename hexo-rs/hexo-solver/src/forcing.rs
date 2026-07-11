@@ -1254,9 +1254,13 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
     if let Some(&v) = s.tt.get(&key) { return v; }
     // The all-covers-fail loop below defaults to a win; that is only sound if
     // B == 2 guarantees at least one enumerable cover (a size-2 hitting set
-    // implies one) — make the cross-function dependency on min_covers2
-    // explicit rather than implicit.
+    // implies one). Make the cross-function dependency on min_covers2 explicit,
+    // and fail CONSERVATIVE in release: an internal inconsistency here must
+    // become a missed win, never a false one.
     debug_assert!(!covers.is_empty(), "bnum == 2 must come with covers");
+    if covers.is_empty() {
+        return (false, false);
+    }
     // Defender covers are single cells the defender plays to block; each must be a
     // legal placement. Covers are drawn only from the cells of `atk_comps`, which
     // `scan_windows` has already filtered to within-radius gaps in the tight regime,
@@ -1337,6 +1341,17 @@ fn solve_from_state(
     // The strip-scan buffers are stack-sized for win_length in 1..=MAX_WL; any
     // other config cannot be analyzed — report an honest give-up, never a bogus `No`.
     if !(1..=MAX_WL).contains(&(wl as usize)) {
+        return SolveResult::BudgetExceeded;
+    }
+    // Below wl=5 the threat machinery is blind to some MULTI-TURN wins: the
+    // strip scan only visits windows through the player's own stones (pc >= 1
+    // always), so for wl < 4 the whole threat band [wl-4, wl-3] is unreachable,
+    // and for wl == 4 its pc = 0 element is — yet at wl=4 a bare pair played
+    // into empty space is already a forcing double threat the generator would
+    // never emit. An immediate completion still solves (the completion band
+    // works down to wl=2), but anything deeper would surface as a FALSE proven
+    // `No`. Give up honestly instead.
+    if (wl as usize) < 5 && !has_completion(board, s.atk, wl, placements_remaining, radius) {
         return SolveResult::BudgetExceeded;
     }
     // Tight regime: switch legality queries to O(1) incremental counts.
@@ -1498,9 +1513,11 @@ fn solve_ex_support(
             let pv = extract_pv(&mut board, placements, depth, &mut s);
             match fm.or_else(|| pv.first().copied()) {
                 Some(first) => (Outcome::Win(ForcingWin { depth, first_move: first, pv }), support),
-                // Should be impossible for a proven win, but never panic: fall back to
-                // treating it as no forcing win found; the MCTS caller just runs normal search.
-                None => (Outcome::No, None),
+                // Nearly impossible with warm-state probes, but if both PV
+                // re-probes starve under budget, report the honest give-up —
+                // never `No`, which would contradict the proof the main search
+                // just produced.
+                None => (Outcome::BudgetExceeded, None),
             }
         }
     }
@@ -1542,7 +1559,9 @@ pub fn solve_from_board(
             let pv = extract_pv(board, placements, depth, &mut s);
             match fm.or_else(|| pv.first().copied()) {
                 Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
-                None => Outcome::No,
+                // Honest give-up, never a `No` contradicting the proven win —
+                // see solve_ex_support.
+                None => Outcome::BudgetExceeded,
             }
         }
     }
@@ -1673,6 +1692,7 @@ fn extract_pv(board: &mut SolverBoard, mut placements: u8, depth: u8,
 /// when the flipped re-solve after it no longer proves the win, where
 /// `BudgetExceeded` counts as killed (parity with the old loop; an honest
 /// "couldn't re-prove" stands down to MCTS rather than panicking the defense).
+#[derive(Debug)]
 pub struct DefenseAnalysis {
     /// The depth of the opponent's proven threat (from the flipped fresh-turn
     /// `solve`). Captured so WASM/PyO3 callers can reconstruct a `SolveOutcome`
@@ -1742,9 +1762,43 @@ pub fn solve_threat_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> O
 /// the partial result is returned (unverified candidates are simply not
 /// reported), so live turns stay bounded no matter how many candidates the
 /// threat line offers.
+/// Outcome of a defensive analysis, distinguishing "provably nothing to
+/// defend" from "the threat check ran out of budget" — a starved check must
+/// never be read as safe.
+#[derive(Debug)]
+pub enum DefenseVerdict {
+    /// The opponent has a proven threat; here is what refutes it.
+    Threat(DefenseAnalysis),
+    /// Provably no opponent threat within `depth_cap` (the threat solve
+    /// returned a genuine `No`).
+    NoThreat,
+    /// The threat check exhausted `node_budget` before proving anything —
+    /// retry with a larger budget; NOT a safety verdict.
+    BudgetExceeded,
+}
+
+/// Back-compat wrapper: tight generator, `Threat` flattened to `Some` and both
+/// give-up cases to `None` (the historical conflation — callers that need to
+/// tell them apart use [`solve_defense_ex`]).
 pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
                      time_limit: std::time::Duration) -> Option<DefenseAnalysis> {
-    let mover = game.current_player()?;
+    match solve_defense_ex(game, depth_cap, node_budget, time_limit, false) {
+        DefenseVerdict::Threat(a) => Some(a),
+        DefenseVerdict::NoThreat | DefenseVerdict::BudgetExceeded => None,
+    }
+}
+
+/// See `solve_defense`; `wide` runs every internal solve (threat sighting AND
+/// candidate/pair verifications — both sides must see the same generator, or a
+/// wide-only threat would be "refuted" by any placement the tight re-solve is
+/// blind to) with the wide generator. A missing `current_player` reports
+/// `NoThreat` (terminal game: nothing to defend).
+pub fn solve_defense_ex(game: &GameState, depth_cap: u8, node_budget: u64,
+                        time_limit: std::time::Duration, wide: bool) -> DefenseVerdict {
+    let Some(mover) = game.current_player() else {
+        return DefenseVerdict::NoThreat;
+    };
+    let solve_g = if wide { solve_wide } else { solve };
     let opp = mover.opponent();
     // `Instant::now()` panics at runtime on wasm32-unknown-unknown (no monotonic
     // clock in std for that target). On wasm the deadline is skipped entirely —
@@ -1755,9 +1809,10 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
     let t0 = Instant::now();
     #[cfg(target_arch = "wasm32")]
     let _ = time_limit;
-    let threat = match solve(&flipped_fresh_turn(game, opp), depth_cap, node_budget) {
+    let threat = match solve_g(&flipped_fresh_turn(game, opp), depth_cap, node_budget) {
         Outcome::Win(w) => w,
-        Outcome::No | Outcome::BudgetExceeded => return None,
+        Outcome::No => return DefenseVerdict::NoThreat,
+        Outcome::BudgetExceeded => return DefenseVerdict::BudgetExceeded,
     };
     let threat_depth = threat.depth;
     let legal = game.legal_moves_set();
@@ -1781,7 +1836,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
             killers.push(c);
             continue;
         }
-        match solve(&flipped_fresh_turn(&trial, opp), depth_cap, node_budget) {
+        match solve_g(&flipped_fresh_turn(&trial, opp), depth_cap, node_budget) {
             Outcome::Win(w) => survivors.push((c, w.pv)),
             Outcome::No | Outcome::BudgetExceeded => killers.push(c),
         }
@@ -1808,7 +1863,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
                 if trial2.apply_move(c2).is_err() { continue; }
                 let refuted = trial2.is_terminal()
                     || !matches!(
-                        solve(&flipped_fresh_turn(&trial2, opp), depth_cap, node_budget),
+                        solve_g(&flipped_fresh_turn(&trial2, opp), depth_cap, node_budget),
                         Outcome::Win(_)
                     );
                 if refuted {
@@ -1829,7 +1884,7 @@ pub fn solve_defense(game: &GameState, depth_cap: u8, node_budget: u64,
         }
     }
 
-    Some(DefenseAnalysis {
+    DefenseVerdict::Threat(DefenseAnalysis {
         threat_depth,
         threat_pv: threat.pv,
         killers,
@@ -2933,6 +2988,15 @@ mod tests {
             Outcome::Win(w) => {
                 assert_eq!(w.depth, 6, "known winning-move-in-6");
                 assert_eq!(w.first_move, (-1, 0), "win starts from the open-four maker");
+                // Replay the PV through the engine: the line must be legal and
+                // actually end in the attacker's win — a wide-only bug that
+                // fabricates a plausible-looking PV must not pass.
+                let mut replay = game.clone();
+                for &c in &w.pv {
+                    replay.apply_move(c).expect("wide PV must be a legal line");
+                }
+                assert!(replay.is_terminal(), "wide PV must end the game");
+                assert_eq!(replay.winner(), Some(Player::P1), "wide PV must win for the attacker");
             }
             other => panic!("expected wide Win within 20k nodes, got {other:?}"),
         }
@@ -2993,6 +3057,65 @@ mod tests {
             .map(|&(_, s, d)| (s, d)).unwrap();
         assert_eq!(entry((0, 1)), (10, 1));
         assert_eq!(entry((0, 5)), (1, 5));
+    }
+
+    /// The defensive analysis gets the same wide knob: with P2 to move on the
+    /// quiet-builder board, P1's wide-only threat is invisible to the tight
+    /// defense (historical behavior: None / NoThreat) but the wide defense
+    /// sights it and produces verified refutation candidates from its PV.
+    #[test]
+    fn wide_defense_sights_quiet_builder_threat_tight_defense_cannot() {
+        use hexo_engine::game::{GameConfig, GameState};
+        use std::time::Duration;
+        let game = GameState::from_state(
+            &quiet_builder_win_stones(), Player::P2, 2, GameConfig::FULL_HEXO);
+        match solve_defense_ex(&game, 12, 100_000, Duration::from_secs(60), false) {
+            DefenseVerdict::NoThreat => {}
+            other => panic!("tight defense must prove NoThreat here, got {other:?}"),
+        }
+        match solve_defense_ex(&game, 12, 100_000, Duration::from_secs(60), true) {
+            DefenseVerdict::Threat(a) => {
+                assert_eq!(a.threat_depth, 6, "the quiet-builder threat is a win-in-6");
+                assert!(!a.threat_pv.is_empty(), "sighted threat must carry its PV");
+                assert!(
+                    !a.killers.is_empty() || !a.pair_anchors.is_empty() || a.best_delay.is_some(),
+                    "defense must report some candidate against the sighted threat"
+                );
+            }
+            other => panic!("wide defense must sight the threat, got {other:?}"),
+        }
+    }
+
+    /// A starved threat check is BudgetExceeded — never the proven NoThreat it
+    /// was historically conflated with.
+    #[test]
+    fn defense_distinguishes_no_threat_from_starved_check() {
+        use hexo_engine::game::{GameConfig, GameState};
+        use std::time::Duration;
+        // Real threat (P1's open fork), mover P2 — at node_budget 1 the threat
+        // check can only starve.
+        let mut stones: Vec<(Coord, Player)> = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
+            .into_iter().map(|c| (c, Player::P1)).collect();
+        stones.push(((5, 5), Player::P2));
+        let game = GameState::from_state(&stones, Player::P2, 2, GameConfig::FULL_HEXO);
+        match solve_defense_ex(&game, 12, 1, Duration::from_secs(60), false) {
+            DefenseVerdict::BudgetExceeded => {}
+            other => panic!("starved check must be BudgetExceeded, got {other:?}"),
+        }
+        match solve_defense_ex(&game, 12, 100_000, Duration::from_secs(60), false) {
+            DefenseVerdict::Threat(_) => {}
+            other => panic!("full budget must sight the fork threat, got {other:?}"),
+        }
+        // Provably nothing to defend: a bare-board opponent cannot threaten.
+        let quiet = GameState::from_state(
+            &[((0, 0), Player::P1), ((5, 5), Player::P2)], Player::P2, 2, GameConfig::FULL_HEXO);
+        match solve_defense_ex(&quiet, 12, 100_000, Duration::from_secs(60), false) {
+            DefenseVerdict::NoThreat => {}
+            other => panic!("expected proven NoThreat, got {other:?}"),
+        }
+        // Back-compat wrapper flattens both give-ups to None.
+        assert!(solve_defense(&game, 12, 1, Duration::from_secs(60)).is_none());
+        assert!(solve_defense(&quiet, 12, 100_000, Duration::from_secs(60)).is_none());
     }
 
     /// The flipped-perspective threat solve gets the same wide knob: with P2 to

@@ -13,7 +13,7 @@
 use hexo_engine::types::{Coord, Player as EnginePlayer};
 use hexo_solver::forcing::{ForcingWin, Outcome};
 use hexo_solver::{
-    is_game_valid_board, solve_defense_from_position, solve_from_position,
+    is_game_valid_board, solve_defense_verdict_from_position, solve_from_position, DefenseVerdict,
     solve_wide_from_position, SolverEngine, SolverPosition,
 };
 use wasm_bindgen::prelude::*;
@@ -152,16 +152,13 @@ pub struct SolveOutcome {
 pub enum DefenseKind {
     /// The opponent has a proven forcing threat (the mover has a defense to find).
     ThreatFound = 0,
-    /// No proven opponent threat — nothing to defend. NOTE: this conflates "no
-    /// threat" with "budget exceeded during the threat check" (`solve_defense`
-    /// returns `None` for both); the caller cannot distinguish them from this
-    /// enum alone. A larger `node_budget` disambiguates on re-query.
+    /// PROVEN no opponent threat within `depth_cap` — nothing to defend.
+    /// (Historically this also covered budget starvation; that case is now
+    /// reported as `BudgetExceeded`.)
     NoThreat = 1,
-    /// Budget exceeded during the threat check. Currently UNREACHABLE: the
-    /// `solve_defense` mapping produces only `ThreatFound`/`NoThreat` (the
-    /// underlying `solve_defense` returns `None` for both no-threat and
-    /// budget-exceeded, which maps to `NoThreat`). Reserved for a future revision
-    /// where `solve_defense` distinguishes budget-exceeded from no-threat.
+    /// The threat check exhausted `node_budget` (or the position was not
+    /// analyzable: invalid turn shape / pathological coordinate spread) before
+    /// proving anything. NOT a safety verdict — retry with a larger budget.
     BudgetExceeded = 2,
 }
 
@@ -250,8 +247,11 @@ impl StrixSolver {
     /// Defensive analysis for the side to move: detects the opponent's
     /// flipped-perspective forcing threat and reports which placements refute it
     /// (killers / pair anchors / best-delay fallback). Wraps
-    /// `hexo_solver::solve_defense_from_position`, which delegates to the
-    /// battle-tested `forcing::solve_defense`.
+    /// `hexo_solver::solve_defense_verdict_from_position`, which delegates to
+    /// the battle-tested `forcing::solve_defense_ex`. Uses the TIGHT generator;
+    /// see `solve_defense_wide` for threats the tight generator cannot see.
+    /// A starved threat check reports `kind: BudgetExceeded`, distinct from the
+    /// proven `NoThreat`.
     ///
     /// `limits.engine` is INERT for defense: the analysis always uses the forcing
     /// (idtt) solver internally (the candidate-verification pattern is
@@ -271,6 +271,26 @@ impl StrixSolver {
         position: &Position,
         limits: &SolverLimits,
     ) -> Result<DefenseOutcome, JsError> {
+        Self::solve_defense_inner(position, limits, false)
+    }
+
+    /// `solve_defense` with the wide (threat + quiet-builder) generator for the
+    /// threat sighting AND every candidate/pair verification — sees threats the
+    /// tight defense provably cannot (a forcing turn pairing a threat stone
+    /// with a quiet build stone), at the known ~1.5-1.7x per-solve cost.
+    pub fn solve_defense_wide(
+        &self,
+        position: &Position,
+        limits: &SolverLimits,
+    ) -> Result<DefenseOutcome, JsError> {
+        Self::solve_defense_inner(position, limits, true)
+    }
+
+    fn solve_defense_inner(
+        position: &Position,
+        limits: &SolverLimits,
+        wide: bool,
+    ) -> Result<DefenseOutcome, JsError> {
         let t0 = instant_now();
         let pos = convert_position(position)?;
         if !is_game_valid_board(&pos.stones) {
@@ -289,28 +309,36 @@ impl StrixSolver {
                 "solve_defense requires 1 <= placement_radius <= 64",
             ));
         }
-        let analysis = solve_defense_from_position(
+        // GameState::from_state asserts this; reject with a clear error instead
+        // of trapping the wasm instance. (solve/solve_wide/solve_threat get the
+        // equivalent guard from the dispatch layer.)
+        if !(1..=2).contains(&pos.moves_remaining) {
+            return Err(JsError::new("solve_defense requires moves_remaining of 1 or 2"));
+        }
+        let verdict = solve_defense_verdict_from_position(
             &pos,
             limits.depth_cap,
             limits.node_budget,
             std::time::Duration::from_secs(10),
+            wide,
         );
         let time_ms = elapsed_ms(t0);
-        // `solve_defense` returns None for BOTH "no threat" and "budget exceeded
-        // during the threat check" — there is no distinct BudgetExceeded case
-        // (see forcing.rs: Outcome::No | Outcome::BudgetExceeded => return None).
-        // Map None → NoThreat (documented conflation).
-        match analysis {
-            None => Ok(DefenseOutcome {
-                kind: DefenseKind::NoThreat,
-                nodes: 0,
-                time_ms,
-                threat: None,
-                killers: Vec::new(),
-                pair_anchors: Vec::new(),
-                best_delay: None,
-            }),
-            Some(a) => {
+        let empty = |kind: DefenseKind, time_ms: f64| DefenseOutcome {
+            kind,
+            nodes: 0,
+            time_ms,
+            threat: None,
+            killers: Vec::new(),
+            pair_anchors: Vec::new(),
+            best_delay: None,
+        };
+        match verdict {
+            // A genuine proven "nothing to defend".
+            DefenseVerdict::NoThreat => Ok(empty(DefenseKind::NoThreat, time_ms)),
+            // The threat CHECK starved — not a safety verdict; retry with a
+            // larger node_budget. (Historically conflated into NoThreat.)
+            DefenseVerdict::BudgetExceeded => Ok(empty(DefenseKind::BudgetExceeded, time_ms)),
+            DefenseVerdict::Threat(a) => {
                 // The threat is the opponent's fresh 2-placement turn: chunk with
                 // moves_remaining=2, attacker = opponent of `to_move`.
                 //
@@ -732,6 +760,62 @@ mod tests {
         assert!(out.killers.is_empty(), "no threat → no killers");
         assert!(out.pair_anchors.is_empty(), "no threat → no pair anchors");
         assert!(out.best_delay.is_none(), "no threat → no best_delay");
+    }
+
+    /// The quiet-builder threat board: P1's win-in-6 pairs a forcing stone
+    /// with a quiet builder, so the tight defense proves NoThreat while
+    /// `solve_defense_wide` sights it — the "why does solve_defense say
+    /// NoThreat here" field report.
+    #[test]
+    fn solve_defense_wide_sights_quiet_builder_threat() {
+        let solver = StrixSolver::new();
+        let mut stones: Vec<Stone> = [(0, 0), (1, 0), (2, 0)]
+            .into_iter()
+            .map(|(q, r)| Stone { coord: CoordW { q, r }, player: Player::P1 })
+            .collect();
+        stones.extend([(0, -8), (-1, -15), (7, -22), (3, -26)].into_iter().map(
+            |(q, r)| Stone { coord: CoordW { q, r }, player: Player::P2 },
+        ));
+        let pos = Position {
+            win_length: 6,
+            placement_radius: 8,
+            max_moves: 200,
+            to_move: Player::P2,
+            moves_remaining: 2,
+            stones,
+        };
+        let tight = solver.solve_defense(&pos, &limits_idtt(12, 100_000)).unwrap();
+        assert_eq!(tight.kind, DefenseKind::NoThreat, "tight defense is blind to this threat");
+        let wide = solver.solve_defense_wide(&pos, &limits_idtt(12, 100_000)).unwrap();
+        assert_eq!(wide.kind, DefenseKind::ThreatFound);
+        let threat = wide.threat.as_ref().expect("ThreatFound carries the threat");
+        assert_eq!(threat.depth, 6, "quiet-builder threat is a win-in-6");
+        assert!(!threat.pv.is_empty(), "sighted threat carries its chunked pv");
+    }
+
+    /// A starved threat check reports BudgetExceeded — the previously-reserved
+    /// variant is now reachable and distinct from the proven NoThreat.
+    #[test]
+    fn solve_defense_starved_check_is_budget_exceeded_not_no_threat() {
+        let solver = StrixSolver::new();
+        let mut stones: Vec<Stone> = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
+            .into_iter()
+            .map(|(q, r)| Stone { coord: CoordW { q, r }, player: Player::P1 })
+            .collect();
+        stones.push(Stone { coord: CoordW { q: 5, r: 5 }, player: Player::P2 });
+        let pos = Position {
+            win_length: 6,
+            placement_radius: 8,
+            max_moves: 200,
+            to_move: Player::P2,
+            moves_remaining: 2,
+            stones,
+        };
+        let starved = solver.solve_defense(&pos, &limits_idtt(12, 1)).unwrap();
+        assert_eq!(starved.kind, DefenseKind::BudgetExceeded, "gave up != safe");
+        assert!(starved.threat.is_none());
+        let full = solver.solve_defense(&pos, &limits_idtt(12, 100_000)).unwrap();
+        assert_eq!(full.kind, DefenseKind::ThreatFound, "full budget sights the fork");
     }
 
     /// `solve_defense` rejects a non-game-valid position (missing the (0,0,P1)

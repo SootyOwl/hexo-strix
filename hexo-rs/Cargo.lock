@@ -749,6 +749,7 @@ dependencies = [
  "criterion",
  "crossterm",
  "ratatui",
+ "rustc-hash",
 ]
 
 [[package]]

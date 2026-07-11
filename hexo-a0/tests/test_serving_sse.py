@@ -289,6 +289,31 @@ def _ctx_db(db_path, model_id="m1", sims=16, m=16):
                           model_id=model_id, cache_db_path=str(db_path))
 
 
+def test_pipeline_version_bump_invalidates_cached_analyses(tmp_path):
+    # Cached entries embed solver verdicts (e.g. forcing=None from a solver
+    # generation that couldn't see a win the current one proves), so the
+    # persistent store's model key carries ANALYSIS_PIPELINE_VERSION: entries
+    # written under one version must never be served under another — the exact
+    # field report was a pre-wide forcing=None trajectory re-served verbatim
+    # after the wide upgrade.
+    from hexo_a0.serving.app import ANALYSIS_PIPELINE_VERSION
+    db = tmp_path / "a.analysis.sqlite"
+    moves = [(0, 0), (1, 0), (2, 0), (0, 1)]
+    # Simulate a pre-upgrade store: same raw model id, older version suffix.
+    stale = _PositionStore(str(db), "m1::a1", 16, 16)
+    stale.put_many([
+        (tuple(moves[:i + 1]), {"q_hat": [0.0], "current_player": "P1", "forcing": None})
+        for i in range(len(moves))
+    ])
+    ctx = _ctx_db(db)  # builds its store as m1::a{current version}
+    assert ANALYSIS_PIPELINE_VERSION > 1
+    assert ctx.cache_get(moves) is None, "pre-upgrade entries must not be served"
+    assert ctx.cache_warm(moves) is None, "nor warm-start a re-analysis"
+    # Post-upgrade writes round-trip normally, including across a restart.
+    ctx.cache_put(moves, _full_result(moves))
+    assert _ctx_db(db).cache_get(moves) is not None
+
+
 def test_position_store_roundtrip(tmp_path):
     st = _PositionStore(str(tmp_path / "c.sqlite"), "m1", 16, 16)
     pt = ((0, 0), (1, 0))

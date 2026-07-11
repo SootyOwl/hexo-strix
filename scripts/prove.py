@@ -108,7 +108,7 @@ def _default_prove_bin() -> str:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.environ.get(
         "PROVE_BIN",
-        os.path.join(root, "hexo-rs", "target-forcing", "release", "prove"))
+        os.path.join(root, "hexo-rs", "target", "release", "prove"))
 
 
 def cmd_prove(args: argparse.Namespace) -> int:

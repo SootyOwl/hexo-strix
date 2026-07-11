@@ -755,6 +755,26 @@ def test_solve_forcing_internal_typeerror_is_not_misread_as_old_extension(monkey
     assert calls == [True], "must not re-call tight after an internal TypeError"
 
 
+def test_internal_typeerror_mentioning_wide_still_propagates(monkeypatch):
+    # The discriminator is the signature-error PHRASE, not the word "wide": an
+    # internal TypeError whose message happens to mention "wide" must still
+    # propagate instead of triggering the tight fallback.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P1")
+    calls = []
+
+    def _buggy(st, depth_cap, node_budget, wide=False):
+        calls.append(wide)
+        raise TypeError("wide tensor shape mismatch")
+
+    monkeypatch.setattr(hr, "solve_forcing", _buggy)
+    monkeypatch.setattr(hr, "solve_threat", lambda *a, **k: None)
+    out = _solve_forcing(state)
+    assert out is None
+    assert calls == [True], "phrase-based discriminator must not fall back"
+
+
 def test_solve_threat_also_requests_wide(monkeypatch):
     # The perspective-flipped threat check gets the same wide request.
     import hexo_rs as hr
@@ -773,6 +793,79 @@ def test_solve_threat_also_requests_wide(monkeypatch):
     assert out is not None
     assert out["wide"] is True
     assert out["attacker_is_mover"] is False
+
+
+def test_threat_carries_wide_defense_readout(monkeypatch):
+    # Single-position analysis attaches the defense read-out to THREAT results,
+    # requesting the wide generator and the analysis defense time box.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import (
+        _solve_forcing, ANALYSIS_DEFENSE_TIME_MS)
+    cfg, state = _forcing_fork_state("P2")
+    seen = []
+
+    def _defense_spy(st, depth_cap, node_budget, time_limit_ms, wide=False):
+        seen.append((depth_cap, node_budget, time_limit_ms, wide))
+        return ([(9, 0)], [((10, -1), (10, 1))], (11, 0), [(9, 0), (10, -1)])
+
+    monkeypatch.setattr(hr, "solve_forcing", lambda st, d, n, wide=False: None)
+    monkeypatch.setattr(
+        hr, "solve_threat", lambda st, d, n, wide=False: ((9, 0), [(9, 0), (10, -1)]))
+    monkeypatch.setattr(hr, "solve_defense", _defense_spy)
+    out = _solve_forcing(state, with_defense=True)
+    assert seen == [(ANALYSIS_DEPTH_CAP, ANALYSIS_NODE_BUDGET,
+                     ANALYSIS_DEFENSE_TIME_MS, True)]
+    d = out["defense"]
+    assert d["killers"] == [[9, 0]]
+    assert d["pair_anchors"] == [[[10, -1], [10, 1]]]
+    assert d["best_delay"] == [11, 0]
+    assert d["wide"] is True
+
+
+def test_defense_tight_fallback_on_old_extension(monkeypatch):
+    # An extension whose solve_defense predates the wide kwarg falls back to
+    # the tight call and labels the read-out wide=False.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P2")
+    calls = []
+
+    def _old_defense(st, depth_cap, node_budget, time_limit_ms):
+        calls.append(time_limit_ms)
+        return ([(9, 0)], [], None, [(9, 0)])
+
+    monkeypatch.setattr(hr, "solve_forcing", lambda st, d, n, wide=False: None)
+    monkeypatch.setattr(
+        hr, "solve_threat", lambda st, d, n, wide=False: ((9, 0), [(9, 0), (10, -1)]))
+    monkeypatch.setattr(hr, "solve_defense", _old_defense)
+    out = _solve_forcing(state, with_defense=True)
+    assert len(calls) == 1
+    assert out["defense"]["wide"] is False
+
+
+def test_defense_only_on_threats_and_only_when_requested(monkeypatch):
+    # A mover's own win never runs defense, and the default (trajectory-tier)
+    # call never runs it even on threats.
+    import hexo_rs as hr
+    from hexo_a0.serving.analysis import _solve_forcing
+    cfg, state = _forcing_fork_state("P1")
+
+    def _boom(*a, **k):
+        raise AssertionError("solve_defense must not be called")
+
+    monkeypatch.setattr(hr, "solve_defense", _boom)
+    monkeypatch.setattr(
+        hr, "solve_forcing", lambda st, d, n, wide=False: ((9, 0), [(9, 0), (10, -1)]))
+    out = _solve_forcing(state, with_defense=True)
+    assert out["attacker_is_mover"] is True
+    assert out["defense"] is None
+
+    monkeypatch.setattr(hr, "solve_forcing", lambda st, d, n, wide=False: None)
+    monkeypatch.setattr(
+        hr, "solve_threat", lambda st, d, n, wide=False: ((9, 0), [(9, 0), (10, -1)]))
+    out = _solve_forcing(state)  # with_defense defaults to False
+    assert out["attacker_is_mover"] is False
+    assert out["defense"] is None
 
 
 def test_analyze_game_full_default_run_mcts_fn_uses_trajectory_budget(monkeypatch):
@@ -820,7 +913,7 @@ def _forcing_stub(*rules):
     return `forcing_dict` when called on a state whose exact placed-stone set
     matches `stones`; `None` for every other position."""
     targets = [(frozenset(stones), dict(forcing)) for stones, forcing in rules]
-    def _stub(state, depth_cap, node_budget):
+    def _stub(state, depth_cap, node_budget, with_defense=False):
         current = frozenset(state.placed_stones())
         for stones, forcing in targets:
             if current == stones:
@@ -955,7 +1048,7 @@ def test_analyze_game_full_budget_shy_alternative_win_not_flagged(monkeypatch):
                 "pv_len": 1, "pv_owners": ["P1"]}
     escalated_calls = []
 
-    def _budget_shy_stub(state, depth_cap, node_budget):
+    def _budget_shy_stub(state, depth_cap, node_budget, with_defense=False):
         current = frozenset(state.placed_stones())
         if current == frozenset(_PREFIX2_STONES):
             return dict(prefix2_win)

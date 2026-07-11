@@ -32,6 +32,19 @@ from hexo_a0.serving.nativeutil import softmax
 # which happens to land on the same depth/budget as live play's).
 ANALYSIS_DEPTH_CAP = 12
 ANALYSIS_NODE_BUDGET = 250_000
+# Wall-clock bound for the display-grade defense analysis attached to threat
+# banners (hr.solve_defense stacks many budget-bound sub-solves; partial
+# results on expiry). Single-position analysis only — never the trajectory.
+ANALYSIS_DEFENSE_TIME_MS = 5_000
+# Version of the analysis pipeline's CAPABILITY, folded into the persistent
+# per-position cache key (app.py's _PositionStore): cached entries embed solver
+# verdicts, so an upgrade that finds wins the old pipeline could not (or
+# changes what an entry carries) must invalidate them or stale results get
+# re-served forever. Bump on any such change.
+#   2 = wide-by-default forcing/threat solve + defense read-out (2026-07-11);
+#       v1 (implicit) entries predate the wide generator and can carry
+#       forcing=None for positions the wide solver proves won.
+ANALYSIS_PIPELINE_VERSION = 2
 # Per-prefix budget for analyze_game_full's forcing solves (run twice per
 # placement inside the SSE loop) — the depth=10/20k row above caps the
 # per-solve worst case at ~0.4s, keeping a whole-game analysis bounded.
@@ -82,7 +95,9 @@ class AnalysisResult:
     # cell that ends the game), so ownership can't be inferred from position
     # alone. "wide" records whether the wide (threat + quiet-builder)
     # generator produced the verdict (False = tight fallback on an extension
-    # predating the kwarg). See _solve_forcing.
+    # predating the kwarg). THREAT results from single-position analysis also
+    # carry "defense": {killers, pair_anchors, best_delay, wide} | None — the
+    # display-grade refutation analysis (see _solve_forcing's with_defense).
     forcing: dict | None = None
 
     def to_json(self) -> dict:
@@ -300,19 +315,37 @@ def _solve_wide_or_tight(fn, state, depth_cap, node_budget):
     so callers can label which generator produced the verdict.
 
     The fallback fires only on the specific signature error ("unexpected
-    keyword argument 'wide'") — any other TypeError is a real bug and must
-    propagate rather than silently rerun tight with a wrong provenance label.
+    keyword argument") — any other TypeError, including one whose message
+    merely mentions "wide", is a real bug and must propagate rather than
+    silently rerun tight with a wrong provenance label.
     """
     try:
         return fn(state, depth_cap, node_budget, wide=True), True
     except TypeError as e:
-        if "wide" not in str(e):
+        if "unexpected keyword argument" not in str(e):
             raise
         return fn(state, depth_cap, node_budget), False
 
 
+def _solve_defense_wide_or_tight(state, depth_cap, node_budget, time_limit_ms):
+    """``hr.solve_defense`` with the wide generator, tight fallback on an
+    extension predating the ``wide`` kwarg (same phrase-gated discriminator as
+    ``_solve_wide_or_tight``). Returns ``(result, wide_used)`` where result is
+    the binding's ``(killers, pair_anchors, best_delay, threat_pv)`` or None.
+    """
+    import hexo_rs as hr
+    try:
+        return hr.solve_defense(
+            state, depth_cap, node_budget, time_limit_ms, wide=True), True
+    except TypeError as e:
+        if "unexpected keyword argument" not in str(e):
+            raise
+        return hr.solve_defense(state, depth_cap, node_budget, time_limit_ms), False
+
+
 def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
-                   node_budget=ANALYSIS_NODE_BUDGET):
+                   node_budget=ANALYSIS_NODE_BUDGET,
+                   with_defense=False):
     """Both-side VCF solve for the analysis display.
 
     Solves for the side to move first; only if THAT side has no proven win is
@@ -330,6 +363,15 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
     self-play stay tight). ``wide`` in the result records whether the
     installed extension actually honored that (False = tight fallback on an
     extension predating the kwarg).
+
+    ``with_defense`` (single-position analysis only — the trajectory pass
+    solves twice per prefix and must stay bounded) attaches a display-grade
+    ``defense`` dict to THREAT results: which mover placements refute the
+    threat (killers), which pairs jointly refute it (pair anchors), and the
+    max-delay fallback — the same wide analysis live play runs tight. Time-
+    boxed (partial results on expiry) and advisory: candidates were verified
+    at these budgets only. ``None``/absent when the defense sub-analysis had
+    trouble or found no threat itself; never fails the forcing result.
     """
     try:
         import hexo_rs as hr
@@ -337,6 +379,7 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
             hr.solve_forcing, state, depth_cap, node_budget)
         attacker_is_mover = True
         winner, solved_state = state.current_player(), state
+        defense = None
         if res is None:
             res, wide = _solve_wide_or_tight(
                 hr.solve_threat, state, depth_cap, node_budget)
@@ -347,6 +390,26 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
             winner = opp
             solved_state = hr.GameState.from_state(
                 state.placed_stones(), opp, 2, state.config())
+        if with_defense and not attacker_is_mover:
+            # The mover must defend: attach how. Its own failure must never
+            # take down the threat display.
+            try:
+                d, d_wide = _solve_defense_wide_or_tight(
+                    state, depth_cap, node_budget, ANALYSIS_DEFENSE_TIME_MS)
+                if d is not None:
+                    killers, pair_anchors, best_delay, _threat_pv = d
+                    defense = {
+                        "killers": [[int(q), int(r)] for (q, r) in killers],
+                        "pair_anchors": [
+                            [[int(a[0]), int(a[1])], [int(b[0]), int(b[1])]]
+                            for (a, b) in pair_anchors
+                        ],
+                        "best_delay": ([int(best_delay[0]), int(best_delay[1])]
+                                       if best_delay is not None else None),
+                        "wide": d_wide,
+                    }
+            except Exception:
+                defense = None
         first_move, pv = res
         pv = [[int(q), int(r)] for (q, r) in pv]
         # Per-cell ownership: the PV's chunk lengths are NOT a fixed pairs-of-2
@@ -372,6 +435,7 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
             "pv_len": len(pv),
             "pv_owners": pv_owners,
             "wide": wide,
+            "defense": defense,
         }
     except Exception:
         return None
@@ -380,7 +444,8 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
 def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
                      mcts_m_actions: int = 16,
                      forcing_depth_cap=ANALYSIS_DEPTH_CAP,
-                     forcing_node_budget=ANALYSIS_NODE_BUDGET) -> AnalysisResult:
+                     forcing_node_budget=ANALYSIS_NODE_BUDGET,
+                     forcing_with_defense: bool = True) -> AnalysisResult:
     """Evaluate a single position.
 
     With ``mcts_sims=0`` the result is a raw forward pass (softmax policy + value
@@ -488,7 +553,8 @@ def analyze_position(model, model_config, state, *, mcts_sims: int = 0,
         threats = _scan_threats_from_state(state, legal_out, probs,
                                            current_player=state.current_player(),
                                            relative_stones=relative)
-    forcing = _solve_forcing(state, forcing_depth_cap, forcing_node_budget)
+    forcing = _solve_forcing(state, forcing_depth_cap, forcing_node_budget,
+                             with_defense=forcing_with_defense)
     return AnalysisResult(
         legal=[list(c) for c in legal_out],
         value=value,
@@ -878,10 +944,13 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
             # whole game, so they use the tighter TRAJECTORY_* budget, not
             # ANALYSIS_* (the single-position /analyze default) — see the
             # consts' bench.
+            # forcing_with_defense stays off here: the defense read-out stacks
+            # many sub-solves per threat and is a single-position luxury.
             return analyze_position(model, model_config, st,
                                     mcts_sims=mcts_sims, mcts_m_actions=mcts_m_actions,
                                     forcing_depth_cap=TRAJECTORY_DEPTH_CAP,
-                                    forcing_node_budget=TRAJECTORY_NODE_BUDGET)
+                                    forcing_node_budget=TRAJECTORY_NODE_BUDGET,
+                                    forcing_with_defense=False)
 
     # Pass 1: batched value + raw policy + legal over all non-terminal prefixes.
     non_terminal_idx = [i for i, s in enumerate(prefix_states) if not s.is_terminal()]

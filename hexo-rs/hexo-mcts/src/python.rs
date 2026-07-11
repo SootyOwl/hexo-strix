@@ -1739,7 +1739,7 @@ fn solve_threat(
 /// `best_delay` is the max-delay fallback survivor. `time_limit_ms` bounds
 /// the whole analysis (partial results on expiry).
 #[pyfunction]
-#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, time_limit_ms=3_000))]
+#[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, time_limit_ms=3_000, wide=false))]
 #[allow(clippy::type_complexity)]
 fn solve_defense(
     py: Python<'_>,
@@ -1747,6 +1747,7 @@ fn solve_defense(
     depth_cap: u8,
     node_budget: u64,
     time_limit_ms: u64,
+    wide: bool,
 ) -> Option<(
     Vec<(i32, i32)>,
     Vec<((i32, i32), (i32, i32))>,
@@ -1755,15 +1756,24 @@ fn solve_defense(
 )> {
     // Clone + detach for the same reason as `solve_forcing`: the defensive
     // analysis stacks many budget-bound sub-solves and must not hold the GIL.
+    // `wide` runs the threat sighting and every verification with the wide
+    // (threat + quiet-builder) generator — see `solve_forcing`'s doc. The
+    // return shape keeps the historical None-conflation (no threat OR starved
+    // check); callers needing the distinction use the WASM/Rust verdict API.
     let inner = state.inner.clone();
     py.detach(move || {
-        crate::mcts::forcing::solve_defense(
+        match crate::mcts::forcing::solve_defense_ex(
             &inner,
             depth_cap,
             node_budget,
             std::time::Duration::from_millis(time_limit_ms),
-        )
-        .map(|a| (a.killers, a.pair_anchors, a.best_delay, a.threat_pv))
+            wide,
+        ) {
+            crate::mcts::forcing::DefenseVerdict::Threat(a) => {
+                Some((a.killers, a.pair_anchors, a.best_delay, a.threat_pv))
+            }
+            _ => None,
+        }
     })
 }
 
