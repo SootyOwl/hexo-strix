@@ -74,7 +74,28 @@ DEFAULT_DIFFICULTY_FORCING_DEPTH: dict[str, int] = {
 # (scripts/forcing_depth_sweep.py): at 20k, p99 stays ~350-390 ms for every
 # depth 10..18, while 50k/100k/250k blow the tail out to p99 0.9-2.7 s
 # (max 13 s) with zero first-sighting gain.
-LIVE_NODE_BUDGET = 20_000
+#
+# OWN-WIN budget raised 20k -> 50k 2026-07-12 after the Hayes live loss
+# (tests/fixtures/hayes_20260712.htttx): at placement 30 the bot had a
+# deep-prover-confirmed forced win that the own-win solve misses at 20k but
+# finds at 35k (~120 ms, any depth cap 8..20) — the "zero first-sighting
+# gain" above was measured on sampled prefixes and this game is a live
+# counterexample. Re-measured over every prefix of the 5 line fixtures
+# (748 solves/config, both sides, dev box — see
+# docs/research/2026-07-12-hayes-live-budget-miss.md):
+#
+#   depth/budget   p95        p99        max       wins sighted
+#    8 / 20_000    133 ms     179 ms     253 ms    323
+#    8 / 50_000    288 ms     418 ms     470 ms    335
+#   16 / 20_000    129 ms     189 ms     243 ms    323
+#   16 / 50_000    265 ms     415 ms     463 ms    335
+#
+# Sub-0.5 s worst case (~1.4 s on the 2-3x slower production host) against
+# the 3-10 s defense deadlines, for +12 first sightings. DEF_NODE_BUDGET
+# stays at its measured knee: the defensive sweep STACKS budget-bound
+# re-solves per candidate, so its tail multiplies where the once-per-
+# placement own-win solve's does not.
+LIVE_NODE_BUDGET = 50_000
 DEF_NODE_BUDGET = 20_000
 # Escalated budget for CONFIRMING the one defense candidate about to be
 # played (`_verified_defense`). solve_defense's internal candidate re-solves
@@ -387,6 +408,24 @@ def make_bot_turn_fn(
             stones, rec.human_side, 2, hr.GameConfig(**game_kwargs))
         return hr.solve_forcing(flip, depth_cap, VERIFY_NODE_BUDGET) is None
 
+    def _own_win_after(rec: GameRecord, depth_cap: int, cell) -> bool:
+        """Does placing `cell` keep/create the bot's own forcing win? Probe
+        at the live budget: with another placement left this turn, a direct
+        own-win solve on the hypothetical board; on the turn's last
+        placement, the flipped-perspective threat solve (the follow-up win
+        only executes if the opponent lets it, but preferring it keeps the
+        initiative among otherwise-equivalent proven killers).
+        """
+        stones = list(rec.state.placed_stones()) + [(tuple(cell), rec.bot_side)]
+        left = rec.state.moves_remaining_this_turn() - 1
+        if left > 0:
+            probe = hr.GameState.from_state(
+                stones, rec.bot_side, left, hr.GameConfig(**game_kwargs))
+            return hr.solve_forcing(probe, depth_cap, LIVE_NODE_BUDGET) is not None
+        probe = hr.GameState.from_state(
+            stones, rec.human_side, 2, hr.GameConfig(**game_kwargs))
+        return hr.solve_threat(probe, depth_cap, LIVE_NODE_BUDGET) is not None
+
     def _defensive_move(rec: GameRecord, depth_cap: int):
         """Step 3: pre-emptive VCF defense, run only when the bot has no own
         forced win. Exploits monotonicity: the bot's stones only remove
@@ -421,8 +460,22 @@ def make_bot_turn_fn(
         verify_deadline = time.monotonic() + deadline_s
         if killers:
             remaining = {tuple(c) for c in killers}
+            # "Block with a double threat": among proven killers, prefer one
+            # whose placement keeps/creates the bot's own forcing win. The
+            # 2026-07-12 Hayes loss played the policy-first killer (8,-2)
+            # while (6,-1), also in the list, was itself a proven win (and
+            # raw MCTS's top choice). Deadline-bounded; on expiry the
+            # unprobed remainder keeps the plain policy-argmax order.
+            winning = set()
+            if len(remaining) > 1:
+                for cand in sorted(remaining):
+                    if time.monotonic() >= verify_deadline:
+                        break
+                    if _own_win_after(rec, depth_cap, cand):
+                        winning.add(cand)
             while remaining:
-                chosen = _policy_argmax(state, restrict_to=remaining)
+                pool = (winning & remaining) or remaining
+                chosen = _policy_argmax(state, restrict_to=pool)
                 if time.monotonic() >= verify_deadline:
                     return chosen, "killer-unverified"
                 if _verified_defense(rec, depth_cap, (chosen,)):

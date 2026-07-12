@@ -31,12 +31,14 @@ import time
 from pathlib import Path
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "forcing_puzzles"
-# Real games only (full move lines, live wl=6/r=8 config): the two losses
+# Real games only (full move lines, live wl=6/r=8 config): the three losses
 # this sweep exists for, plus the two long deep-puzzle lines for latency
-# coverage of long games.
+# coverage of long games. hayes_20260712 is the LIVE_NODE_BUDGET 20k->50k
+# counterexample (own win at prefix 30/31 first provable at 35k nodes).
 LINE_FIXTURES = [
     "strongloss_a_line.json",
     "strongloss_b_line.json",
+    "hayes_20260712_line.json",
     "7zoidcw_line.json",
     "d9ci11d_line.json",
 ]

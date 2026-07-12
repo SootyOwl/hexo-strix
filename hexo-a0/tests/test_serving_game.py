@@ -1103,6 +1103,164 @@ def test_forcing_defense_saves_chao_game_via_pair_cache(monkeypatch):
     assert calls["n"] == 1  # 2nd placement served from the pair cache
 
 
+# --------------------------------------------------------------------------
+# 2026-07-12 Hayes live loss (fixtures/hayes_20260712.htttx, strix as P1 at
+# 512 sims): at placement 30 the bot had a deep-prover-confirmed forced win
+# ((6,-5)+(6,-3): block the opponent's r=-3 completion WITH a q=6-column
+# four) but the own-win solve missed it at the old 20k live budget (the win
+# needs ~35k nodes / ~120 ms, at any depth cap 8..20), the defense layer took
+# over, and one placement later the same budget miss let the pair cache play
+# (8,-2) while (6,-1) — another verified killer — was itself a proven win.
+# --------------------------------------------------------------------------
+
+_HAYES_HTTTX = None
+
+
+def _hayes_position(n):
+    """State + move_log after the first `n` placements of the Hayes game
+    (engine seed excluded from the count, included in the move_log)."""
+    global _HAYES_HTTTX
+    if _HAYES_HTTTX is None:
+        import pathlib
+        _HAYES_HTTTX = (pathlib.Path(__file__).parent / "fixtures"
+                        / "hayes_20260712.htttx").read_text()
+    from hexo_a0.serving.htttx import parse_htttx
+    cfg = hexo_rs.GameConfig(win_length=6, placement_radius=8, max_moves=400)
+    state = hexo_rs.GameState(cfg)
+    move_log = [(0, 0, "P1")]
+    for q, r in parse_htttx(_HAYES_HTTTX)[:n]:
+        side = state.current_player()
+        state.apply_move(q, r)
+        move_log.append((q, r, side))
+    return state, move_log
+
+
+def test_live_budget_finds_hayes_turn16_win():
+    # The turn-16 win must be visible to the own-win solve at the LIVE node
+    # budget, at both the standard and strong tier depth caps (the win is 7
+    # attacker-turns deep; standard's depth 8 covers it).
+    state, _ = _hayes_position(30)
+    assert state.current_player() == "P1"
+    assert state.moves_remaining_this_turn() == 2
+    for tier in ("standard", "strong"):
+        depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH[tier]
+        res = hexo_rs.solve_forcing(state, depth, game_mod.LIVE_NODE_BUDGET)
+        assert res is not None, f"turn-16 win invisible at {tier} live budget"
+        assert tuple(res[0]) == (6, -5)
+
+
+def test_live_budget_finds_hayes_placement31_win():
+    # One placement later (the blocking half of the winning pair already
+    # played), the single stone (6,-5) still wins — the live game's second
+    # missed chance before the opponent extinguished the resource.
+    state, _ = _hayes_position(31)
+    assert state.current_player() == "P1"
+    assert state.moves_remaining_this_turn() == 1
+    for tier in ("standard", "strong"):
+        depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH[tier]
+        res = hexo_rs.solve_forcing(state, depth, game_mod.LIVE_NODE_BUDGET)
+        assert res is not None, f"placement-31 win invisible at {tier} live budget"
+        assert tuple(res[0]) == (6, -5)
+
+
+def test_forcing_bot_wins_hayes_turn16_position():
+    # End to end: at the placement-30 position the bot's own-win solve must
+    # preempt the defense layer and execute the proven win — the live game
+    # instead played the defense pair (6,-3),(8,-2) and went on to lose.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    state, move_log = _hayes_position(30)
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-hayes-t16", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="hayes",
+        move_log=move_log, difficulty="strong",
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert [m[:2] for m in rec.move_log[-2:]] == [(6, -5), (6, -3)]
+    assert rec.forcing_pv is not None  # executed as a cached forced win
+
+
+def test_forcing_defense_prefers_win_contributing_killer(monkeypatch):
+    # Among VERIFIED killers the bot must prefer one whose placement keeps or
+    # creates its own forcing win (the "block with a double threat" rule) —
+    # in the Hayes game the defense layer played its policy-first killer
+    # (8,-2) while (6,-1), also in the killers list, was itself a proven win.
+    # Zero logits make the policy argmax pick the lexically smallest killer,
+    # so without the ranking the passive one wins the tie.
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2")], "P1", 2, cfg)
+    passive, winning, win_cell = (-1, 0), (3, 3), (5, 5)
+
+    def _stub_forcing(st, _depth_cap, node_budget):
+        if node_budget == game_mod.VERIFY_NODE_BUDGET:
+            return None  # every killer verifies as a real block
+        stones = {(int(c[0]), int(c[1])) for c, _p in st.placed_stones()}
+        if winning in stones:
+            # The ranking probe (and, next placement, the own-win solve) sees
+            # a forcing win once the win-contributing killer is on the board.
+            return (win_cell, [win_cell])
+        return None  # bare position: no own win -> defense layer runs
+
+    calls = {"defense": 0}
+
+    def _stub_defense(*_a, **_k):
+        calls["defense"] += 1
+        if calls["defense"] == 1:
+            return ([passive, winning], [], None, [passive, winning])
+        return ([], [], None, [])
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _stub_forcing)
+    monkeypatch.setattr(hexo_rs, "solve_defense", _stub_defense)
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-rank-killer", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")],
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    new_moves = [m[:2] for m in rec.move_log[2:]]
+    assert new_moves[0] == winning  # ranked above the policy-first killer
+    assert new_moves[1] == win_cell  # ...and the own-win solve converts it
+
+
+def test_forcing_defense_prefers_threat_keeping_killer_on_last_placement(monkeypatch):
+    # Same preference on the turn's LAST placement, where the probe is the
+    # flipped-perspective threat solve (the follow-up win only executes if
+    # the opponent lets it, but keeping the initiative among proven-
+    # equivalent killers is strictly better than not).
+    cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
+    cfg = hexo_rs.GameConfig(**cfg_kwargs)
+    state = hexo_rs.GameState.from_state(
+        [((0, 0), "P1"), ((1, 0), "P2"), ((2, 0), "P2")], "P1", 1, cfg)
+    passive, keeping = (-1, 0), (3, 3)
+
+    monkeypatch.setattr(hexo_rs, "solve_forcing", lambda *a, **k: None)
+
+    def _stub_threat(st, _depth_cap, _node_budget):
+        stones = {(int(c[0]), int(c[1])) for c, _p in st.placed_stones()}
+        return ((9, 9), [(9, 9)]) if keeping in stones else None
+
+    monkeypatch.setattr(hexo_rs, "solve_threat", _stub_threat)
+    monkeypatch.setattr(
+        hexo_rs, "solve_defense",
+        lambda *a, **k: ([passive, keeping], [], None, [passive, keeping]))
+
+    now = datetime.now(timezone.utc)
+    rec = GameRecord(
+        game_id="g-rank-threat", created_at=now, last_active_at=now,
+        state=state, human_side="P2", bot_side="P1", human_name="a",
+        move_log=[(0, 0, "P1"), (1, 0, "P2"), (2, 0, "P2")],
+    )
+    _bot_turn_fn(cfg_kwargs)(rec)
+
+    assert rec.move_log[-1][:2] == keeping
+
+
 def test_bot_turn_logs_placement_timing(monkeypatch, caplog):
     # Deploy observability: every bot placement emits ONE INFO line with the
     # move source and per-phase wall-clock (forcing/defense solver vs MCTS),
