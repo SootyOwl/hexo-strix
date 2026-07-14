@@ -20,7 +20,13 @@ uv.toml          # machine-local uv overrides
 # ---- Training / research outputs ----
 # `runs` (no trailing slash) matches a real dir OR a symlink (e.g. runs -> ../hexo/runs)
 runs
-docs/
+# docs/ stays untracked (plans/specs live on disk only) EXCEPT explicitly
+# whitelisted research notes (the paper trail). To commit a new note, add a
+# negation line for it here.
+docs/*
+!docs/research
+docs/research/*
+!docs/research/2026-07-14-solver-zobrist-collision-and-wl4-guard.md
 *.pt             # model checkpoints
 *.bin
 *.tfevents.*

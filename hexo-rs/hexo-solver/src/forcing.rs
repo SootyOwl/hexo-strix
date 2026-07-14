@@ -58,16 +58,28 @@ fn splitmix64(mut z: u64) -> u64 {
 
 /// Deterministic per-(coord, player) Zobrist value (no stored table; the board is
 /// infinite so coords are unbounded).
+///
+/// The pre-mix input MUST be injective in (q, r): the coords pack into
+/// disjoint 32-bit halves, so distinct cells give distinct inputs and the
+/// bijective splitmix64 keeps them distinct — per-player collision-freedom is
+/// structural over ALL i32 coords. The player then selects one of two salts
+/// for an independent second round (cross-player equality would need
+/// `splitmix64(a) ^ splitmix64(b) == salt1 ^ salt2` — pseudo-random 2^-64,
+/// not structural). The previous wrapping-multiply construction
+/// (`q*A ^ (r*B)<<1 ^ p<<63`) aliased badly IN RANGE — e.g. (-2, 63) and
+/// (2, -63) produced the SAME value, ~2.7k such collisions inside
+/// |q|,|r| <= 64 — so whole-board hashes collided routinely and silently
+/// poisoned every hash-keyed table (TT, comps cache, gencache), returning
+/// verdicts computed for unrelated positions.
 #[inline]
 fn zob(coord: Coord, player: Player) -> u64 {
     let (q, r) = coord;
-    let p = matches!(player, Player::P2) as u64;
-    splitmix64(
-        (q as u64).wrapping_mul(0x100_0000_01B3)
-            ^ ((r as u64).wrapping_mul(0x9E37_79B1)) << 1
-            ^ (p << 63)
-            ^ 0xD1B5_4A32_D192_ED03,
-    )
+    let packed = ((q as u32 as u64) << 32) | (r as u32 as u64);
+    let salt = match player {
+        Player::P1 => 0xD1B5_4A32_D192_ED03,
+        Player::P2 => 0xA24B_AED4_963E_E407,
+    };
+    splitmix64(splitmix64(packed) ^ salt)
 }
 
 #[inline]
@@ -2358,6 +2370,31 @@ mod tests {
     }
 
     #[test]
+    /// The old wrapping-multiply pre-mix collided IN RANGE (e.g. (-2, 63) vs
+    /// (2, -63); ~2.7k dupes within |q|,|r| <= 64), poisoning every
+    /// hash-keyed table. Per-player injectivity of the new construction is
+    /// structural (disjoint 32-bit halves + bijective splitmix64); this scan
+    /// is a REGRESSION GUARD against reintroducing a lossy pre-mix, over a
+    /// grid wider than any real game's coordinate spread (±200 covers 300
+    /// max_moves of frontier drift).
+    #[test]
+    fn zobrist_keys_are_collision_free_in_range() {
+        use std::collections::HashMap;
+        let mut seen: HashMap<u64, (Coord, Player)> =
+            HashMap::with_capacity(2 * 401 * 401);
+        for q in -200..=200 {
+            for r in -200..=200 {
+                for pl in [Player::P1, Player::P2] {
+                    let v = zob((q, r), pl);
+                    if let Some(prev) = seen.insert(v, ((q, r), pl)) {
+                        panic!("zob collision: {prev:?} vs {:?}", ((q, r), pl));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn zobrist_place_remove_is_reversible_and_order_independent() {
         let mut b = SolverBoard::new();
         let h0 = b.hash;
@@ -3156,16 +3193,37 @@ mod tests {
             ((10, -1), Player::P1), ((10, 1), Player::P1),
         ];
         let game = GameState::from_state(&stones, Player::P1, 1, cfg);
-        let out = solve(&game, 12, 250_000);
-        assert!(out.is_win(), "deep wl=4 pc>=1 fork must solve to Win, got {out:?}");
+        match solve(&game, 12, 250_000) {
+            Outcome::Win(w) => {
+                assert_eq!(
+                    w.depth, 2,
+                    "the fork is a win-in-2 attacker turns (the 1-placement \
+                     mid-turn + 1 full turn); a different depth means a \
+                     different mechanism won: {w:?}"
+                );
+                // Replay the PV through the real engine so a hallucinated
+                // win (the failure class a solver must never produce) fails
+                // here rather than passing on depth alone.
+                let mut g = GameState::from_state(&stones, Player::P1, 1, cfg);
+                for &c in &w.pv {
+                    assert!(!g.is_terminal(), "PV continues after the game ended");
+                    g.apply_move(c).expect("every PV move must be legal");
+                }
+                assert!(g.is_terminal(), "PV must end the game");
+                assert_eq!(g.winner(), Some(Player::P1), "PV must end in the attacker's win");
+            }
+            other => panic!("deep wl=4 pc>=1 fork must solve to Win, got {other:?}"),
+        }
     }
 
     /// The soundness half of the wl<5 handling: when the search comes up
     /// empty at wl=4, the generator's bare-pair blindness means that `No` is
     /// unproven — it must surface as the honest give-up (`BudgetExceeded`),
-    /// never a proven `No`. depth_cap=1 with a single lone stone makes a win
-    /// impossible (one placement, no 3-line to complete), so every exit path
-    /// is a give-up.
+    /// never a proven `No`. A lone stone with one placement has no completion
+    /// and no four-gate window, so this exercises the SOUND-GATE exit (the
+    /// pre-search `blind_no` return, which pre-fix was a proven `No`);
+    /// depth_cap=1 additionally makes a win impossible, so `BudgetExceeded`
+    /// is the only sound outcome on any exit path.
     #[test]
     fn wl4_no_win_found_is_never_a_proven_no() {
         use hexo_engine::game::{GameConfig, GameState};
