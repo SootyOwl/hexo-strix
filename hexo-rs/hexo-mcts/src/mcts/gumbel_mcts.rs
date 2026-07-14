@@ -357,8 +357,13 @@ where
                 let mut visit_counts = vec![0u32; coords.len()];
                 visit_counts[idx] = 1;
                 let qctx = QContext::new(&root, &coords);
-                let per_child_q: Vec<f64> =
+                let mut per_child_q: Vec<f64> =
                     coords.iter().map(|c| qctx.completed_q[c]).collect();
+                // Solver Q distillation: m1 is a PROVEN immediate win, so its
+                // Q label is ground-truth +1.0, not the unsearched root's
+                // completed-Q estimate. visit_counts[idx] == 1 puts this child
+                // (and only this child) inside the trainer's Q-head mask.
+                per_child_q[idx] = 1.0;
                 let per_child_prior = priors_vec.clone();
                 return Ok(MCTSResult {
                     action: m1,
@@ -461,8 +466,18 @@ where
                 }
 
                 let qctx = QContext::new(&root, &coords);
-                let per_child_q: Vec<f64> =
+                let mut per_child_q: Vec<f64> =
                     coords.iter().map(|c| qctx.completed_q[c]).collect();
+                // Solver Q distillation: the solver PROVED these children win,
+                // so their Q labels are ground-truth +1.0 (each pair member is
+                // individually a winning first placement — order invariance),
+                // not the unsearched root's completed-Q estimate. The
+                // visit_counts set above put exactly these children inside the
+                // trainer's Q-head mask.
+                per_child_q[idx] = 1.0;
+                if let Some(idx2) = pv1_idx {
+                    per_child_q[idx2] = 1.0;
+                }
                 let per_child_prior = priors_vec.clone();
                 return Ok(MCTSResult {
                     // `action` stays pv[0] in both cases (greedy determinism).
@@ -2073,6 +2088,159 @@ mod tests {
                         "seed {seed}: off-pair move {i} should have probability 0.0"
                     );
                 }
+            }
+        }
+    }
+
+    /// Solver Q distillation: the forced-win shortcut must label the PROVEN
+    /// winning children with `per_child_q = +1.0` — exactly the children whose
+    /// `visit_counts` mask is on — not the unsearched root's completed-Q
+    /// (which is just the NN's own value estimate). The trainer's Q-head
+    /// masked MSE trains on `(per_child_q, visit_counts > 0)`, so without
+    /// this the shortcut teaches the Q-head its own guess at precisely the
+    /// moves the solver proved are worth +1.
+    #[test]
+    fn forced_win_shortcut_labels_proven_pair_q_plus_one() {
+        let stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0),   // q-axis 3-run
+            (100, 100), (100, 101),  // r-axis 2-run
+            (98, 104), (99, 103),    // third-axis 2-run
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+
+        let solved = match forcing::solve(&game, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET) {
+            forcing::Outcome::Win(w) => w,
+            other => panic!("expected a forced win, got {other:?}"),
+        };
+        assert!(solved.pv.len() >= 2, "depth-3 win must have a >=2-move pv");
+        let coords = game.legal_moves();
+        let idx0 = coords.iter().position(|&c| c == solved.pv[0]).expect("pv[0] legal");
+        let idx1 = coords.iter().position(|&c| c == solved.pv[1]).expect("pv[1] legal");
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        // mr==2 root: both members of the order-invariant winning pair are
+        // proven wins -> per_child_q = +1.0 on both, mask exactly the pair.
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
+        assert_eq!(result.action, solved.first_move);
+        assert_eq!(
+            result.per_child_q[idx0], 1.0,
+            "pv[0] is a proven win, per_child_q must be +1.0, got {}",
+            result.per_child_q[idx0]
+        );
+        assert_eq!(
+            result.per_child_q[idx1], 1.0,
+            "pv[1] is a proven win, per_child_q must be +1.0, got {}",
+            result.per_child_q[idx1]
+        );
+        for (i, &v) in result.visit_counts.iter().enumerate() {
+            if i == idx0 || i == idx1 {
+                assert!(v > 0, "proven child {i} must be mask-on (visit_counts > 0)");
+            } else {
+                assert_eq!(v, 0, "unproven child {i} must stay mask-off");
+            }
+        }
+
+        // mr==1 root: play the QUIET pair member (pv[1], the shared-cell
+        // builder) so the FORCING placement is the one remaining — the
+        // fully-forcing solver only proves mr==1 wins whose single placement
+        // is itself forcing (a quiet remainder yields Outcome::No and falls
+        // through to normal search, which is fine: no shortcut, no labels).
+        // Here the shortcut must fire: one-hot policy AND per_child_q = +1.0
+        // at the same child, mask exactly that child.
+        let mut game1 = game.clone();
+        game1.apply_move(solved.pv[1]).unwrap();
+        assert_eq!(game1.moves_remaining_this_turn(), 1);
+        assert!(
+            matches!(
+                forcing::solve(&game1, SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET),
+                forcing::Outcome::Win(_)
+            ),
+            "fixture: solver must prove the mr==1 root (forcing placement remaining)"
+        );
+        let mut rng1 = ChaCha8Rng::seed_from_u64(7);
+        let result1 = gumbel_mcts(&game1, &config, &mut rng1, None, &mut dummy_eval).unwrap();
+        let act1 = result1
+            .coords
+            .iter()
+            .position(|&c| c == result1.action)
+            .expect("action must be a legal move");
+        assert_eq!(
+            result1.improved_policy[act1], 1.0,
+            "mr==1 shortcut must be one-hot on the completing placement"
+        );
+        assert_eq!(
+            result1.per_child_q[act1], 1.0,
+            "completing placement is a proven win, per_child_q must be +1.0, got {}",
+            result1.per_child_q[act1]
+        );
+        for (i, &v) in result1.visit_counts.iter().enumerate() {
+            if i == act1 {
+                assert!(v > 0, "proven child must be mask-on");
+            } else {
+                assert_eq!(v, 0, "unproven child {i} must stay mask-off");
+            }
+        }
+    }
+
+    /// Same Q-distillation contract for the depth-1 terminal precheck (a
+    /// single placement that wins immediately, caught before the solver): the
+    /// winning child must carry per_child_q = +1.0 with the mask on exactly
+    /// that child.
+    #[test]
+    fn depth1_shortcut_labels_winning_move_q_plus_one() {
+        let config_game = GameConfig {
+            win_length: 2,
+            placement_radius: 2,
+            max_moves: 80,
+        };
+        let mut game = GameState::with_config(config_game);
+        game.apply_move((2, 0)).unwrap();
+        game.apply_move((-2, 0)).unwrap();
+        assert_eq!(game.current_player(), Some(Player::P1));
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
+
+        // The depth-1 precheck returns one-hot on an immediately winning move.
+        let idx = result
+            .coords
+            .iter()
+            .position(|&c| c == result.action)
+            .expect("action must be a legal move");
+        assert_eq!(
+            result.improved_policy[idx], 1.0,
+            "depth-1 shortcut must return a one-hot policy"
+        );
+        assert_eq!(
+            result.per_child_q[idx], 1.0,
+            "immediately winning move is a proven win, per_child_q must be +1.0, got {}",
+            result.per_child_q[idx]
+        );
+        for (i, &v) in result.visit_counts.iter().enumerate() {
+            if i == idx {
+                assert!(v > 0, "proven child must be mask-on");
+            } else {
+                assert_eq!(v, 0, "unproven child {i} must stay mask-off");
             }
         }
     }
