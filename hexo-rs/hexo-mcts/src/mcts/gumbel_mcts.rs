@@ -393,7 +393,15 @@ where
         } else {
             config.forcing_node_budget
         };
-        if let forcing::Outcome::Win(w) = forcing::solve(game, cap, budget) {
+        // Wide generator: the tight hot×(hot∪block) generator provably misses
+        // wins whose turn includes a quiet threat-BUILDING placement (the
+        // quiet-builder miss, 2026-07-10). `solve_wide` is a strict superset —
+        // every tight Win is still found and `No` stays sound — at ~1.5-1.7×
+        // mean per-call cost (corpus A/B), negligible at one call per
+        // placement. On a Win, `pv` may pair a hot cell with a quiet builder;
+        // the pair is order-invariant within the turn, so the two-hot / Q=+1
+        // construction below is unchanged.
+        if let forcing::Outcome::Win(w) = forcing::solve_wide(game, cap, budget) {
             let first_move = w.first_move;
             // Defensive guard: `forcing::solve` is radius-aware, so
             // `first_move` should always be a member of `game.legal_moves()`.

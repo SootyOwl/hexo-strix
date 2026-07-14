@@ -96,7 +96,10 @@ where
             } else {
                 config.forcing_node_budget
             };
-            if let forcing::Outcome::Win(w) = forcing::solve(game, cap, budget) {
+            // Wide generator, mirroring `gumbel_mcts` Step 3.5: strict
+            // superset of tight `solve` (quiet threat-building partners
+            // included), soundness unchanged, ~1.5-1.7× mean per-call cost.
+            if let forcing::Outcome::Win(w) = forcing::solve_wide(game, cap, budget) {
                 // Defensive guard: `forcing::solve` is radius-aware, so
                 // `first_move` should always be a member of
                 // `game.legal_moves()`. Belt-and-suspenders against a future

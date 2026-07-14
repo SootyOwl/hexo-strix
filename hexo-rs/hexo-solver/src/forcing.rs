@@ -1406,8 +1406,12 @@ pub fn solve_limited(
 /// found at the same or a different (never longer, since the search is best-first
 /// and iterative-deepening) depth, and previously-No/BudgetExceeded positions may
 /// newly resolve to Win. Production callers: the analysis screen (via the PyO3
-/// `wide` kwarg), the WASM `StrixSolver::solve_wide`, and the VCT probe.
-/// Live-play and self-play stay on tight `solve` (throughput).
+/// `wide` kwarg), the WASM `StrixSolver::solve_wide`, the VCT probe, and — as
+/// of 2026-07-14 — the self-play/live-play root shortcut in
+/// `gumbel_mcts`/`batched` (the ~1.5-1.7× mean per-call cost is negligible at
+/// one call per placement; the tight-vs-wide A/B lives in
+/// `bench_depth2_shortcut`). Tight `solve` remains for callers that want the
+/// cheaper generator explicitly.
 pub fn solve_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome {
     solve_ex(game, depth_cap, node_budget, true, Limits::default())
 }
