@@ -1053,7 +1053,7 @@ pub fn attacker_turns_with(
     scored.into_iter().map(|(_, _, m)| m).collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum SolveResult { Win { depth: u8 }, No, BudgetExceeded }
 
 /// (attacker completions, defender completions) of one position.
@@ -1346,27 +1346,28 @@ fn solve_from_state(
     // Below wl=5 the threat machinery is blind to some MULTI-TURN wins: the
     // strip scan only visits windows through the player's own stones (pc >= 1
     // always), so for wl < 4 the whole threat band [wl-4, wl-3] is unreachable,
-    // and for wl == 4 its pc = 0 element is — yet at wl=4 a bare pair played
-    // into empty space is already a forcing double threat the generator would
-    // never emit. An immediate completion still solves (the completion band
-    // works down to wl=2), but anything deeper would surface as a FALSE proven
-    // `No`. Give up honestly instead.
-    if (wl as usize) < 5 && !has_completion(board, s.atk, wl, placements_remaining, radius) {
-        return SolveResult::BudgetExceeded;
-    }
+    // and for wl == 4 its pc = 0 element is — a bare pair played into empty
+    // space is already a forcing double threat the generator would never emit.
+    // Missing threats only ever DEFLATE the attacker (detected threats are
+    // still real, so the hitting-set argument behind `Win` proofs holds), which
+    // means a `Win` stays sound at wl<5 — only a proven `No` does not. So
+    // search normally (deep pc>=1 wins are still found) and downgrade any
+    // top-level `No` to the honest give-up instead of pre-emptively giving up
+    // on every non-completion position.
+    let blind_no = if (wl as usize) < 5 { SolveResult::BudgetExceeded } else { SolveResult::No };
     // Tight regime: switch legality queries to O(1) incremental counts.
     if radius < wl as i32 - 1 {
         board.enable_reach(radius);
     }
     // sound gate
     if !any_four_gate(board, s.atk, wl, radius) && !has_completion(board, s.atk, wl, placements_remaining, radius) {
-        return SolveResult::No;
+        return blind_no;
     }
     for depth in 1..=depth_cap {
         let (won, cut) = atk_within(board, placements_remaining, depth, s);
         if won { return SolveResult::Win { depth }; }
         if s.exceeded { return SolveResult::BudgetExceeded; }
-        if !cut { return SolveResult::No; }
+        if !cut { return blind_no; }
     }
     SolveResult::BudgetExceeded
 }
@@ -3137,6 +3138,44 @@ mod tests {
         match solve_threat(&game, 12, 250_000) {
             Outcome::No => {}
             other => panic!("tight threat solve should not see it: {other:?}"),
+        }
+    }
+
+    /// wl<5 regression (83a05b5): the bare-pair-blindness guard must not
+    /// pre-emptively kill deep wl=4 wins that only use pc>=1 windows. This is
+    /// the serving-analysis mid-turn fixture: P1 (one placement left this
+    /// turn) fills the crossing of two open pairs, creating a double open
+    /// three the opponent's full turn cannot cover — a multi-turn forcing win
+    /// the generator CAN see (every threat runs through existing stones).
+    #[test]
+    fn wl4_midturn_fork_is_searched_and_won() {
+        use hexo_engine::game::{GameConfig, GameState};
+        let cfg = GameConfig { win_length: 4, placement_radius: 3, max_moves: 60 };
+        let stones = [
+            ((9, 0), Player::P1), ((11, 0), Player::P1),
+            ((10, -1), Player::P1), ((10, 1), Player::P1),
+        ];
+        let game = GameState::from_state(&stones, Player::P1, 1, cfg);
+        let out = solve(&game, 12, 250_000);
+        assert!(out.is_win(), "deep wl=4 pc>=1 fork must solve to Win, got {out:?}");
+    }
+
+    /// The soundness half of the wl<5 handling: when the search comes up
+    /// empty at wl=4, the generator's bare-pair blindness means that `No` is
+    /// unproven — it must surface as the honest give-up (`BudgetExceeded`),
+    /// never a proven `No`. depth_cap=1 with a single lone stone makes a win
+    /// impossible (one placement, no 3-line to complete), so every exit path
+    /// is a give-up.
+    #[test]
+    fn wl4_no_win_found_is_never_a_proven_no() {
+        use hexo_engine::game::{GameConfig, GameState};
+        let cfg = GameConfig { win_length: 4, placement_radius: 3, max_moves: 60 };
+        let stones = [((0, 0), Player::P1), ((5, 5), Player::P2)];
+        let game = GameState::from_state(&stones, Player::P1, 1, cfg);
+        match solve(&game, 1, 250_000) {
+            Outcome::No => panic!("wl<5 must never report a proven No"),
+            Outcome::Win(w) => panic!("one placement can't win here: {w:?}"),
+            Outcome::BudgetExceeded => {}
         }
     }
 }
