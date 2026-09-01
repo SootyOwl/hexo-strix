@@ -1,0 +1,165 @@
+name: solver-wasm release
+
+# Publishes the STANDALONE solver-only WASM package (hexo-solver-wasm: forced-win
+# proving + defensive analysis, no model weights, no hexo-infer/hexo-mcts).
+#
+# Trigger: push a tag `solver-wasm-vX.Y.Z` (must match the crate version).
+# A release is only built when the solver's real dependency graph changed since
+# the previous `solver-wasm-v*` tag — engine, solver, the wrapper crate, or the
+# workspace manifest/lockfile. Bot-only or UI-only changes skip the release.
+# Manual dispatch supports `force: true` to release anyway.
+
+on:
+  push:
+    tags:
+      - "solver-wasm-v*"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if no solver dependency changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: solver-wasm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  WASM_PACK_VERSION: "0.13.1"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+      previous: ${{ steps.prev.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Find previous solver-wasm tag
+        id: prev
+        run: |
+          previous="$(git tag --list 'solver-wasm-v*' --sort=-v:refname \
+            | grep -vx "${GITHUB_REF_NAME}" | head -n1 || true)"
+          echo "previous=${previous}" >> "$GITHUB_OUTPUT"
+          echo "previous solver-wasm tag: '${previous}'"
+      - name: Check solver dependency paths
+        id: changed
+        run: |
+          # Exactly the files the solver-only package can depend on. Deliberately
+          # NOT included: hexo-infer, hexo-mcts, hexo-wasm (bot), hexo-py,
+          # hexo-a0, configs, docs.
+          paths="hexo-rs/hexo-engine hexo-rs/hexo-solver hexo-rs/hexo-solver-wasm hexo-rs/Cargo.toml hexo-rs/Cargo.lock"
+          previous="${{ steps.prev.outputs.previous }}"
+          if [ -z "$previous" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No previous release; publishing the first one."
+            exit 0
+          fi
+          base="${previous}^{commit}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            base="$previous"
+          fi
+          if git diff --name-only "$base" "$GITHUB_SHA" -- $paths | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only "$base" "$GITHUB_SHA" -- $paths
+          elif [ "${{ inputs.force || 'false' }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No solver dependency changes; forcing release by request."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No solver dependency changes since $previous; skipping release."
+          fi
+
+  release:
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hexo-rs
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version "$WASM_PACK_VERSION"
+      - name: Guard tag against package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' hexo-rs/hexo-solver-wasm/Cargo.toml | head -n1)"
+          tag="${GITHUB_REF_NAME#solver-wasm-v}"
+          if [ "$version" != "$tag" ]; then
+            echo "Tag solver-wasm-v$tag does not match package version $version" >&2
+            exit 1
+          fi
+      - name: Native solver tests
+        working-directory: hexo-rs
+        run: cargo test -p hexo-solver -p hexo-solver-wasm
+      - name: Build browser package (web)
+        working-directory: hexo-rs
+        run: wasm-pack build hexo-solver-wasm --target web --out-dir pkg
+      - name: Build node package and smoke-test it
+        working-directory: hexo-rs
+        run: |
+          wasm-pack build hexo-solver-wasm --target nodejs --out-dir pkg-node
+          node hexo-solver-wasm/tests/node_smoke.mjs
+      - name: Package release archives
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' hexo-rs/hexo-solver-wasm/Cargo.toml | head -n1)"
+          mkdir -p dist
+          tar -czf "dist/hexo-solver-wasm-web-v${version}.tar.gz" -C hexo-rs/hexo-solver-wasm/pkg .
+          tar -czf "dist/hexo-solver-wasm-node-v${version}.tar.gz" -C hexo-rs/hexo-solver-wasm/pkg-node .
+          cp hexo-rs/hexo-solver-wasm/pkg/hexo_solver_wasm.d.ts "dist/hexo_solver_wasm_web.d.ts"
+          sha256sum dist/* > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' hexo-rs/hexo-solver-wasm/Cargo.toml | head -n1)"
+          previous="${{ needs.gate.outputs.previous }}"
+          range="${previous:+${previous}..}${GITHUB_SHA}"
+          {
+            echo "## hexo-solver-wasm v${version}"
+            echo
+            echo "Standalone solver-only WASM package: forced-win proving (PNS/DFPN/PDS-PN),"
+            echo "wide defensive analysis with counter-threats, exact minimum covers, and"
+            echo "certificate verification. No model weights, no network access."
+            echo
+            echo "- \`hexo-solver-wasm-web-v${version}.tar.gz\` — browser (\`--target web\`) package"
+            echo "- \`hexo-solver-wasm-node-v${version}.tar.gz\` — Node (\`--target nodejs\`) package"
+            echo "- \`hexo_solver_wasm_web.d.ts\` — TypeScript declarations"
+            echo "- \`SHA256SUMS\` — checksums for every artifact"
+            echo
+            echo "Solver changes since ${previous:-repository start}:"
+            echo
+            git log --no-decorate --oneline "$range" -- hexo-rs/hexo-engine hexo-rs/hexo-solver hexo-rs/hexo-solver-wasm | sed 's/^/- /'
+          } > notes.md
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Dispatch creates the tag at the current SHA via the release itself.
+            tag="solver-wasm-v${version}"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "release $tag already exists" >&2
+              exit 1
+            fi
+            verify=()
+          else
+            tag="${GITHUB_REF_NAME}"
+            verify=(--verify-tag)
+          fi
+          gh release create "$tag" dist/* --title "hexo-solver-wasm v${version}" \
+            --notes-file notes.md "${verify[@]}"

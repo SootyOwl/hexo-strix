@@ -819,6 +819,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexo-solver-wasm"
+version = "0.1.0"
+dependencies = [
+ "hexo-engine",
+ "hexo-solver",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "hexo-wasm"
 version = "0.1.0"
 dependencies = [

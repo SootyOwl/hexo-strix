@@ -5,6 +5,7 @@ members = [
     "hexo-mcts",
     "hexo-infer",
     "hexo-wasm",
+    "hexo-solver-wasm",
     "hexo-py",
     "hexo-raster",
 ]

@@ -45,7 +45,7 @@ gamma = 0.99
 critic_mass_floor = 0.20
 
 [collection]
-positions_per_iteration = 262144
+positions_per_iteration = 524288
 parallel_games = 512
 inference_batch_size = 256
 inference_edge_budget = 250_000
