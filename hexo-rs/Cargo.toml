@@ -8,5 +8,6 @@ members = [
     "hexo-solver-wasm",
     "hexo-py",
     "hexo-raster",
+    "hexo-solver-ffi",
 ]
 resolver = "3"

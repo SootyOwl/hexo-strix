@@ -108,7 +108,7 @@ jobs:
           fi
       - name: Native solver tests
         working-directory: hexo-rs
-        run: cargo test -p hexo-solver -p hexo-solver-wasm
+        run: cargo test -p hexo-solver -p hexo-solver-wasm -p hexo-solver-ffi
       - name: Build browser package (web)
         working-directory: hexo-rs
         run: wasm-pack build hexo-solver-wasm --target web --out-dir pkg

@@ -1,0 +1,17 @@
+[package]
+name = "hexo-solver-ffi"
+version = "0.1.0"
+edition = "2024"
+authors = ["SootyOwl"]
+description = "C ABI JSON wrapper for the standalone HeXO forcing solver"
+license = "MIT"
+
+[lib]
+name = "hexo_solver_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
+hexo-solver = { version = "0.1.0", path = "../hexo-solver" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
