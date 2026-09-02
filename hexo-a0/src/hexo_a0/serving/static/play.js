@@ -188,6 +188,7 @@ async function runLocalBotTurn() {
     const sims = Number(DIFFICULTY_SIMS[stateAtStart.difficulty] ?? 64);
     const result = await localInference("bestMove", {
       position: localBotPosition(stateAtStart), sims, mActions: 16,
+      difficulty: stateAtStart.difficulty,
       modelId: stateAtStart.model_id || selectedPlayModel,
     });
     if (!gameState || gameState.game_id !== stateAtStart.game_id) return;

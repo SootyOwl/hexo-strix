@@ -129,7 +129,13 @@ def test_static_serves_css_and_js():
                 and b"unresolved" in inference_js
                 and b"ANALYSIS_CACHE_VERSION = 3" in inference_js
                 and b"self.location.search" in inference_js
+                and b"play-defense.js" in inference_js
                 and b"indexedDB" in inference_js)
+        pd, pd_type, _, _, play_defense_js = _get(port, "/static/play-defense.js")
+        assert pd == 200 and pd_type == "text/javascript; charset=utf-8"
+        assert b"selectForcingMove" in play_defense_js
+        assert b"tactical_pairs" in play_defense_js
+        assert b"BudgetExceeded" in play_defense_js
         pe, pe_type, _, _, proof_js = _get(port, "/static/proof-explorer.js")
         assert pe == 200 and pe_type == "text/javascript; charset=utf-8"
         assert b"buildProofModel" in proof_js and b"proofExplorerWorstCase" in proof_js

@@ -1,6 +1,8 @@
 // Browser-local neural inference and Gumbel MCTS. Heavy synchronous WASM work
 // stays off the UI thread; terminating this worker cancels an analysis.
 
+import {selectForcingMove} from "./play-defense.js";
+
 let apiPromise;
 const botPromises = new Map();
 const ANALYSIS_CACHE_DB = "hexo-local-analysis";
@@ -484,6 +486,33 @@ self.onmessage = async event => {
     if (msg.type === "bestMove") {
       const bot = await loadBot(msg.modelUrl);
       stage = "local bot search";
+      // Forcing/defense layer before MCTS, mirroring the server bot's
+      // `_forcing_move`. Never breaks play: any failure falls back to the
+      // plain search below.
+      let forced = null;
+      try {
+        const api = await loadApi();
+        const solver = new api.StrixSolver();
+        try {
+          forced = selectForcingMove({
+            api, solver, bot, position: msg.position, difficulty: msg.difficulty,
+          });
+        } finally {
+          try { solver.free(); } catch (_error) {}
+        }
+      } catch (_error) {
+        forced = null;
+      }
+      if (forced) {
+        const result = {
+          move: {q: forced.q, r: forced.r},
+          value: null, policy: [], legal: [], probs: [],
+          improved_policy: [], visit_counts: [], q_hat: [],
+          candidate_set: [], forcing_source: forced.source,
+        };
+        self.postMessage({type: "bestMove", requestId, result});
+        return;
+      }
       const result = JSON.parse(bot.best_move(JSON.stringify(msg.position), msg.sims, msg.mActions, 0n));
       self.postMessage({type: "bestMove", requestId, result});
       return;
