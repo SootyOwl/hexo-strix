@@ -33,11 +33,11 @@ dedup_skip = ["dedup_count"]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
 hexo-raster = { version = "0.1.0", path = "../hexo-raster" }
 hexo-solver = { version = "0.1.0", path = "../hexo-solver" }
-pyo3 = { version = "0.28", optional = true }
+pyo3 = { version = "0.30", optional = true }
 tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rand = "0.9"
+rand = "0.10"
 rand_chacha = "0.9"
 rand_distr = "0.5"
 rayon = "1.10"
